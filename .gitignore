@@ -1,0 +1,10 @@
+.env
+.env.local
+node_modules/
+.next/
+coverage/
+dist/
+.superpowers/
+.superdesign/tmp/
+.superdesign/*-design.json
+.worktrees/
