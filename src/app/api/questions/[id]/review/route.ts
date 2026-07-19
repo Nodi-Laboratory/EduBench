@@ -41,9 +41,18 @@ export async function POST(
         revision += 1;
         await client.query(
           `insert into question_revisions(
-             question_id, revision, question_text, answer_text, scoring_criteria, change_reason
-           ) values ($1, $2, $3, $4, $5::jsonb, $6)`,
-          [id, revision, input.questionText, input.answerText, JSON.stringify(input.scoringCriteria), input.note ?? '수정 후 승인'],
+             question_id, revision, question_text, answer_text, answer_options, scoring_criteria,
+             accepted_answers, design_summary, evidence_summary, quality_scores, change_reason
+           ) select question_id, $2, $3, $4, answer_options, $5::jsonb,
+             accepted_answers, design_summary, evidence_summary, quality_scores, $6
+           from question_revisions where question_id = $1 and revision = $7`,
+          [id, revision, input.questionText, input.answerText, JSON.stringify(input.scoringCriteria), input.note ?? '수정 후 승인', current.current_revision],
+        );
+        await client.query(
+          `insert into question_evidence(question_id, question_revision, source_chunk_id, ordinal, role, quote_text)
+           select question_id, $2, source_chunk_id, ordinal, role, quote_text
+           from question_evidence where question_id = $1 and question_revision = $3`,
+          [id, revision, current.current_revision],
         );
       }
 
@@ -70,4 +79,3 @@ export async function POST(
     throw error;
   }
 }
-

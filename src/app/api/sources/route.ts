@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { db } from '@/server/db/pool';
-import { enqueueJob } from '@/server/jobs/queue';
+import { enqueueJob, enqueueJobWithClient } from '@/server/jobs/queue';
 import { storeSourceFile } from '@/server/files/storage';
+import { withTransaction } from '@/server/db/transaction';
 
 type SourceRow = {
   id: string;
@@ -57,25 +58,17 @@ export async function POST(request: Request) {
 
   const id = randomUUID();
   const storagePath = await storeSourceFile(id, bytes);
-  await db.query(
-    `insert into source_files(
-       id, sha256, original_name, storage_path, mime_type, byte_size, subject, grade, status
-     ) values ($1, $2, $3, $4, $5, $6, $7, $8, 'UPLOADED')`,
-    [
-      id,
-      sha256,
-      file.name,
-      storagePath,
-      file.type,
-      bytes.byteLength,
-      form.get('subject')?.toString() || null,
-      form.get('grade')?.toString() || null,
-    ],
-  );
-  const job = await enqueueJob({
-    kind: 'document.parse',
-    payload: { sourceId: id },
-    idempotencyKey: `document.parse:${id}:v1`,
+  const job = await withTransaction(async (client) => {
+    await client.query(
+      `insert into source_files(
+         id, sha256, original_name, storage_path, mime_type, byte_size, subject, grade, status
+       ) values ($1, $2, $3, $4, $5, $6, $7, $8, 'UPLOADED')`,
+      [id, sha256, file.name, storagePath, file.type, bytes.byteLength,
+        form.get('subject')?.toString() || null, form.get('grade')?.toString() || null],
+    );
+    return enqueueJobWithClient(client, {
+      kind: 'document.parse', payload: { sourceId: id }, idempotencyKey: `document.parse:${id}:v1`,
+    });
   });
   return NextResponse.json({ id, jobId: job.id, existing: false }, { status: 201 });
 }

@@ -48,6 +48,11 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     }
     setSubmitting(false);
   }
+  async function retry(sourceId: string) {
+    const response = await fetch(`/api/sources/${sourceId}/retry`, { method:'POST' }); const body = await response.json();
+    setNotice(response.ok ? '실패한 문서 처리 작업을 다시 예약했습니다.' : (body.message ?? '재실행하지 못했습니다.'));
+    if (response.ok) setSources((current) => current.map((source) => source.id === sourceId ? { ...source, status:'UPLOADED', failed_stage:null } : source));
+  }
 
   return (
     <div className="workflow-page">
@@ -72,7 +77,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
             <td>{source.subject ?? '미지정'} · {source.grade ?? '미지정'}</td>
             {stages.map((stage) => { const state = stageState(source, stage); return <td key={stage}><span className={`state-label state-${state.replace(' ', '-')}`}>{state}</span></td>; })}
             <td className="mono">{source.created_at.slice(0, 16).replace('T', ' ')}</td>
-            <td>{source.status === 'FAILED' && <button className="icon-button" aria-label="실패 단계 재실행"><RotateCcw size={15} /></button>}</td>
+            <td>{source.status === 'FAILED' && <button className="icon-button" aria-label="실패 단계 재실행" onClick={() => retry(source.id)}><RotateCcw size={15} /></button>}</td>
           </tr>)}
           {sources.length === 0 && <tr><td colSpan={9}><div className="table-empty"><FileText size={22} /><strong>등록된 교과서가 없습니다.</strong><span>위에서 PDF를 등록하면 처리 상태가 여기에 표시됩니다.</span></div></td></tr>}
         </tbody></table></div>
@@ -80,4 +85,3 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     </div>
   );
 }
-

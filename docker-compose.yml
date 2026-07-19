@@ -44,6 +44,7 @@ services:
       DATABASE_URL: postgresql://edubench:edubench@db:5432/edubench
       STORAGE_ROOT: /data/storage
     command: ["npm", "run", "worker"]
+    restart: unless-stopped
     volumes:
       - edubench_storage:/data/storage
     depends_on:

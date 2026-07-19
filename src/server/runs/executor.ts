@@ -3,7 +3,7 @@ import type { ModelProvider, ProviderError } from '@/server/providers/types';
 import { withProviderRetry } from '@/server/providers/retry';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
-import type { RunItemRecord } from './service';
+import { renewRunItemLease, type RunItemRecord } from './service';
 
 type ExecutionContext = {
   id: string; attempts: number; benchmark_run_id: string; state: string; lease_owner: string | null;
@@ -58,17 +58,21 @@ export async function executeRunItem(
     ? `다음 근거만 사용하십시오.\n\n${evidence.join('\n\n')}`
     : context.evidence_mode === 'GROUNDED' ? '연결된 교과서 근거가 없습니다. 근거 부족을 명시하십시오.' : '외부 검색 없이 답하십시오.';
   const retryHistory: Array<Record<string, unknown>> = [];
-  const generated = await withProviderRetry(() => provider.generate({
-    system: context.system_prompt,
-    prompt: `${evidenceBlock}\n\n[질문]\n${context.question_text}${options}`,
-    maxOutputTokens: 2048,
-    temperature: 0,
-  }), {
-    maxAttempts: 3,
-    onRetry: ({ attempt, delayMs, error }) => retryHistory.push({
-      attempt, delayMs, kind: error.kind, status: error.status, requestId: error.requestId,
-    }),
-  });
+  const leaseMs = 150_000; const leaseAbort = new AbortController();
+  const signal = AbortSignal.any([leaseAbort.signal, AbortSignal.timeout(Number(process.env.PROVIDER_TIMEOUT_MS ?? 90_000))]);
+  const heartbeat = setInterval(() => { renewRunItemLease(item.id, workerId, leaseMs).then((renewed) => { if (!renewed) leaseAbort.abort(new Error('RUN_ITEM_LEASE_LOST')); }).catch(() => leaseAbort.abort(new Error('RUN_ITEM_LEASE_RENEWAL_FAILED'))); }, 30_000);
+  let generated;
+  try {
+    generated = await withProviderRetry(() => provider.generate({
+      system: context.system_prompt,
+      prompt: `${evidenceBlock}\n\n[질문]\n${context.question_text}${options}`,
+      maxOutputTokens: 2048,
+      temperature: 0,
+    }, signal), {
+      maxAttempts: 3,
+      onRetry: ({ attempt, delayMs, error }) => retryHistory.push({ attempt, delayMs, kind: error.kind, status: error.status, requestId: error.requestId }),
+    });
+  } finally { clearInterval(heartbeat); }
 
   await withTransaction(async (client) => {
     const locked = await client.query<{ benchmark_run_id: string; attempts: number; state: string; lease_owner: string | null; run_state: string }>(
@@ -95,14 +99,19 @@ export async function executeRunItem(
       `update run_items set state = 'SUCCEEDED', lease_owner = null, lease_expires_at = null,
          completed_at = now() where id = $1`, [item.id],
     );
-    await client.query(
+    const counters = await client.query<{ completed_items: number; failed_items: number; total_items: number }>(
       `update benchmark_runs set completed_items = completed_items + 1, updated_at = now()
-       where id = $1`, [current.benchmark_run_id],
+       where id = $1 returning completed_items, failed_items, total_items`, [current.benchmark_run_id],
     );
     await client.query(
       `insert into job_events(aggregate_type, aggregate_id, event_type, payload)
        values ('benchmark_run', $1, 'RUN_ITEM_COMPLETED', $2::jsonb)`,
-      [current.benchmark_run_id, JSON.stringify({ itemId: item.id, providerKey: context.provider_key, latencyMs: generated.latencyMs })],
+      [current.benchmark_run_id, JSON.stringify({
+        itemId: item.id, providerKey: context.provider_key, latencyMs: generated.latencyMs,
+        completedItems: counters.rows[0]?.completed_items,
+        failedItems: counters.rows[0]?.failed_items,
+        totalItems: counters.rows[0]?.total_items,
+      })],
     );
   });
 }

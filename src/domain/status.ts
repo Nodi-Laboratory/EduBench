@@ -69,6 +69,9 @@ export type QuestionCommand = 'SUBMIT' | 'APPROVE' | 'EDIT_AND_APPROVE' | 'HOLD'
 
 const questionTransitions = new Map<string, QuestionState>([
   ['DRAFT:SUBMIT', 'IN_REVIEW'],
+  ['DRAFT:APPROVE', 'APPROVED'],
+  ['DRAFT:EDIT_AND_APPROVE', 'APPROVED'],
+  ['DRAFT:HOLD', 'HELD'],
   ['IN_REVIEW:APPROVE', 'APPROVED'],
   ['IN_REVIEW:EDIT_AND_APPROVE', 'APPROVED'],
   ['IN_REVIEW:HOLD', 'HELD'],
@@ -85,4 +88,3 @@ export function transitionQuestion(current: QuestionState, command: QuestionComm
   }
   return next;
 }
-

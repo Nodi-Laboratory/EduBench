@@ -7,8 +7,8 @@ export const dynamic = 'force-dynamic';
 
 export default async function DatasetsPage() {
   const [approved, versions] = await Promise.all([
-    db.query<{ count: string }>(`select count(*) from questions where status = 'APPROVED' and deleted_at is null and public_id not like 'SAMPLE-Q-%'`),
+    db.query<{ id: string }>(`select id from questions where status = 'APPROVED' and deleted_at is null and public_id not like 'SAMPLE-Q-%' order by public_id`),
     db.query<{ id: string; version: string; title: string; question_count: number; content_hash: string; published_at: string }>(`select id, version, title, question_count, content_hash, published_at::text from dataset_versions order by published_at desc`),
   ]);
-  return <DatasetWorkspace approvedCount={Number(approved.rows[0]?.count ?? 0)} versions={versions.rows} />;
+  return <DatasetWorkspace approvedQuestionIds={approved.rows.map((row) => row.id)} versions={versions.rows} />;
 }

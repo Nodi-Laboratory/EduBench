@@ -26,15 +26,17 @@ export async function seedDatabase(): Promise<void> {
     `);
 
     await client.query(`
-      insert into score_profiles(id, version, title, metrics, rubric_prompt, content_hash)
+      insert into score_profiles(id, version, title, metrics, rubric_prompt, judge_provider, judge_model, content_hash)
       values (
         '20000000-0000-0000-0000-000000000001',
         'score-v1',
         'EduBench 교육 적합성 기본 프로필',
         '["accuracy","faithfulness","completeness","curriculum_alignment","student_fit","misconception","hallucination"]',
         '모델 식별자를 보지 않고 원자 채점 기준별로 절대평가한다.',
+        'gemini',
+        'configured-via-env',
         encode(digest('edubench-score-profile-v1', 'sha256'), 'hex')
-      ) on conflict(version) do nothing
+      ) on conflict(version) do update set judge_provider=excluded.judge_provider, judge_model=excluded.judge_model
     `);
 
     await client.query(`
@@ -85,19 +87,22 @@ export async function seedDatabase(): Promise<void> {
         md5('sample-question-' || n)::uuid,
         1,
         '[샘플 문항 ' || n || '] 실제 교과서 자료를 등록하면 승인된 문항으로 교체됩니다.',
-        '샘플 모범 답안 ' || n,
+        case when n <= 100 then chr(65 + ((n - 1) % 4)) else '샘플 모범 답안 ' || n end,
         case when n <= 100 then '["A","B","C","D"]'::jsonb else null end,
         jsonb_build_array(
           jsonb_build_object('key','concept','label','핵심 개념','maxScore',1),
           jsonb_build_object('key','reasoning','label','설명 완결성','maxScore',1)
         ),
-        jsonb_build_array('샘플 모범 답안 ' || n),
+        jsonb_build_array(case when n <= 100 then chr(65 + ((n - 1) % 4)) else '샘플 모범 답안 ' || n end),
         '화면과 실행 흐름 검증을 위한 샘플 문항',
         '실제 교과서 근거가 아니며 공식 결과에 사용할 수 없음',
         '{"sample_data":true}'::jsonb,
         'deterministic seed'
       from generate_series(1, 500) as n
-      on conflict(question_id, revision) do nothing
+      on conflict(question_id, revision) do update set
+        answer_text = excluded.answer_text,
+        answer_options = excluded.answer_options,
+        accepted_answers = excluded.accepted_answers
     `);
 
     await client.query(`

@@ -38,9 +38,8 @@ async function appendEvent(
   );
 }
 
-export async function enqueueJob(input: EnqueueInput): Promise<{ id: string; existing: boolean }> {
-  return withTransaction(async (client) => {
-    const inserted = await client.query<{ id: string }>(
+export async function enqueueJobWithClient(client: PoolClient, input: EnqueueInput): Promise<{ id: string; existing: boolean }> {
+  const inserted = await client.query<{ id: string }>(
       `insert into jobs(kind, payload, idempotency_key, priority, max_attempts, available_at)
        values ($1, $2::jsonb, $3, $4, $5, coalesce($6::timestamptz, now()))
        on conflict(idempotency_key) do nothing
@@ -53,18 +52,21 @@ export async function enqueueJob(input: EnqueueInput): Promise<{ id: string; exi
         input.maxAttempts ?? 4,
         input.availableAt ?? null,
       ],
-    );
-    if (inserted.rows[0]) {
-      await appendEvent(client, inserted.rows[0].id, 'JOB_ENQUEUED', { kind: input.kind });
-      return { id: inserted.rows[0].id, existing: false };
-    }
-    const existing = await client.query<{ id: string }>(
-      'select id from jobs where idempotency_key = $1', [input.idempotencyKey],
-    );
-    const id = existing.rows[0]?.id;
-    if (!id) throw new DomainError('JOB_ENQUEUE_RACE', '중복 작업을 조회하지 못했습니다.');
-    return { id, existing: true };
-  });
+  );
+  if (inserted.rows[0]) {
+    await appendEvent(client, inserted.rows[0].id, 'JOB_ENQUEUED', { kind: input.kind });
+    return { id: inserted.rows[0].id, existing: false };
+  }
+  const existing = await client.query<{ id: string }>(
+    'select id from jobs where idempotency_key = $1', [input.idempotencyKey],
+  );
+  const id = existing.rows[0]?.id;
+  if (!id) throw new DomainError('JOB_ENQUEUE_RACE', '중복 작업을 조회하지 못했습니다.');
+  return { id, existing: true };
+}
+
+export async function enqueueJob(input: EnqueueInput): Promise<{ id: string; existing: boolean }> {
+  return withTransaction((client) => enqueueJobWithClient(client, input));
 }
 
 export async function claimJobs(

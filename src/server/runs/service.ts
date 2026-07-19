@@ -61,8 +61,8 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
     throw new DomainError('DUPLICATE_RUN_PROVIDER', '동일 제공자를 한 실행에 두 번 등록할 수 없습니다.');
   }
   return withTransaction(async (client) => {
-    const dataset = await client.query<{ status: string }>(
-      'select status from dataset_versions where id = $1', [input.datasetVersionId],
+    const dataset = await client.query<{ status: string; distribution: { sample_data?: boolean } }>(
+      'select status, distribution from dataset_versions where id = $1', [input.datasetVersionId],
     );
     if (dataset.rows[0]?.status !== 'PUBLISHED') {
       throw new DomainError('DATASET_NOT_PUBLISHED', '게시된 데이터셋 버전만 실행할 수 있습니다.');
@@ -88,7 +88,11 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
          price_profile_version, system_prompt, parameters, total_items
        ) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
       [runId, publicId, input.title, input.datasetVersionId, input.scoreProfileId,
-        input.priceProfileVersion, input.systemPrompt, JSON.stringify(input.parameters ?? {}), totalItems],
+        input.priceProfileVersion, input.systemPrompt, JSON.stringify({
+          ...(input.parameters ?? {}),
+          sample_data: Boolean(dataset.rows[0]?.distribution?.sample_data),
+          mock_providers: process.env.MOCK_PROVIDERS?.toLowerCase() === 'true',
+        }), totalItems],
     );
 
     for (const [modelIndex, model] of input.models.entries()) {
@@ -155,13 +159,34 @@ export async function claimRunItems(
 ): Promise<RunItemRecord[]> {
   if (limit < 1 || leaseMs < 1) throw new DomainError('INVALID_CLAIM_OPTIONS', 'limit와 leaseMs는 1 이상이어야 합니다.');
   return withTransaction(async (client) => {
+    // Serialize claims per run so multiple workers cannot exceed a model's persisted concurrency.
+    await client.query('select pg_advisory_xact_lock(hashtext($1))', [runId]);
     const result = await client.query<RunItemRecord>(
-      `with candidates as (
-         select ri.id from run_items ri
+      `with model_capacity as (
+         select rm.id,
+           greatest(rm.concurrency - count(ri.id) filter (
+             where ri.state = 'LEASED' and ri.lease_expires_at > now()
+           ), 0)::int as available_slots,
+           rm.request_interval_ms,
+           max(ri.started_at) as last_started_at
+         from run_models rm
+         left join run_items ri on ri.run_model_id = rm.id
+         where rm.benchmark_run_id = $1
+         group by rm.id, rm.concurrency, rm.request_interval_ms
+       ), ranked as (
+         select ri.id, ri.run_model_id, mc.available_slots, mc.request_interval_ms,
+           row_number() over (partition by ri.run_model_id order by ri.created_at, ri.id) as position
+         from run_items ri
          join benchmark_runs br on br.id = ri.benchmark_run_id
+         join model_capacity mc on mc.id = ri.run_model_id
          where ri.benchmark_run_id = $1 and br.state = 'RUNNING'
            and ri.state in ('PENDING','RETRY_WAIT') and ri.available_at <= now()
            and ri.attempts < ri.max_attempts
+           and (mc.last_started_at is null or mc.request_interval_ms = 0
+             or mc.last_started_at <= now() - (mc.request_interval_ms::bigint * interval '1 millisecond'))
+       ), candidates as (
+         select ri.id from run_items ri join ranked r on r.id = ri.id
+         where r.position <= case when r.request_interval_ms > 0 then least(r.available_slots, 1) else r.available_slots end
          order by ri.created_at, ri.id
          for update of ri skip locked limit $3
        )
@@ -176,6 +201,15 @@ export async function claimRunItems(
     if (result.rowCount) await appendRunEvent(client, runId, 'RUN_ITEMS_CLAIMED', { workerId, count: result.rowCount });
     return result.rows;
   });
+}
+
+export async function renewRunItemLease(itemId: string, workerId: string, leaseMs: number): Promise<boolean> {
+  const { db } = await import('@/server/db/pool');
+  const result = await db.query(
+    `update run_items set lease_expires_at = now() + ($3::bigint * interval '1 millisecond')
+     where id = $1 and state = 'LEASED' and lease_owner = $2`, [itemId, workerId, leaseMs],
+  );
+  return Boolean(result.rowCount);
 }
 
 export async function failRunItem(
@@ -194,8 +228,15 @@ export async function failRunItem(
     );
     const runId = result.rows[0]?.benchmark_run_id;
     if (!runId) throw new DomainError('RUN_ITEM_LEASE_MISMATCH', '해당 워커가 임대한 실행 항목이 아닙니다.');
-    await client.query('update benchmark_runs set failed_items = failed_items + 1, updated_at = now() where id = $1', [runId]);
-    await appendRunEvent(client, runId, 'RUN_ITEM_FAILED', { itemId, errorCode });
+    const counters = await client.query<{ completed_items: number; failed_items: number; total_items: number }>(
+      'update benchmark_runs set failed_items = failed_items + 1, updated_at = now() where id = $1 returning completed_items, failed_items, total_items', [runId],
+    );
+    await appendRunEvent(client, runId, 'RUN_ITEM_FAILED', {
+      itemId, errorCode,
+      completedItems: counters.rows[0]?.completed_items,
+      failedItems: counters.rows[0]?.failed_items,
+      totalItems: counters.rows[0]?.total_items,
+    });
   });
 }
 

@@ -12,11 +12,17 @@ export function RunController({ initialRun, models }: { initialRun: Run; models:
   const [run, setRun] = useState(initialRun); const [events, setEvents] = useState<EventRecord[]>([]); const [busy, setBusy] = useState(false);
   useEffect(() => {
     const source = new EventSource(`/api/runs/${run.id}/events`);
-    const types = ['RUN_CREATED','RUN_QUEUED','RUN_STARTED','RUN_PAUSED','RUN_RESUMED','RUN_ITEM_FAILED','RUN_ITEMS_RETRIED','RUN_COMPLETED','RUN_CANCELLED'];
+    const types = ['RUN_CREATED','RUN_QUEUED','RUN_STARTED','RUN_PAUSED','RUN_RESUMED','RUN_ITEMS_CLAIMED','RUN_ITEM_COMPLETED','RUN_ITEM_FAILED','RUN_ITEMS_RETRIED','RUN_SCORING_STARTED','RUN_COMPLETED','RUN_CANCELLED','RUN_FAILED'];
     for (const type of types) source.addEventListener(type, (event) => {
       const message = event as MessageEvent<string>; const data = JSON.parse(message.data);
       setEvents((current) => [...current.slice(-49), { id: message.lastEventId, type, data }]);
-      if (typeof data.state === 'string') setRun((current) => ({ ...current, state: data.state as string }));
+      setRun((current) => ({
+        ...current,
+        state: typeof data.state === 'string' ? data.state : current.state,
+        completed_items: typeof data.completedItems === 'number' ? data.completedItems : current.completed_items,
+        failed_items: typeof data.failedItems === 'number' ? data.failedItems : current.failed_items,
+        total_items: typeof data.totalItems === 'number' ? data.totalItems : current.total_items,
+      }));
     });
     return () => source.close();
   }, [run.id]);

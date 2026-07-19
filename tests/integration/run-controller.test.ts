@@ -39,7 +39,7 @@ test('creates the complete question × model execution matrix', async () => {
     systemPrompt: '근거에 따라 답하라.',
     questionLimit: 5,
     models: [
-      { providerKey: 'gemini', displayName: 'Gemini', modelId: 'gemini-test', protocol: 'gemini' },
+      { providerKey: 'gemini', displayName: 'Gemini', modelId: 'gemini-test', protocol: 'gemini', concurrency: 3 },
       { providerKey: 'openai', displayName: 'OpenAI', modelId: 'openai-test', protocol: 'openai-responses' },
     ],
   });
@@ -60,7 +60,7 @@ test('pause prevents new claims, resume restores them, and failed items retry ex
     systemPrompt: '근거에 따라 답하라.',
     questionLimit: 3,
     models: [
-      { providerKey: 'gemini', displayName: 'Gemini', modelId: 'gemini-test', protocol: 'gemini' },
+      { providerKey: 'gemini', displayName: 'Gemini', modelId: 'gemini-test', protocol: 'gemini', concurrency: 3 },
     ],
   });
 

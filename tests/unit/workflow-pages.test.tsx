@@ -37,7 +37,7 @@ test('review workspace keeps question, rubric, and evidence visible together', (
 });
 
 test('dataset workspace shows exact target distributions and immutable versions', () => {
-  render(<DatasetWorkspace approvedCount={382} versions={[]} />);
+  render(<DatasetWorkspace approvedQuestionIds={Array.from({ length: 382 }, (_, index) => `q-${index}`)} versions={[]} />);
   expect(screen.getByRole('heading', { name: '데이터셋 관리' })).toBeInTheDocument();
   expect(screen.getByText('핵심 개념 이해')).toBeInTheDocument();
   expect(screen.getByText('150')).toBeInTheDocument();

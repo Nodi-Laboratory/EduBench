@@ -25,7 +25,7 @@ async function processBenchmarkRuns() {
   const runs = await db.query<{ id: string }>("select id from benchmark_runs where state = 'RUNNING' order by created_at limit 20");
   let processed = 0;
   for (const run of runs.rows) {
-    const items = await claimRunItems(run.id, workerId, Number(process.env.WORKER_BATCH_SIZE ?? 8), 120_000);
+    const items = await claimRunItems(run.id, workerId, Number(process.env.WORKER_BATCH_SIZE ?? 8), 150_000);
     await Promise.all(items.map(async (item) => {
       const model = await db.query<{ provider_key: string }>('select provider_key from run_models where id = $1', [item.run_model_id]);
       const providerKey = model.rows[0]?.provider_key ?? '';
@@ -59,7 +59,11 @@ async function processPersistentJobs() {
       if (job.kind === 'document.parse') await markDocumentFailed(String(job.payload.sourceId), error);
       if (job.kind === 'question.generate') await markGenerationFailed(String(job.payload.batchId), error);
       const message = error instanceof Error ? error.message : '알 수 없는 작업 오류';
-      await failJob(job.id, workerId, { code: message.split(':', 1)[0] || 'JOB_FAILED', message, retryDelayMs: 5_000 });
+      try {
+        await failJob(job.id, workerId, { code: message.split(':', 1)[0] || 'JOB_FAILED', message, retryDelayMs: 5_000 });
+      } catch (leaseError) {
+        console.error(`[EduBench worker] could not record failure for job ${job.id}`, leaseError);
+      }
     }
   }));
   return jobs.length;
@@ -82,9 +86,14 @@ export async function main() {
   let lastRecovery = 0;
   console.info(`[EduBench worker] started ${workerId}`);
   while (!stopping) {
-    if (Date.now() - lastRecovery > 30_000) { await Promise.all([recoverExpiredRunItemLeases(), recoverExpiredLeases()]); lastRecovery = Date.now(); }
-    const processed = (await processPersistentJobs()) + (await processBenchmarkRuns()) + (await processScoringRuns()) + (await processCancellations());
-    if (!processed) await sleep(500);
+    try {
+      if (Date.now() - lastRecovery > 30_000) { await Promise.all([recoverExpiredRunItemLeases(), recoverExpiredLeases()]); lastRecovery = Date.now(); }
+      const processed = (await processPersistentJobs()) + (await processBenchmarkRuns()) + (await processScoringRuns()) + (await processCancellations());
+      if (!processed) await sleep(500);
+    } catch (error) {
+      console.error('[EduBench worker] loop recovered from error', error);
+      await sleep(1_000);
+    }
   }
   await db.end();
   console.info('[EduBench worker] stopped');
