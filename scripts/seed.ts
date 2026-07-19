@@ -107,7 +107,7 @@ export async function seedDatabase(): Promise<void> {
       ) values (
         '10000000-0000-0000-0000-000000000001',
         'sample-v1.0.0',
-        'PUBLISHED',
+        'DRAFT',
         '샘플 500문항 데이터셋',
         '기능 검증 전용이며 공식 결과에 사용할 수 없습니다.',
         500,
@@ -125,7 +125,13 @@ export async function seedDatabase(): Promise<void> {
         1,
         n
       from generate_series(1, 500) as n
+      join dataset_versions dv on dv.id = '10000000-0000-0000-0000-000000000001' and dv.status = 'DRAFT'
       on conflict(dataset_version_id, question_id) do nothing
+    `);
+
+    await client.query(`
+      update dataset_versions set status = 'PUBLISHED', published_at = now()
+      where id = '10000000-0000-0000-0000-000000000001' and status = 'DRAFT'
     `);
 
     await client.query(`
