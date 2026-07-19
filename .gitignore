@@ -8,3 +8,5 @@ dist/
 .superdesign/tmp/
 .superdesign/*-design.json
 .worktrees/
+*.tsbuildinfo
+storage/

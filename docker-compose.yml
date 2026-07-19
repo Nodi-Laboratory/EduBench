@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: edubench
+      POSTGRES_USER: edubench
+      POSTGRES_PASSWORD: edubench
+    ports:
+      - "54329:5432"
+    volumes:
+      - edubench_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edubench -d edubench"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  edubench_db:
+
