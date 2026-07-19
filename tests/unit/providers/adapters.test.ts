@@ -87,3 +87,10 @@ test('registers all six providers from environment configuration', () => {
   });
   expect([...registry.keys()]).toEqual(['gemini', 'claude', 'openai', 'upstage', 'exaone', 'midm']);
 });
+
+test('registers only fully configured providers and supports explicit mock mode', () => {
+  expect([...createProviderRegistry({ OPENAI_API_KEY: 'o', OPENAI_MODEL: 'openai-model' }).keys()]).toEqual(['openai']);
+  const mocked = createProviderRegistry({ MOCK_PROVIDERS: 'true' });
+  expect([...mocked.keys()]).toEqual(['gemini', 'claude', 'openai', 'upstage', 'exaone', 'midm']);
+  expect(mocked.get('gemini')?.modelId).toBe('mock-gemini');
+});

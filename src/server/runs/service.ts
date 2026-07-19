@@ -226,3 +226,52 @@ export async function getRunEventsAfter(runId: string, afterId = 0, limit = 200)
   );
   return result.rows;
 }
+
+export async function recoverExpiredRunItemLeases(): Promise<number> {
+  return withTransaction(async (client) => {
+    const recovered = await client.query<{ benchmark_run_id: string; terminal: boolean }>(
+      `update run_items set
+         state = case when attempts >= max_attempts then 'TERMINAL_FAILED' else 'RETRY_WAIT' end,
+         available_at = now(), lease_owner = null, lease_expires_at = null,
+         error_code = 'LEASE_EXPIRED', error_message = '워커 임대가 만료되었습니다.'
+       where state = 'LEASED' and lease_expires_at < now()
+       returning benchmark_run_id, attempts >= max_attempts as terminal`,
+    );
+    const byRun = new Map<string, { count: number; terminal: number }>();
+    for (const row of recovered.rows) {
+      const current = byRun.get(row.benchmark_run_id) ?? { count: 0, terminal: 0 };
+      current.count += 1; if (row.terminal) current.terminal += 1; byRun.set(row.benchmark_run_id, current);
+    }
+    for (const [runId, summary] of byRun) {
+      if (summary.terminal) await client.query('update benchmark_runs set failed_items = failed_items + $2 where id = $1', [runId, summary.terminal]);
+      await appendRunEvent(client, runId, 'RUN_ITEM_LEASES_RECOVERED', summary);
+    }
+    return recovered.rowCount ?? 0;
+  });
+}
+
+export async function beginScoringWhenExecutionFinished(runId: string): Promise<boolean> {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ total_items: number; completed_items: number; failed_items: number; state: RunState }>(
+      'select total_items, completed_items, failed_items, state from benchmark_runs where id = $1 for update', [runId],
+    );
+    const run = result.rows[0];
+    if (!run || run.state !== 'RUNNING' || run.completed_items + run.failed_items < run.total_items) return false;
+    await client.query("update benchmark_runs set state = 'SCORING', updated_at = now() where id = $1", [runId]);
+    await appendRunEvent(client, runId, 'RUN_SCORING_STARTED', { completedItems: run.completed_items, failedItems: run.failed_items });
+    return true;
+  });
+}
+
+export async function finishCancellationWhenDrained(runId: string): Promise<boolean> {
+  return withTransaction(async (client) => {
+    const run = await client.query<{ state: RunState }>('select state from benchmark_runs where id = $1 for update', [runId]);
+    if (run.rows[0]?.state !== 'CANCELLING') return false;
+    await client.query("update run_items set state = 'CANCELLED', completed_at = now() where benchmark_run_id = $1 and state in ('PENDING','RETRY_WAIT')", [runId]);
+    const active = await client.query<{ count: string }>("select count(*) from run_items where benchmark_run_id = $1 and state = 'LEASED'", [runId]);
+    if (Number(active.rows[0]?.count) > 0) return false;
+    await client.query("update benchmark_runs set state = 'CANCELLED', completed_at = now(), updated_at = now() where id = $1", [runId]);
+    await appendRunEvent(client, runId, 'RUN_CANCELLED');
+    return true;
+  });
+}

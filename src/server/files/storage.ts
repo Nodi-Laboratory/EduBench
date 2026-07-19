@@ -3,7 +3,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export function storageRoot(): string {
-  return path.resolve(process.env.STORAGE_ROOT ?? './storage');
+  return process.env.STORAGE_ROOT
+    ? path.resolve(/* turbopackIgnore: true */ process.env.STORAGE_ROOT)
+    : path.join(process.cwd(), 'storage');
 }
 
 export async function storeSourceFile(sourceId: string, bytes: Uint8Array): Promise<string> {
@@ -15,4 +17,3 @@ export async function storeSourceFile(sourceId: string, bytes: Uint8Array): Prom
   await rename(temporary, target);
   return target;
 }
-

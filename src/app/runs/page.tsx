@@ -11,6 +11,7 @@ const modelEnv: Record<string, string> = {
 };
 
 export default async function RunsPage() {
+  const mockMode = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   const [datasets, providers, scoreProfiles, runs] = await Promise.all([
     db.query<{ id: string; version: string; title: string; question_count: number }>(
       `select id, version, title, question_count from dataset_versions where status = 'PUBLISHED' order by published_at desc`,
@@ -29,7 +30,7 @@ export default async function RunsPage() {
     scoreProfiles={scoreProfiles.rows}
     providers={providers.rows.map((provider) => ({
       ...provider,
-      modelId: process.env[modelEnv[provider.provider_key]!] ?? '',
+      modelId: mockMode ? `mock-${provider.provider_key}` : (process.env[modelEnv[provider.provider_key]!] ?? ''),
       envName: modelEnv[provider.provider_key]!,
     }))}
     initialRuns={runs.rows}

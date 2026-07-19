@@ -3,18 +3,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { db } from '@/server/db/pool';
 import { enqueueJob } from '@/server/jobs/queue';
-
-export const GENERATION_STAGES = [
-  '조건 분석',
-  '검색 질의 생성',
-  '벡터 검색',
-  '검색 결과 재정렬',
-  '핵심 개념 구조화',
-  '질문 설계',
-  '질문·정답 생성',
-  '근거 검증',
-  '품질 평가',
-] as const;
+import { GENERATION_STAGES } from '@/domain/generation';
 
 const generationSchema = z.object({
   subject: z.string().trim().min(1),
@@ -96,4 +85,3 @@ export async function POST(request: Request) {
   });
   return NextResponse.json({ id, jobId: job.id, state: 'QUEUED', progress }, { status: 201 });
 }
-

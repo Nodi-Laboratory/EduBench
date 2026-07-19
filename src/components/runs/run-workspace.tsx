@@ -35,12 +35,13 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }
     setSubmitting(false);
   }
 
+  const seoulDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   return <div className="workflow-page">
     <header className="page-heading"><div><span className="eyebrow">BENCHMARK / EXECUTION</span><h1>벤치마크 실행</h1><p>불변 데이터셋과 환경변수의 실제 모델을 결합해 재현 가능한 실행을 생성합니다.</p></div></header>
     <div className="run-setup-grid">
       <section className="panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>실행 명세</h2></div></div>
         <form className="dense-form" action={submit}>
-          <label>실행 제목<input name="title" defaultValue={`공식 비교 실행 ${new Date().toISOString().slice(0, 10)}`} required /></label>
+          <label>실행 제목<input name="title" defaultValue={`공식 비교 실행 ${seoulDate}`} required /></label>
           <div className="form-row"><label>불변 데이터셋<select name="datasetVersionId" required>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required>{scoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
           <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input name="questionLimit" type="number" min="1" max="500" defaultValue="500" required /></label></div>
           <label>시스템 프롬프트<textarea name="systemPrompt" defaultValue="제공된 교과서 근거와 질문의 지시를 따르며, 근거가 부족하면 부족하다고 명시한다." required /></label>

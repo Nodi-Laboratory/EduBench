@@ -9,11 +9,21 @@ import {
   createRun,
   failRunItem,
   retryFailedRunItems,
+  finishCancellationWhenDrained,
 } from '@/server/runs/service';
 
 beforeAll(async () => {
   await migrate();
   await seedDatabase();
+});
+
+test('cancellation closes pending work and reaches a terminal state', async () => {
+  const run = await createRun({ title: `취소 테스트 ${randomUUID().slice(0, 8)}`, datasetVersionId: '10000000-0000-0000-0000-000000000001', scoreProfileId: '20000000-0000-0000-0000-000000000001', priceProfileVersion: 'test-price-v1', systemPrompt: '답하라.', questionLimit: 2, models: [{ providerKey: 'gemini', displayName: 'Gemini', modelId: 'gemini-test', protocol: 'gemini' }] });
+  await commandRun(run.id, 'QUEUE'); await commandRun(run.id, 'START');
+  expect((await commandRun(run.id, 'CANCEL')).state).toBe('CANCELLING');
+  expect(await finishCancellationWhenDrained(run.id)).toBe(true);
+  const stored = await db.query<{ state: string; cancelled: string }>(`select br.state, count(ri.id) filter (where ri.state='CANCELLED')::text cancelled from benchmark_runs br join run_items ri on ri.benchmark_run_id=br.id where br.id=$1 group by br.id`, [run.id]);
+  expect(stored.rows[0]).toEqual({ state: 'CANCELLED', cancelled: '2' });
 });
 
 afterAll(async () => {

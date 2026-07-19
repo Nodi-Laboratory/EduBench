@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from 'react';
 import { Check, Search, Sparkles } from 'lucide-react';
-import { GENERATION_STAGES } from '@/app/api/generation/route';
+import { GENERATION_STAGES } from '@/domain/generation';
 
 type GenerationSource = { id: string; original_name: string; subject: string | null; grade: string | null };
 type GenerationBatch = { id: string; state: string; requested_count: number; created_at: string };
@@ -46,4 +46,3 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     </div>
   </div>;
 }
-

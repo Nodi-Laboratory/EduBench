@@ -1,15 +1,6 @@
 import Link from 'next/link';
 import { AlertCircle, ArrowRight, BookOpenCheck, Play, RefreshCw } from 'lucide-react';
 
-const providers = [
-  { name: 'EXAONE', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-  { name: 'Gemini', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-  { name: 'Claude', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-  { name: 'OpenAI', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-  { name: 'Upstage', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-  { name: 'KT Mi:dm', model: '환경변수에서 모델 ID 로드', done: 0, total: 500, latency: '—', tokens: '—', cost: '—' },
-] as const;
-
 const capabilities = [
   ['핵심 개념 이해', 150],
   ['개념 적용·문제풀이', 120],
@@ -18,7 +9,13 @@ const capabilities = [
   ['오개념·주장 교정', 70],
 ] as const;
 
-export function DashboardOverview() {
+type LatestRun = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number };
+type ModelRow = { display_name: string; model_id: string; total: string; done: string; failed: string; latency: string | null; tokens: string | null; cost: string | null };
+type RecentRun = { id: string; public_id: string; title: string; state: string; completed_items: number; total_items: number };
+const neutralModels: ModelRow[] = ['EXAONE','Gemini','Claude','OpenAI','Upstage','KT Mi:dm'].map((display_name) => ({ display_name, model_id: '환경변수에서 모델 ID 로드', total: '0', done: '0', failed: '0', latency: null, tokens: null, cost: null }));
+
+export function DashboardOverview({ approved = 0, readySources = 0, attention = 0, latest = null, models = neutralModels, recent = [] }: { approved?: number; readySources?: number; attention?: number; latest?: LatestRun | null; models?: ModelRow[]; recent?: RecentRun[] } = {}) {
+  const percent = latest?.total_items ? (latest.completed_items / latest.total_items) * 100 : 0;
   return (
     <div className="dashboard-page">
       <header className="page-heading">
@@ -30,7 +27,7 @@ export function DashboardOverview() {
           <h1>벤치마크 운영 현황</h1>
           <p>교과서 준비부터 6개 모델 실행과 결과 산출까지 한 화면에서 추적합니다.</p>
         </div>
-        <Link className="button primary" href="/runs/new">
+        <Link className="button primary" href="/runs">
           <Play size={16} aria-hidden="true" /> 새 벤치마크 실행
         </Link>
       </header>
@@ -38,22 +35,22 @@ export function DashboardOverview() {
       <section className="metric-grid" aria-label="운영 핵심 지표">
         <article className="metric-card metric-feature">
           <div className="metric-label"><span>최근 실행</span><b>RUN</b></div>
-          <div className="metric-value mono">0 <small>/ 3,000</small></div>
-          <div className="metric-footer"><span className="status-dot idle" /> 아직 생성된 실행이 없습니다</div>
+          <div className="metric-value mono">{latest?.completed_items ?? 0} <small>/ {latest?.total_items ?? 0}</small></div>
+          <div className="metric-footer"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest ? `${latest.public_id} · ${latest.state}` : '아직 생성된 실행이 없습니다'}</div>
         </article>
         <article className="metric-card">
           <div className="metric-label"><span>승인된 문항</span><b>DATASET</b></div>
-          <div className="metric-value mono">0 <small>/ 500</small></div>
-          <div className="metric-footer">목표 프로필 대비 <strong>0%</strong></div>
+          <div className="metric-value mono">{approved} <small>/ 500</small></div>
+          <div className="metric-footer">목표 프로필 대비 <strong>{Math.min(100, approved / 5).toFixed(0)}%</strong></div>
         </article>
         <article className="metric-card">
           <div className="metric-label"><span>준비된 교과서</span><b>SOURCES</b></div>
-          <div className="metric-value mono">0 <small>개</small></div>
+          <div className="metric-value mono">{readySources} <small>개</small></div>
           <div className="metric-footer">Parse·청크·임베딩 완료 기준</div>
         </article>
         <article className="metric-card danger-edge">
           <div className="metric-label"><span>조치 필요</span><b>ATTENTION</b></div>
-          <div className="metric-value mono">0 <small>건</small></div>
+          <div className="metric-value mono">{attention} <small>건</small></div>
           <div className="metric-footer">실패 또는 검수 대기 항목</div>
         </article>
       </section>
@@ -69,11 +66,11 @@ export function DashboardOverview() {
           </div>
           <div className="run-summary">
             <div>
-              <strong className="mono">0.0%</strong>
-              <span>전체 3,000호출</span>
+              <strong className="mono">{percent.toFixed(1)}%</strong>
+              <span>전체 {latest?.total_items ?? 0}호출</span>
             </div>
-            <div className="progress-track"><span style={{ width: '0%' }} /></div>
-            <span className="status-chip muted"><span className="status-dot idle" /> 실행 전</span>
+            <div className="progress-track"><span style={{ width: `${percent}%` }} /></div>
+            <span className="status-chip muted"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest?.state ?? '실행 전'}</span>
           </div>
           <div className="data-table-wrap">
             <table className="data-table provider-table">
@@ -81,11 +78,11 @@ export function DashboardOverview() {
                 <tr><th>제공사</th><th>진행</th><th className="numeric">성공 / 실패</th><th className="numeric">평균 지연</th><th className="numeric">토큰</th><th className="numeric">예상 비용</th></tr>
               </thead>
               <tbody>
-                {providers.map((provider, index) => (
-                  <tr key={provider.name}>
-                    <td><span className={`model-key model-${index + 1}`} /><div><strong>{provider.name}</strong><small>{provider.model}</small></div></td>
-                    <td><div className="cell-progress"><span className="mono">{provider.done} / {provider.total}</span><div><i style={{ width: '0%' }} /></div></div></td>
-                    <td className="numeric mono">0 / 0</td><td className="numeric mono">{provider.latency}</td><td className="numeric mono">{provider.tokens}</td><td className="numeric mono">{provider.cost}</td>
+                {models.map((provider, index) => (
+                  <tr key={`${provider.display_name}-${index}`}>
+                    <td><span className={`model-key model-${index + 1}`} /><div><strong>{provider.display_name}</strong><small>{provider.model_id}</small></div></td>
+                    <td><div className="cell-progress"><span className="mono">{provider.done} / {provider.total}</span><div><i style={{ width: `${Number(provider.total) ? Number(provider.done)/Number(provider.total)*100 : 0}%` }} /></div></div></td>
+                    <td className="numeric mono">{provider.done} / {provider.failed}</td><td className="numeric mono">{provider.latency ? `${Math.round(Number(provider.latency))} ms` : '—'}</td><td className="numeric mono">{provider.tokens ?? '—'}</td><td className="numeric mono">{provider.cost ? `₩${Number(provider.cost).toLocaleString('ko-KR')}` : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -128,11 +125,11 @@ export function DashboardOverview() {
           <div><span className="section-index mono">04</span><h2>최근 실행</h2></div>
           <button className="icon-text-button" type="button"><RefreshCw size={14} /> 새로고침</button>
         </div>
-        <div className="empty-table">
+        {recent.length === 0 ? <div className="empty-table">
           <span className="mono">NO RUN RECORDS</span>
           <strong>아직 벤치마크 실행이 없습니다.</strong>
           <p>문항 데이터셋 버전을 확정한 뒤 새 실행을 생성하세요.</p>
-        </div>
+        </div> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>실행 ID</th><th>제목</th><th>상태</th><th className="numeric">진행</th></tr></thead><tbody>{recent.map((run) => <tr key={run.id}><td><Link className="text-link mono" href={`/runs/${run.id}`}>{run.public_id}</Link></td><td>{run.title}</td><td><span className={`state-label state-${run.state}`}>{run.state}</span></td><td className="numeric mono">{run.completed_items}/{run.total_items}</td></tr>)}</tbody></table></div>}
       </section>
     </div>
   );

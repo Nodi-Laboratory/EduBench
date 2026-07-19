@@ -10,10 +10,11 @@ const modelSchema = z.object({
   concurrency: z.number().int().min(1).max(50).optional(),
   requestIntervalMs: z.number().int().min(0).max(60_000).optional(),
 });
+const postgresUuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 
 const runSchema = z.object({
-  title: z.string().trim().min(2).max(200), datasetVersionId: z.string().uuid(),
-  scoreProfileId: z.string().uuid(), priceProfileVersion: z.string().min(1).max(80),
+  title: z.string().trim().min(2).max(200), datasetVersionId: postgresUuid,
+  scoreProfileId: postgresUuid, priceProfileVersion: z.string().min(1).max(80),
   systemPrompt: z.string().min(1).max(20_000), questionLimit: z.number().int().min(1).max(500).optional(),
   models: z.array(modelSchema).min(1).max(12),
 });
