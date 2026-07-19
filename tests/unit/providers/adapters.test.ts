@@ -1,0 +1,89 @@
+import { describe, expect, test } from 'vitest';
+import { GeminiProvider } from '@/server/providers/gemini';
+import { AnthropicProvider } from '@/server/providers/anthropic';
+import { OpenAIProvider } from '@/server/providers/openai';
+import { OpenAICompatibleProvider } from '@/server/providers/openai-compatible';
+import type { FetchLike, GenerationRequest } from '@/server/providers/types';
+import { createProviderRegistry } from '@/server/providers/registry';
+
+const request: GenerationRequest = {
+  system: '교과서 근거만 사용한다.',
+  prompt: '원자의 뜻을 설명하라.',
+  maxOutputTokens: 300,
+  temperature: 0,
+};
+
+function fixtureFetch(body: unknown, headers: Record<string, string> = {}): FetchLike {
+  return async () => new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json', ...headers },
+  });
+}
+
+describe('provider response normalization', () => {
+  test('normalizes Gemini generateContent', async () => {
+    const provider = new GeminiProvider({ apiKey: 'secret', modelId: 'gemini-test', fetch: fixtureFetch({
+      candidates: [{ content: { parts: [{ text: '원자는 기본 입자이다.' }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 17, candidatesTokenCount: 9 },
+    }, { 'x-request-id': 'gem-req' }) });
+    await expect(provider.generate(request)).resolves.toMatchObject({
+      text: '원자는 기본 입자이다.', inputTokens: 17, outputTokens: 9,
+      finishReason: 'STOP', requestId: 'gem-req', modelId: 'gemini-test',
+    });
+  });
+
+  test('normalizes Anthropic Messages', async () => {
+    const provider = new AnthropicProvider({ apiKey: 'secret', modelId: 'claude-test', fetch: fixtureFetch({
+      id: 'msg_1', model: 'claude-snapshot', content: [{ type: 'text', text: '원자는 기본 입자이다.' }],
+      stop_reason: 'end_turn', usage: { input_tokens: 15, output_tokens: 8 },
+    }, { 'request-id': 'ant-req' }) });
+    await expect(provider.generate(request)).resolves.toMatchObject({
+      text: '원자는 기본 입자이다.', inputTokens: 15, outputTokens: 8,
+      finishReason: 'end_turn', requestId: 'ant-req', modelId: 'claude-snapshot',
+    });
+  });
+
+  test('normalizes OpenAI Responses', async () => {
+    const provider = new OpenAIProvider({ apiKey: 'secret', modelId: 'openai-test', fetch: fixtureFetch({
+      id: 'resp_1', model: 'openai-snapshot',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '원자는 기본 입자이다.' }] }],
+      status: 'completed', usage: { input_tokens: 14, output_tokens: 7 },
+    }, { 'x-request-id': 'oai-req' }) });
+    await expect(provider.generate(request)).resolves.toMatchObject({
+      text: '원자는 기본 입자이다.', inputTokens: 14, outputTokens: 7,
+      finishReason: 'completed', requestId: 'oai-req', modelId: 'openai-snapshot',
+    });
+  });
+
+  test('normalizes OpenAI-compatible chat completions', async () => {
+    const provider = new OpenAICompatibleProvider({ providerKey: 'upstage', apiKey: 'secret', baseUrl: 'https://example.test/v1', modelId: 'solar-test', fetch: fixtureFetch({
+      id: 'chat_1', model: 'solar-snapshot', choices: [{ message: { content: '원자는 기본 입자이다.' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 13, completion_tokens: 6 },
+    }, { 'x-request-id': 'compat-req' }) });
+    await expect(provider.generate(request)).resolves.toMatchObject({
+      text: '원자는 기본 입자이다.', inputTokens: 13, outputTokens: 6,
+      finishReason: 'stop', requestId: 'compat-req', modelId: 'solar-snapshot',
+    });
+  });
+});
+
+test('normalizes a provider error without exposing the API key', async () => {
+  const provider = new OpenAIProvider({
+    apiKey: 'top-secret-key', modelId: 'openai-test',
+    fetch: async () => new Response(JSON.stringify({ error: { message: 'invalid key top-secret-key' } }), { status: 401 }),
+  });
+  await expect(provider.generate(request)).rejects.toMatchObject({ kind: 'AUTH', retryable: false, status: 401 });
+  await expect(provider.generate(request)).rejects.not.toHaveProperty('message', expect.stringContaining('top-secret-key'));
+});
+
+test('registers all six providers from environment configuration', () => {
+  const registry = createProviderRegistry({
+    GOOGLE_API_KEY: 'g', GEMINI_GENERATION_MODEL: 'gemini-model',
+    ANTHROPIC_API_KEY: 'a', ANTHROPIC_MODEL: 'claude-model',
+    OPENAI_API_KEY: 'o', OPENAI_MODEL: 'openai-model',
+    UPSTAGE_API_KEY: 'u', UPSTAGE_MODEL: 'solar-model', UPSTAGE_BASE_URL: 'https://upstage.test/v1',
+    EXAONE_API_KEY: 'e', EXAONE_MODEL: 'exaone-model', EXAONE_BASE_URL: 'https://exaone.test/v1',
+    MIDM_API_KEY: 'm', MIDM_MODEL: 'midm-model', MIDM_BASE_URL: 'https://midm.test/v1',
+  });
+  expect([...registry.keys()]).toEqual(['gemini', 'claude', 'openai', 'upstage', 'exaone', 'midm']);
+});
