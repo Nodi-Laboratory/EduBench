@@ -127,20 +127,20 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
   const mimeType = detectMimeType(bytes);
   if (!mimeType) throw new DocumentLabError('INVALID_DOCUMENT_FILE', 400, 'Upload a PDF, PNG, JPEG, or WebP file with valid file bytes.');
 
-  const pages = mimeType === 'application/pdf'
-    ? await (dependencies.renderPdfPages ?? renderPdfPages)(bytes)
-    : [imagePage(file, bytes, mimeType)];
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   const requestConfig = mock
     ? { model: 'mock-document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: ['footnote'], output_formats: ['html'] }
     : { model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: ['footnote'], output_formats: ['html'] };
+  const apiKey = process.env.UPSTAGE_API_KEY;
+  if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
 
+  const pages = mimeType === 'application/pdf'
+    ? await (dependencies.renderPdfPages ?? renderPdfPages)(bytes)
+    : [imagePage(file, bytes, mimeType)];
   if (mock) return { pages: pages.map(mockPage), requestConfig, mock: true };
 
-  const apiKey = process.env.UPSTAGE_API_KEY;
-  if (!apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
   const parser = dependencies.parser ?? new UpstageDocumentParser({
-    apiKey,
+    apiKey: apiKey!,
     model: requestConfig.model,
     baseUrl: process.env.UPSTAGE_BASE_URL,
   });

@@ -5,6 +5,14 @@ import { parseDocumentLabFile } from '@/server/documents/lab';
 const originalMockProviders = process.env.MOCK_PROVIDERS;
 const originalUpstageApiKey = process.env.UPSTAGE_API_KEY;
 
+function metadataFile(bytes: Uint8Array, size: number, name = 'document.bin'): File {
+  return {
+    name,
+    size,
+    arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+  } as File;
+}
+
 afterEach(() => {
   if (originalMockProviders === undefined) delete process.env.MOCK_PROVIDERS;
   else process.env.MOCK_PROVIDERS = originalMockProviders;
@@ -95,6 +103,88 @@ test('parses a JPEG directly using its detected mime type and data URL', async (
     mimeType: 'image/jpeg',
     dataUrl: 'data:image/jpeg;base64,/9j/4A==',
   });
+});
+
+test.each([
+  { name: 'PNG', bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), mimeType: 'image/png' },
+  { name: 'WebP', bytes: new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]), mimeType: 'image/webp' },
+])('parses a valid $name signature directly', async ({ bytes, mimeType }) => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const calls: string[] = [];
+
+  const result = await parseDocumentLabFile(new File([bytes], 'image.bin'), {
+    parser: {
+      parse: async (_bytes, _filename, options) => {
+        calls.push(options.mimeType);
+        return { html: '<p>image</p>', elements: [], raw: {}, requestId: 'image-request', model: 'document-parse', requestConfig: {} };
+      },
+    },
+  });
+
+  expect(calls).toEqual([mimeType]);
+  expect(result.pages[0]).toMatchObject({ mimeType, dataUrl: `data:${mimeType};base64,${Buffer.from(bytes).toString('base64')}` });
+});
+
+test('hands each rendered PDF page to the parser as a complete PNG image', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]);
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  const rendererCalls: Uint8Array[] = [];
+  const parserCalls: Array<{ bytes: Uint8Array; filename: string; mimeType: string; pageNumber: number }> = [];
+
+  await parseDocumentLabFile(new File([pdfBytes], 'lesson.pdf'), {
+    renderPdfPages: async (bytes) => {
+      rendererCalls.push(bytes);
+      return [{ pageNumber: 1, bytes: pngBytes, mimeType: 'image/png', filename: 'page-1.png', dataUrl: 'data:image/png;base64,iVBORw==' }];
+    },
+    parser: {
+      parse: async (bytes, filename, options) => {
+        parserCalls.push({ bytes, filename, mimeType: options.mimeType, pageNumber: options.pageNumber });
+        return { html: '<p>page</p>', elements: [], raw: {}, requestId: 'pdf-request', model: 'document-parse', requestConfig: {} };
+      },
+    },
+  });
+
+  expect(rendererCalls).toEqual([pdfBytes]);
+  expect(parserCalls).toEqual([{ bytes: pngBytes, filename: 'page-1.png', mimeType: 'image/png', pageNumber: 1 }]);
+});
+
+test('accepts exactly 100 MiB and rejects one additional byte based on file metadata', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const oneHundredMiB = 100 * 1024 * 1024;
+  let parsed = false;
+
+  await expect(parseDocumentLabFile(metadataFile(pngBytes, oneHundredMiB), {
+    parser: {
+      parse: async () => {
+        parsed = true;
+        return { html: '<p>page</p>', elements: [], raw: {}, requestId: 'size-request', model: 'document-parse', requestConfig: {} };
+      },
+    },
+  })).resolves.toMatchObject({ mock: false });
+  expect(parsed).toBe(true);
+  await expect(parseDocumentLabFile(metadataFile(pngBytes, oneHundredMiB + 1))).rejects.toMatchObject({
+    status: 400,
+    code: 'FILE_TOO_LARGE',
+  });
+});
+
+test('returns missing-key configuration error for a valid PDF before rendering', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  delete process.env.UPSTAGE_API_KEY;
+  let rendererCalled = false;
+
+  await expect(parseDocumentLabFile(new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], 'lesson.pdf'), {
+    renderPdfPages: async () => {
+      rendererCalled = true;
+      throw new Error('Poppler should not run');
+    },
+  })).rejects.toMatchObject({ status: 409, code: 'UPSTAGE_NOT_CONFIGURED' });
+  expect(rendererCalled).toBe(false);
 });
 
 test('returns a typed configured error without exposing credentials', async () => {
