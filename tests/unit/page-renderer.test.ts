@@ -10,6 +10,7 @@ test('renders PDF pages as ordered 150-DPI PNG data URLs', async () => {
     commandRunner: async (command, args) => {
       calls.push({ command, args });
       const outputPrefix = args.at(-1)!;
+      await writeFile(`${outputPrefix}-10.png`, new Uint8Array([10]));
       await writeFile(`${outputPrefix}-2.png`, new Uint8Array([2]));
       await writeFile(`${outputPrefix}-1.png`, new Uint8Array([1]));
     },
@@ -17,10 +18,11 @@ test('renders PDF pages as ordered 150-DPI PNG data URLs', async () => {
 
   expect(calls).toHaveLength(1);
   expect(calls[0]).toMatchObject({ command: 'pdftoppm' });
-  expect(calls[0]!.args).toEqual(expect.arrayContaining(['-png', '-r', '150']));
+  expect(calls[0]!.args.slice(0, 3)).toEqual(['-png', '-r', '150']);
   expect(pages).toEqual([
     { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', dataUrl: 'data:image/png;base64,AQ==' },
     { pageNumber: 2, bytes: new Uint8Array([2]), mimeType: 'image/png', filename: 'page-2.png', dataUrl: 'data:image/png;base64,Ag==' },
+    { pageNumber: 10, bytes: new Uint8Array([10]), mimeType: 'image/png', filename: 'page-10.png', dataUrl: 'data:image/png;base64,Cg==' },
   ]);
   await expect(access(dirname(calls[0]!.args.at(-1)!))).rejects.toThrow();
 });
