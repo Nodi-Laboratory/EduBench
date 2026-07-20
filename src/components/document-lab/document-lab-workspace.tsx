@@ -87,6 +87,15 @@ export function DocumentLabWorkspace() {
 
   const page = result?.pages[selectedPage] ?? null;
 
+  function selectFile(nextFile: File | null) {
+    setFile(nextFile);
+    setResult(null);
+    setError(null);
+    setSelectedPage(0);
+    setHtmlTab('preview');
+    setDetailTab('elements');
+  }
+
   async function parse(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!file) return;
@@ -130,7 +139,8 @@ export function DocumentLabWorkspace() {
             <input
               type="file"
               accept="application/pdf,image/png,image/jpeg,image/webp"
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              disabled={loading}
+              onChange={(event) => selectFile(event.target.files?.[0] ?? null)}
             />
           </label>
           <button className="button primary" disabled={!file || loading}>
@@ -199,13 +209,28 @@ export function DocumentLabWorkspace() {
               ))}
             </div>
           </header>
-          {page ? htmlTab === 'preview' ? (
-            <div className="lab-html-content" role="tabpanel" id="document-lab-preview-panel" aria-labelledby="document-lab-preview-tab">
-              <iframe title={`변환 HTML 페이지 ${page.pageNumber}`} sandbox="" srcDoc={page.html} />
-            </div>
-          ) : (
-            <pre className="lab-code" role="tabpanel" id="document-lab-source-panel" aria-labelledby="document-lab-source-tab">{page.html}</pre>
-          ) : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 샌드박스 미리보기와 소스 HTML을 확인할 수 있습니다." />}
+          <div
+            className="lab-html-panel"
+            role="tabpanel"
+            id="document-lab-preview-panel"
+            aria-labelledby="document-lab-preview-tab"
+            hidden={htmlTab !== 'preview'}
+          >
+            {page ? (
+              <div className="lab-html-content">
+                <iframe title={`변환 HTML 페이지 ${page.pageNumber}`} sandbox="" srcDoc={page.html} />
+              </div>
+            ) : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 샌드박스 미리보기와 소스 HTML을 확인할 수 있습니다." />}
+          </div>
+          <div
+            className="lab-html-panel"
+            role="tabpanel"
+            id="document-lab-source-panel"
+            aria-labelledby="document-lab-source-tab"
+            hidden={htmlTab !== 'source'}
+          >
+            {page ? <pre className="lab-code">{page.html}</pre> : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 소스 HTML을 확인할 수 있습니다." />}
+          </div>
         </section>
 
         <section className="panel lab-pane lab-detail-pane" aria-labelledby="lab-detail-title">
@@ -227,11 +252,32 @@ export function DocumentLabWorkspace() {
               >{tab.label}</button>
             ))}
           </div>
-          {page ? (
-            <div className="lab-detail-content" role="tabpanel" id={`document-lab-${detailTab}-panel`} aria-labelledby={`document-lab-${detailTab}-tab`}>
-              {detailTab === 'elements' && <pre>{pretty(page.elements)}</pre>}
-              {detailTab === 'raw' && <pre>{pretty(page.raw)}</pre>}
-              {detailTab === 'request' && (
+          <div
+            className="lab-detail-content"
+            role="tabpanel"
+            id="document-lab-elements-panel"
+            aria-labelledby="document-lab-elements-tab"
+            hidden={detailTab !== 'elements'}
+          >
+            {page ? <pre>{pretty(page.elements)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="Elements는 응답을 받은 뒤 표시됩니다." />}
+          </div>
+          <div
+            className="lab-detail-content"
+            role="tabpanel"
+            id="document-lab-raw-panel"
+            aria-labelledby="document-lab-raw-tab"
+            hidden={detailTab !== 'raw'}
+          >
+            {page ? <pre>{pretty(page.raw)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="원본 JSON은 응답을 받은 뒤 표시됩니다." />}
+          </div>
+          <div
+            className="lab-detail-content"
+            role="tabpanel"
+            id="document-lab-request-panel"
+            aria-labelledby="document-lab-request-tab"
+            hidden={detailTab !== 'request'}
+          >
+            {page ? (
                 <dl className="lab-request-info">
                   <div><dt>REQUEST ID</dt><dd className="mono">{page.requestId ?? '제공되지 않음'}</dd></div>
                   <div><dt>MODEL</dt><dd className="mono">{page.model || '제공되지 않음'}</dd></div>
@@ -240,9 +286,8 @@ export function DocumentLabWorkspace() {
                   <div><dt>PAGE</dt><dd className="mono">{page.pageNumber}</dd></div>
                   <div><dt>REQUEST CONFIG</dt><dd><pre>{pretty(page.requestConfig)}</pre></dd></div>
                 </dl>
-              )}
-            </div>
-          ) : <EmptyPane icon={<ScrollText size={22} />} text="Elements, 원본 JSON, 요청 정보는 응답을 받은 뒤 표시됩니다." />}
+              ) : <EmptyPane icon={<ScrollText size={22} />} text="요청 정보는 응답을 받은 뒤 표시됩니다." />}
+          </div>
         </section>
       </div>
     </div>

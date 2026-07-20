@@ -26,6 +26,11 @@ test('document lab exposes its exact parser settings before upload', () => {
   expect(screen.getByText('변환 HTML')).toBeInTheDocument();
   expect(screen.getByRole('tab', { name: '원본 JSON' })).toBeInTheDocument();
   expect(screen.getByText('테스트 파일을 선택하면 페이지별 결과가 여기에 표시됩니다.')).toBeInTheDocument();
+  expect(document.getElementById('document-lab-preview-panel')).toBeInTheDocument();
+  expect(document.getElementById('document-lab-source-panel')).toHaveAttribute('hidden');
+  expect(document.getElementById('document-lab-elements-panel')).toBeInTheDocument();
+  expect(document.getElementById('document-lab-raw-panel')).toHaveAttribute('hidden');
+  expect(document.getElementById('document-lab-request-panel')).toHaveAttribute('hidden');
 });
 
 test('document lab uploads one file and switches every result pane by PDF page', async () => {
@@ -88,10 +93,78 @@ test('document lab uploads one file and switches every result pane by PDF page',
   expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('sandbox', '');
   expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('srcdoc', '<h1>둘째 페이지</h1>');
 
+  const previewTab = screen.getByRole('tab', { name: '미리보기' });
+  previewTab.focus();
+  fireEvent.keyDown(previewTab, { key: 'ArrowRight' });
+  expect(screen.getByRole('tab', { name: '소스 HTML' })).toHaveFocus();
+  expect(screen.getByRole('tab', { name: '소스 HTML' })).toHaveAttribute('aria-selected', 'true');
+  expect(document.getElementById('document-lab-preview-panel')).toHaveAttribute('hidden');
+  expect(document.getElementById('document-lab-source-panel')).not.toHaveAttribute('hidden');
+  expect(screen.getByText('<h1>둘째 페이지</h1>')).toBeVisible();
+
   fireEvent.click(screen.getByRole('tab', { name: '원본 JSON' }));
   expect(screen.getByText(/"page": 2/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole('tab', { name: '요청 정보' }));
   expect(screen.getByText('mock-page-2')).toBeInTheDocument();
+});
+
+test('document lab clears stale results and resets panes when a different file is selected', async () => {
+  const responseBody = {
+    mock: true,
+    requestConfig: { mode: 'enhanced' },
+    pages: [{
+      pageNumber: 1,
+      filename: 'first-page.png',
+      mimeType: 'image/png',
+      dataUrl: 'data:image/png;base64,Zmlyc3Q=',
+      html: '<p>stale first file</p>',
+      elements: [{ type: 'paragraph' }],
+      raw: { source: 'first' },
+      requestId: 'first-request',
+      model: 'mock-document-parse',
+      requestConfig: { pageNumber: 1 },
+    }],
+  };
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => responseBody }));
+  render(<DocumentLabWorkspace />);
+
+  const input = screen.getByLabelText('테스트 파일');
+  fireEvent.change(input, { target: { files: [new File(['first'], 'first.pdf', { type: 'application/pdf' })] } });
+  fireEvent.click(screen.getByRole('button', { name: '문서 파싱' }));
+  expect(await screen.findByAltText('원본 페이지 1')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('tab', { name: '소스 HTML' }));
+  fireEvent.click(screen.getByRole('tab', { name: '원본 JSON' }));
+
+  fireEvent.change(input, { target: { files: [new File(['second'], 'second.pdf', { type: 'application/pdf' })] } });
+
+  expect(screen.queryByAltText('원본 페이지 1')).not.toBeInTheDocument();
+  expect(screen.queryByText('MOCK')).not.toBeInTheDocument();
+  expect(screen.getByText('테스트 파일을 선택하면 페이지별 결과가 여기에 표시됩니다.')).toBeInTheDocument();
+  expect(screen.getByRole('tab', { name: '미리보기' })).toHaveAttribute('aria-selected', 'true');
+  expect(screen.getByRole('tab', { name: 'Elements' })).toHaveAttribute('aria-selected', 'true');
+});
+
+test('document lab locks file controls while parsing and shows an actionable server error', async () => {
+  let resolveFetch!: (value: { ok: boolean; json: () => Promise<{ message: string }> }) => void;
+  const fetchPromise = new Promise<{ ok: boolean; json: () => Promise<{ message: string }> }>((resolve) => {
+    resolveFetch = resolve;
+  });
+  vi.stubGlobal('fetch', vi.fn(() => fetchPromise));
+  render(<DocumentLabWorkspace />);
+
+  const input = screen.getByLabelText('테스트 파일');
+  fireEvent.change(input, { target: { files: [new File(['bad'], 'bad.pdf', { type: 'application/pdf' })] } });
+  fireEvent.click(screen.getByRole('button', { name: '문서 파싱' }));
+
+  expect(await screen.findByRole('status')).toHaveTextContent('문서를 페이지별로 분석하고 있습니다.');
+  expect(input).toBeDisabled();
+  expect(screen.getByRole('button', { name: '파싱 중…' })).toBeDisabled();
+
+  resolveFetch({ ok: false, json: async () => ({ message: 'UPSTAGE_API_KEY is required.' }) });
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent('UPSTAGE_API_KEY is required.');
+  expect(alert).toHaveTextContent('파일 형식과 서버 설정을 확인한 뒤 같은 파일로 다시 시도하세요.');
+  expect(input).not.toBeDisabled();
 });
 
 test('source workspace exposes PDF upload and each processing stage', () => {
