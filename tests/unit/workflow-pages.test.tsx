@@ -91,7 +91,12 @@ test('document lab uploads one file and switches every result pane by PDF page',
   expect(screen.getByRole('button', { name: 'Page 02' })).toHaveAttribute('aria-pressed', 'true');
   expect(screen.getByAltText('원본 페이지 2')).toHaveAttribute('src', responseBody.pages[1].dataUrl);
   expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('sandbox', '');
-  expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('srcdoc', '<h1>둘째 페이지</h1>');
+  expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('referrerpolicy', 'no-referrer');
+  expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute(
+    'srcdoc',
+    expect.stringContaining("default-src 'none'; img-src data: blob:"),
+  );
+  expect(screen.getByTitle('변환 HTML 페이지 2')).toHaveAttribute('srcdoc', expect.stringContaining('<h1>둘째 페이지</h1>'));
 
   const previewTab = screen.getByRole('tab', { name: '미리보기' });
   previewTab.focus();

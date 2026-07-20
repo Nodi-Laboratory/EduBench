@@ -1,7 +1,7 @@
 import { access, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { expect, test } from 'vitest';
-import { renderPdfPages } from '@/server/documents/page-renderer';
+import { renderPdfPages, streamPdfPages } from '@/server/documents/page-renderer';
 
 test('renders PDF pages as ordered 150-DPI PNG data URLs', async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
@@ -36,6 +36,54 @@ test('cleans up temporary PDF files when rendering fails', async () => {
       throw new Error('pdftoppm failed');
     },
   })).rejects.toThrow('pdftoppm failed');
+
+  await expect(access(tempDirectory)).rejects.toThrow();
+});
+
+test('streams one spooled PNG at a time without persistent data URLs and cleans up on early return', async () => {
+  let tempDirectory = '';
+  const controller = new AbortController();
+  const pages = streamPdfPages(new Uint8Array([37, 80, 68, 70]), {
+    signal: controller.signal,
+    timeoutMs: 12_345,
+    commandRunner: async (_command, args, options) => {
+      tempDirectory = dirname(args.at(-1)!);
+      expect(options).toEqual({ signal: controller.signal, timeout: 12_345 });
+      await writeFile(`${args.at(-1)!}-1.png`, new Uint8Array([1]));
+      await writeFile(`${args.at(-1)!}-2.png`, new Uint8Array([2]));
+    },
+  });
+
+  const first = await pages.next();
+  expect(first.value).toEqual({
+    pageNumber: 1,
+    bytes: new Uint8Array([1]),
+    mimeType: 'image/png',
+    filename: 'page-1.png',
+    width: null,
+    height: null,
+  });
+  expect(first.value).not.toHaveProperty('dataUrl');
+  await expect(access(tempDirectory)).resolves.toBeUndefined();
+
+  await pages.return(undefined);
+  await expect(access(tempDirectory)).rejects.toThrow();
+});
+
+test('cleans up the spool when streaming iteration throws during page processing', async () => {
+  let tempDirectory = '';
+
+  await expect((async () => {
+    for await (const page of streamPdfPages(new Uint8Array([37, 80, 68, 70]), {
+      commandRunner: async (_command, args) => {
+        tempDirectory = dirname(args.at(-1)!);
+        await writeFile(`${args.at(-1)!}-1.png`, new Uint8Array([1]));
+      },
+    })) {
+      expect(page.pageNumber).toBe(1);
+      throw new Error('consumer failed');
+    }
+  })()).rejects.toThrow('consumer failed');
 
   await expect(access(tempDirectory)).rejects.toThrow();
 });

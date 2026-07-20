@@ -52,7 +52,7 @@ export async function executeFetch(
     return await operation();
   } catch (error) {
     if (error instanceof ProviderError) throw error;
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
       throw new ProviderError({ kind: 'TIMEOUT', message: 'TIMEOUT: 공급자 요청 시간이 초과됐습니다.', retryable: true, cause: error });
     }
     throw new ProviderError({ kind: 'NETWORK', message: 'NETWORK: 공급자에 연결하지 못했습니다.', retryable: true, cause: error });

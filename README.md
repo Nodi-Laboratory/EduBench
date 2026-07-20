@@ -45,6 +45,16 @@ npm run dev
 
 별도 터미널에서 `npm run worker`를 실행합니다.
 
+## Document Lab
+
+`http://localhost:63000/document-lab`에서 PDF, PNG, JPEG, WebP 파일을 일회성으로 파싱해 원본 페이지와 Upstage HTML 결과를 비교할 수 있습니다. 업로드와 결과는 DB에 저장되지 않습니다. `MOCK_PROVIDERS=false`일 때는 서버의 `UPSTAGE_API_KEY`를 사용하며 브라우저로 키를 전달하지 않습니다.
+
+- PDF는 Poppler `pdftoppm`으로 페이지별 150 DPI PNG를 만든 뒤 순서대로 파싱합니다.
+- 요청 옵션은 `ocr=force`, `mode=enhanced`, `base64_encoding=['footnote']`, `output_formats=['html']`입니다.
+- 최대 입력은 100 MiB, 최대 50페이지, 렌더링 이미지 합계 64 MiB, 응답 32 MiB입니다.
+- Docker 이미지에는 Poppler가 포함됩니다. 로컬 실행에는 Poppler를 설치하거나 `PDFTOPPM_PATH`에 실행 파일 경로를 지정해야 합니다.
+- `PROVIDER_TIMEOUT_MS`는 각 Upstage 요청과 PDF 렌더링의 제한 시간으로 사용됩니다.
+
 ## 검증
 
 ```powershell

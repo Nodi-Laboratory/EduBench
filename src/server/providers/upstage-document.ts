@@ -8,7 +8,7 @@ export type DocumentParseOptions = {
 };
 
 export class UpstageDocumentParser {
-  constructor(private readonly options: { apiKey: string; model?: string; baseUrl?: string; fetch?: FetchLike }) {}
+  constructor(private readonly options: { apiKey: string; model?: string; baseUrl?: string; fetch?: FetchLike; timeoutMs?: number }) {}
   async parse(bytes: Uint8Array, filename: string, options: DocumentParseOptions) {
     const form = new FormData();
     const model = this.options.model ?? 'document-parse';
@@ -27,10 +27,26 @@ export class UpstageDocumentParser {
     form.append('mode', requestConfig.mode);
     form.append('base64_encoding', JSON.stringify(requestConfig.base64_encoding));
     form.append('output_formats', JSON.stringify(requestConfig.output_formats));
-    const response = await executeFetch(() => (this.options.fetch ?? fetch)(
-      `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/+$/, '')}/document-digitization`,
-      { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal: options.signal },
-    ));
+    const configuredTimeout = this.options.timeoutMs ?? Number(process.env.PROVIDER_TIMEOUT_MS || 120_000);
+    const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 120_000;
+    const timeoutController = new AbortController();
+    const timer = setTimeout(
+      () => timeoutController.abort(new DOMException('Document Parse request timed out.', 'TimeoutError')),
+      timeoutMs,
+    );
+    const signal = options.signal ? AbortSignal.any([options.signal, timeoutController.signal]) : timeoutController.signal;
+    let response: Response;
+    try {
+      response = await executeFetch(() => (this.options.fetch ?? fetch)(
+        `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/+$/, '')}/document-digitization`,
+        { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal },
+      ));
+    } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
     await assertProviderResponse(response, this.options.apiKey);
     const raw = await response.json() as { html?: string; content?: { html?: string }; elements?: unknown[]; model?: string };
     const html = raw.content?.html ?? raw.html;

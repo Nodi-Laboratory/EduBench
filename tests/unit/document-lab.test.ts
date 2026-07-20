@@ -1,14 +1,15 @@
-import { afterEach, expect, test } from 'vitest';
+import { afterEach, expect, test, vi } from 'vitest';
 import { POST } from '@/app/api/document-lab/parse/route';
-import { parseDocumentLabFile } from '@/server/documents/lab';
+import { DOCUMENT_LAB_LIMITS, parseDocumentLabFile } from '@/server/documents/lab';
 
 const originalMockProviders = process.env.MOCK_PROVIDERS;
 const originalUpstageApiKey = process.env.UPSTAGE_API_KEY;
 
-function metadataFile(bytes: Uint8Array, size: number, name = 'document.bin'): File {
+function metadataFile(bytes: Uint8Array, size: number, name = 'document.png', type = 'image/png'): File {
   return {
     name,
     size,
+    type,
     arrayBuffer: async () => Uint8Array.from(bytes).buffer,
   } as File;
 }
@@ -18,6 +19,7 @@ afterEach(() => {
   else process.env.MOCK_PROVIDERS = originalMockProviders;
   if (originalUpstageApiKey === undefined) delete process.env.UPSTAGE_API_KEY;
   else process.env.UPSTAGE_API_KEY = originalUpstageApiKey;
+  vi.unstubAllGlobals();
 });
 
 test('rejects a declared PDF whose bytes are not a supported document', async () => {
@@ -76,10 +78,10 @@ test('returns a representative, stateless parsed page for a mock PDF', async () 
   });
 });
 
-test('parses a JPEG directly using its detected mime type and data URL', async () => {
+test('parses a JPEG when its declared and detected MIME types match', async () => {
   delete process.env.MOCK_PROVIDERS;
   process.env.UPSTAGE_API_KEY = 'server-only-key';
-  const jpeg = new File([new Uint8Array([0xff, 0xd8, 0xff, 0xe0])], 'photo.bin', { type: 'application/octet-stream' });
+  const jpeg = new File([new Uint8Array([0xff, 0xd8, 0xff, 0xe0])], 'photo.jpg', { type: 'image/jpeg' });
   const parseCalls: Array<{ mimeType: string; pageNumber: number }> = [];
 
   const result = await parseDocumentLabFile(jpeg, {
@@ -113,7 +115,7 @@ test.each([
   process.env.UPSTAGE_API_KEY = 'server-only-key';
   const calls: string[] = [];
 
-  const result = await parseDocumentLabFile(new File([bytes], 'image.bin'), {
+  const result = await parseDocumentLabFile(new File([bytes], 'image.bin', { type: mimeType }), {
     parser: {
       parse: async (_bytes, _filename, options) => {
         calls.push(options.mimeType);
@@ -124,6 +126,15 @@ test.each([
 
   expect(calls).toEqual([mimeType]);
   expect(result.pages[0]).toMatchObject({ mimeType, dataUrl: `data:${mimeType};base64,${Buffer.from(bytes).toString('base64')}` });
+});
+
+test('rejects supported magic bytes when the declared MIME type does not match', async () => {
+  const jpeg = new File([new Uint8Array([0xff, 0xd8, 0xff, 0xe0])], 'photo.jpg', { type: 'image/png' });
+
+  await expect(parseDocumentLabFile(jpeg)).rejects.toMatchObject({
+    status: 400,
+    code: 'INVALID_DOCUMENT_FILE',
+  });
 });
 
 test('hands each rendered PDF page to the parser as a complete PNG image', async () => {
@@ -200,4 +211,91 @@ test('returns a typed configured error without exposing credentials', async () =
     code: 'UPSTAGE_NOT_CONFIGURED',
     message: 'UPSTAGE_API_KEY is required to parse documents.',
   });
+});
+
+test('stops streamed PDF accumulation at the page limit and closes the renderer', async () => {
+  process.env.MOCK_PROVIDERS = 'true';
+  let cleaned = false;
+  const pdf = new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], 'lesson.pdf', { type: 'application/pdf' });
+
+  const parsing = parseDocumentLabFile(pdf, {
+    limits: { ...DOCUMENT_LAB_LIMITS, maxPages: 1 },
+    streamPdfPages: async function* () {
+      try {
+        yield { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', width: null, height: null };
+        yield { pageNumber: 2, bytes: new Uint8Array([2]), mimeType: 'image/png', filename: 'page-2.png', width: null, height: null };
+      } finally {
+        cleaned = true;
+      }
+    },
+  });
+
+  await expect(parsing).rejects.toMatchObject({ status: 413, code: 'LAB_PAGE_LIMIT_EXCEEDED' });
+  expect(cleaned).toBe(true);
+});
+
+test('rejects expanded rendered bytes before building an unbounded Lab response', async () => {
+  process.env.MOCK_PROVIDERS = 'true';
+  const pdf = new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], 'lesson.pdf', { type: 'application/pdf' });
+
+  await expect(parseDocumentLabFile(pdf, {
+    limits: { ...DOCUMENT_LAB_LIMITS, maxRenderedBytes: 1 },
+    streamPdfPages: async function* () {
+      yield { pageNumber: 1, bytes: new Uint8Array([1, 2]), mimeType: 'image/png', filename: 'page-1.png', width: null, height: null };
+    },
+  })).rejects.toMatchObject({ status: 413, code: 'LAB_RENDERED_BYTES_LIMIT_EXCEEDED' });
+});
+
+test('rejects an oversized serialized Lab response with a typed 4xx error', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const png = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'page.png', { type: 'image/png' });
+
+  await expect(parseDocumentLabFile(png, {
+    limits: { ...DOCUMENT_LAB_LIMITS, maxResponseBytes: 128 },
+    parser: {
+      parse: async () => ({
+        html: `<p>${'x'.repeat(256)}</p>`, elements: [], raw: {}, requestId: 'large-response', model: 'document-parse', requestConfig: {},
+      }),
+    },
+  })).rejects.toMatchObject({ status: 413, code: 'LAB_RESPONSE_LIMIT_EXCEEDED' });
+});
+
+test('returns safe page and request provenance while redacting provider bodies and credentials', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'super-secret-key';
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+    JSON.stringify({ error: 'Authorization Bearer super-secret-key', image: 'data:image/png;base64,AAAA' }),
+    { status: 503, headers: { 'x-request-id': 'provider-request-7' } },
+  )));
+  const form = new FormData();
+  form.set('file', new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'page.png', { type: 'image/png' }));
+
+  const response = await POST(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
+  const body = await response.json();
+
+  expect(response.status).toBe(502);
+  expect(body).toEqual({
+    code: 'DOCUMENT_PAGE_PARSE_FAILED',
+    message: 'Unable to parse document page 1.',
+    pageNumber: 1,
+    provider: 'upstage',
+    category: 'PROVIDER_5XX',
+    status: 503,
+    requestId: 'provider-request-7',
+  });
+  expect(JSON.stringify(body)).not.toMatch(/super-secret|authorization|base64|AAAA|stack/i);
+});
+
+test('extracts original PNG dimensions for the page-coordinate signature', async () => {
+  process.env.MOCK_PROVIDERS = 'true';
+  const png = new Uint8Array(24);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  png.set([0x49, 0x48, 0x44, 0x52], 12);
+  new DataView(png.buffer).setUint32(16, 640);
+  new DataView(png.buffer).setUint32(20, 480);
+
+  const result = await parseDocumentLabFile(new File([png], 'page.png', { type: 'image/png' }));
+
+  expect(result.pages[0]).toMatchObject({ width: 640, height: 480 });
 });

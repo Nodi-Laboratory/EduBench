@@ -7,6 +7,8 @@ import {
   enqueueJob,
   failJob,
   recoverExpiredLeases,
+  renewJobLease,
+  withJobLeaseHeartbeat,
 } from '@/server/jobs/queue';
 
 beforeAll(async () => {
@@ -83,4 +85,44 @@ test('marks an exhausted job as terminal instead of retrying forever', async () 
   expect(state).toBe('TERMINAL_FAILED');
   const stored = await db.query<{ state: string }>('select state from jobs where id = $1', [job!.id]);
   expect(stored.rows[0]?.state).toBe('TERMINAL_FAILED');
+});
+
+test('renews a slow job through its claim attempt until all sequential work finishes', async () => {
+  await enqueueJob({ kind: 'document.parse', payload: { sourceId: 'slow' }, idempotencyKey: 'parse:slow' });
+  const [job] = await claimJobs('worker-heartbeat', 1, 120);
+  const lease = { jobId: job!.id, workerId: 'worker-heartbeat', attempt: job!.attempts };
+  const pages: number[] = [];
+
+  await withJobLeaseHeartbeat(lease, { leaseMs: 120, heartbeatMs: 20 }, async (signal) => {
+    for (const page of [1, 2, 3]) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      signal.throwIfAborted();
+      pages.push(page);
+    }
+    expect(await recoverExpiredLeases()).toBe(0);
+    expect(await claimJobs('replacement-worker', 1, 120)).toEqual([]);
+  });
+
+  expect(pages).toEqual([1, 2, 3]);
+  await completeJob(lease, { pages: pages.length });
+});
+
+test('rejects renewal, completion, and failure from a reclaimed attempt even with the same worker id', async () => {
+  await enqueueJob({ kind: 'document.parse', payload: { sourceId: 'stale' }, idempotencyKey: 'parse:stale' });
+  const [first] = await claimJobs('worker-reused', 1, 60_000);
+  const staleLease = { jobId: first!.id, workerId: 'worker-reused', attempt: first!.attempts };
+  await db.query(`update jobs set lease_expires_at = now() - interval '1 second' where id = $1`, [first!.id]);
+  expect(await recoverExpiredLeases()).toBe(1);
+  const [second] = await claimJobs('worker-reused', 1, 60_000);
+  const currentLease = { jobId: second!.id, workerId: 'worker-reused', attempt: second!.attempts };
+
+  await expect(renewJobLease(staleLease, 60_000)).resolves.toBe(false);
+  await expect(completeJob(staleLease, { stale: true })).rejects.toMatchObject({ code: 'JOB_LEASE_MISMATCH' });
+  await expect(failJob(staleLease, { code: 'STALE', message: 'stale failure', retryDelayMs: 0 })).rejects.toMatchObject({ code: 'JOB_LEASE_MISMATCH' });
+
+  const stillCurrent = await db.query<{ state: string; attempts: number; result: unknown; last_error_code: string | null }>(
+    'select state, attempts, result, last_error_code from jobs where id = $1', [second!.id],
+  );
+  expect(stillCurrent.rows[0]).toMatchObject({ state: 'LEASED', attempts: 2, result: null, last_error_code: 'LEASE_EXPIRED' });
+  await completeJob(currentLease, { current: true });
 });

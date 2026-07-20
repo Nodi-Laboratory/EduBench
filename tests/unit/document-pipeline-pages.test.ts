@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { parseDocumentPages } from '@/server/documents/pipeline';
+import { MAX_PERSISTED_RAW_PROVENANCE_BYTES, parseDocumentPages } from '@/server/documents/pipeline';
 
 test('renders PDF pages and parses PNG pages in page-number order', async () => {
   const pdf = new Uint8Array([37, 80, 68, 70]);
@@ -65,4 +65,74 @@ test('names the failed page while preserving the parser error', async () => {
       },
     },
   })).rejects.toThrow('DOCUMENT_PARSE_PAGE_3: provider temporarily unavailable');
+});
+
+test('consumes the PDF spool one page at a time and releases each page before requesting the next', async () => {
+  const produced: number[] = [];
+  let firstPageStarted!: () => void;
+  const started = new Promise<void>((resolve) => { firstPageStarted = resolve; });
+  let releaseFirstPage!: () => void;
+  const released = new Promise<void>((resolve) => { releaseFirstPage = resolve; });
+
+  const resultPromise = parseDocumentPages(new Uint8Array([37, 80, 68, 70]), {
+    streamPdfPages: async function* () {
+      produced.push(1);
+      yield { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', width: 100, height: 200 };
+      produced.push(2);
+      yield { pageNumber: 2, bytes: new Uint8Array([2]), mimeType: 'image/png', filename: 'page-2.png', width: 100, height: 200 };
+    },
+    parser: {
+      parse: async (_bytes, _filename, options) => {
+        if (options.pageNumber === 1) {
+          firstPageStarted();
+          await released;
+        }
+        return { html: `<p>${options.pageNumber}</p>`, raw: {}, requestId: null, model: 'document-parse', requestConfig: {} };
+      },
+    },
+  });
+
+  await Promise.race([started, resultPromise]);
+  expect(produced).toEqual([1]);
+  releaseFirstPage();
+  await expect(resultPromise).resolves.toMatchObject({ html: expect.stringContaining('data-page="2"') });
+  expect(produced).toEqual([1, 2]);
+});
+
+test('bounds aggregate persistent raw provenance without retaining oversized provider payloads', async () => {
+  const oversizedRaw = { duplicatedBase64: 'A'.repeat(MAX_PERSISTED_RAW_PROVENANCE_BYTES + 1) };
+
+  const result = await parseDocumentPages(new Uint8Array([37, 80, 68, 70]), {
+    streamPdfPages: async function* () {
+      yield { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', width: null, height: null };
+    },
+    parser: {
+      parse: async () => ({ html: '<p>page</p>', raw: oversizedRaw, requestId: 'request-1', model: 'document-parse', requestConfig: {} }),
+    },
+  });
+
+  expect(result.raw.pages[0]?.raw).toEqual({
+    omitted: true,
+    reason: 'PERSISTED_RAW_PROVENANCE_LIMIT',
+    byteLength: expect.any(Number),
+  });
+  expect(JSON.stringify(result.raw)).not.toContain(oversizedRaw.duplicatedBase64);
+});
+
+test('preserves the document cancellation reason instead of wrapping it as a page failure', async () => {
+  const controller = new AbortController();
+  const reason = new Error('lease lost');
+
+  await expect(parseDocumentPages(new Uint8Array([37, 80, 68, 70]), {
+    signal: controller.signal,
+    streamPdfPages: async function* () {
+      yield { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', width: null, height: null };
+    },
+    parser: {
+      parse: async () => {
+        controller.abort(reason);
+        throw reason;
+      },
+    },
+  })).rejects.toBe(reason);
 });

@@ -24,6 +24,8 @@ type LabPage = {
   requestId: string | null;
   model: string;
   requestConfig: unknown;
+  width?: number | null;
+  height?: number | null;
 };
 
 type LabResponse = {
@@ -48,6 +50,10 @@ const detailTabs: readonly { id: DetailTab; label: string }[] = [
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function previewDocument(html: string) {
+  return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:"><meta name="referrer" content="no-referrer"></head><body>${html}</body></html>`;
 }
 
 function coordinate(value: number) {
@@ -216,11 +222,16 @@ export function DocumentLabWorkspace() {
             aria-labelledby="document-lab-preview-tab"
             hidden={htmlTab !== 'preview'}
           >
-            {page ? (
+            {htmlTab === 'preview' && page ? (
               <div className="lab-html-content">
-                <iframe title={`변환 HTML 페이지 ${page.pageNumber}`} sandbox="" srcDoc={page.html} />
+                <iframe
+                  title={`변환 HTML 페이지 ${page.pageNumber}`}
+                  sandbox=""
+                  referrerPolicy="no-referrer"
+                  srcDoc={previewDocument(page.html)}
+                />
               </div>
-            ) : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 샌드박스 미리보기와 소스 HTML을 확인할 수 있습니다." />}
+            ) : htmlTab === 'preview' && <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 샌드박스 미리보기와 소스 HTML을 확인할 수 있습니다." />}
           </div>
           <div
             className="lab-html-panel"
@@ -229,7 +240,7 @@ export function DocumentLabWorkspace() {
             aria-labelledby="document-lab-source-tab"
             hidden={htmlTab !== 'source'}
           >
-            {page ? <pre className="lab-code">{page.html}</pre> : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 소스 HTML을 확인할 수 있습니다." />}
+            {htmlTab === 'source' && (page ? <pre className="lab-code">{page.html}</pre> : <EmptyPane icon={<FileCode2 size={22} />} text="파싱이 끝나면 소스 HTML을 확인할 수 있습니다." />)}
           </div>
         </section>
 
@@ -259,7 +270,7 @@ export function DocumentLabWorkspace() {
             aria-labelledby="document-lab-elements-tab"
             hidden={detailTab !== 'elements'}
           >
-            {page ? <pre>{pretty(page.elements)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="Elements는 응답을 받은 뒤 표시됩니다." />}
+            {detailTab === 'elements' && (page ? <pre>{pretty(page.elements)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="Elements는 응답을 받은 뒤 표시됩니다." />)}
           </div>
           <div
             className="lab-detail-content"
@@ -268,7 +279,7 @@ export function DocumentLabWorkspace() {
             aria-labelledby="document-lab-raw-tab"
             hidden={detailTab !== 'raw'}
           >
-            {page ? <pre>{pretty(page.raw)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="원본 JSON은 응답을 받은 뒤 표시됩니다." />}
+            {detailTab === 'raw' && (page ? <pre>{pretty(page.raw)}</pre> : <EmptyPane icon={<ScrollText size={22} />} text="원본 JSON은 응답을 받은 뒤 표시됩니다." />)}
           </div>
           <div
             className="lab-detail-content"
@@ -277,16 +288,18 @@ export function DocumentLabWorkspace() {
             aria-labelledby="document-lab-request-tab"
             hidden={detailTab !== 'request'}
           >
-            {page ? (
+            {detailTab === 'request' && (page ? (
                 <dl className="lab-request-info">
                   <div><dt>REQUEST ID</dt><dd className="mono">{page.requestId ?? '제공되지 않음'}</dd></div>
                   <div><dt>MODEL</dt><dd className="mono">{page.model || '제공되지 않음'}</dd></div>
                   <div><dt>FILE</dt><dd>{page.filename}</dd></div>
                   <div><dt>MIME TYPE</dt><dd className="mono">{page.mimeType}</dd></div>
                   <div><dt>PAGE</dt><dd className="mono">{page.pageNumber}</dd></div>
+                  <div><dt>DIMENSIONS</dt><dd className="mono">{page.width && page.height ? `${page.width} × ${page.height}` : '제공되지 않음'}</dd></div>
+                  <div><dt>ELEMENTS</dt><dd className="mono">{page.elements.length}</dd></div>
                   <div><dt>REQUEST CONFIG</dt><dd><pre>{pretty(page.requestConfig)}</pre></dd></div>
                 </dl>
-              ) : <EmptyPane icon={<ScrollText size={22} />} text="요청 정보는 응답을 받은 뒤 표시됩니다." />}
+              ) : <EmptyPane icon={<ScrollText size={22} />} text="요청 정보는 응답을 받은 뒤 표시됩니다." />)}
           </div>
         </section>
       </div>

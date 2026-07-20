@@ -16,6 +16,12 @@ export type JobRecord = {
   lease_expires_at: Date | null;
 };
 
+export type JobLease = {
+  jobId: string;
+  workerId: string;
+  attempt: number;
+};
+
 export type EnqueueInput = {
   kind: string;
   payload: Record<string, unknown>;
@@ -107,37 +113,91 @@ export async function claimJobs(
   });
 }
 
+export async function renewJobLease(lease: JobLease, leaseMs: number): Promise<boolean> {
+  if (leaseMs < 1) throw new DomainError('INVALID_LEASE_DURATION', 'leaseMs는 1 이상이어야 합니다.');
+  const renewed = await withTransaction((client) => client.query(
+    `update jobs set lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), updated_at = now()
+     where id = $1 and state = 'LEASED' and lease_owner = $2 and attempts = $3
+       and lease_expires_at > now()
+     returning id`,
+    [lease.jobId, lease.workerId, lease.attempt, leaseMs],
+  ));
+  return Boolean(renewed.rowCount);
+}
+
+export async function withJobLeaseHeartbeat<T>(
+  lease: JobLease,
+  options: { leaseMs: number; heartbeatMs?: number },
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const heartbeatMs = options.heartbeatMs ?? Math.min(60_000, Math.max(1, Math.floor(options.leaseMs / 3)));
+  let renewal = Promise.resolve();
+  const timer = setInterval(() => {
+    renewal = renewal.then(async () => {
+      if (!await renewJobLease(lease, options.leaseMs)) {
+        controller.abort(new DomainError('JOB_LEASE_MISMATCH', '작업 lease가 만료되었거나 다른 시도에 선점되었습니다.', lease));
+      }
+    }).catch((error) => controller.abort(error));
+  }, heartbeatMs);
+
+  try {
+    const result = await operation(controller.signal);
+    controller.signal.throwIfAborted();
+    return result;
+  } finally {
+    clearInterval(timer);
+    await renewal;
+  }
+}
+
+export async function completeJob(lease: JobLease, result: Record<string, unknown>): Promise<void>;
+export async function completeJob(jobId: string, workerId: string, result: Record<string, unknown>): Promise<void>;
 export async function completeJob(
-  jobId: string,
-  workerId: string,
-  result: Record<string, unknown>,
+  leaseOrJobId: JobLease | string,
+  resultOrWorkerId: Record<string, unknown> | string,
+  maybeResult?: Record<string, unknown>,
 ): Promise<void> {
+  const lease = typeof leaseOrJobId === 'string'
+    ? { jobId: leaseOrJobId, workerId: resultOrWorkerId as string, attempt: null }
+    : leaseOrJobId;
+  const result = (typeof leaseOrJobId === 'string' ? maybeResult : resultOrWorkerId) as Record<string, unknown>;
   await withTransaction(async (client) => {
     const updated = await client.query(
-      `update jobs set state = 'SUCCEEDED', result = $3::jsonb,
+      `update jobs set state = 'SUCCEEDED', result = $4::jsonb,
          lease_owner = null, lease_expires_at = null, completed_at = now(), updated_at = now()
        where id = $1 and state = 'LEASED' and lease_owner = $2
+         and ($3::int is null or attempts = $3) and lease_expires_at > now()
        returning id`,
-      [jobId, workerId, JSON.stringify(result)],
+      [lease.jobId, lease.workerId, lease.attempt, JSON.stringify(result)],
     );
-    if (!updated.rowCount) throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', { jobId, workerId });
-    await appendEvent(client, jobId, 'JOB_SUCCEEDED', { workerId });
+    if (!updated.rowCount) throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', lease);
+    await appendEvent(client, lease.jobId, 'JOB_SUCCEEDED', { workerId: lease.workerId, attempt: lease.attempt });
   });
 }
 
+type JobFailure = { code: string; message: string; retryDelayMs: number };
+
+export async function failJob(lease: JobLease, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
+export async function failJob(jobId: string, workerId: string, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
 export async function failJob(
-  jobId: string,
-  workerId: string,
-  error: { code: string; message: string; retryDelayMs: number },
+  leaseOrJobId: JobLease | string,
+  errorOrWorkerId: JobFailure | string,
+  maybeError?: JobFailure,
 ): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'> {
+  const lease = typeof leaseOrJobId === 'string'
+    ? { jobId: leaseOrJobId, workerId: errorOrWorkerId as string, attempt: null }
+    : leaseOrJobId;
+  const error = (typeof leaseOrJobId === 'string' ? maybeError : errorOrWorkerId) as JobFailure;
   return withTransaction(async (client) => {
     const current = await client.query<{ attempts: number; max_attempts: number }>(
       `select attempts, max_attempts from jobs
-       where id = $1 and state = 'LEASED' and lease_owner = $2 for update`,
-      [jobId, workerId],
+       where id = $1 and state = 'LEASED' and lease_owner = $2
+         and ($3::int is null or attempts = $3) and lease_expires_at > now() for update`,
+      [lease.jobId, lease.workerId, lease.attempt],
     );
     const job = current.rows[0];
-    if (!job) throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', { jobId, workerId });
+    if (!job) throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', lease);
     const state = job.attempts >= job.max_attempts ? 'TERMINAL_FAILED' : 'RETRY_WAIT';
     await client.query(
       `update jobs set state = $3, last_error_code = $4, last_error_message = $5,
@@ -146,11 +206,11 @@ export async function failJob(
          lease_owner = null, lease_expires_at = null,
          completed_at = case when $3 = 'TERMINAL_FAILED' then now() else null end,
          updated_at = now()
-       where id = $1 and lease_owner = $2`,
-      [jobId, workerId, state, error.code, error.message, error.retryDelayMs],
+       where id = $1 and lease_owner = $2 and ($7::int is null or attempts = $7)`,
+      [lease.jobId, lease.workerId, state, error.code, error.message, error.retryDelayMs, lease.attempt],
     );
-    await appendEvent(client, jobId, state === 'RETRY_WAIT' ? 'JOB_RETRY_SCHEDULED' : 'JOB_TERMINAL_FAILED', {
-      workerId, code: error.code, retryDelayMs: error.retryDelayMs,
+    await appendEvent(client, lease.jobId, state === 'RETRY_WAIT' ? 'JOB_RETRY_SCHEDULED' : 'JOB_TERMINAL_FAILED', {
+      workerId: lease.workerId, attempt: lease.attempt, code: error.code, retryDelayMs: error.retryDelayMs,
     });
     return state;
   });

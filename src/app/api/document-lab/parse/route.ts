@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { DocumentLabError, parseDocumentLabFile } from '@/server/documents/lab';
+import { DocumentLabError, DocumentPageParseError, parseDocumentLabFile } from '@/server/documents/lab';
 
 export async function POST(request: Request) {
   try {
@@ -12,6 +12,17 @@ export async function POST(request: Request) {
   } catch (error) {
     if (error instanceof DocumentLabError) {
       return NextResponse.json({ code: error.code, message: error.message }, { status: error.status });
+    }
+    if (error instanceof DocumentPageParseError) {
+      return NextResponse.json({
+        code: error.code,
+        message: error.message,
+        pageNumber: error.pageNumber,
+        provider: error.provider,
+        category: error.category,
+        status: error.providerStatus,
+        requestId: error.requestId,
+      }, { status: 502 });
     }
     return NextResponse.json({ code: 'DOCUMENT_LAB_PARSE_FAILED', message: 'Unable to parse the document.' }, { status: 502 });
   }

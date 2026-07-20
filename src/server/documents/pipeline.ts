@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { chunkTextbook } from '@/domain/chunking';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
-import { renderPdfPages, type RenderedPage } from '@/server/documents/page-renderer';
+import { streamPdfPages, type RenderedPage, type StreamedPage } from '@/server/documents/page-renderer';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 import { UpstageDocumentParser, type DocumentParseOptions } from '@/server/providers/upstage-document';
 
@@ -22,24 +22,81 @@ type PageParser = {
 
 export type ParseDocumentPagesDependencies = {
   renderPdfPages?: (bytes: Uint8Array) => Promise<RenderedPage[]>;
+  streamPdfPages?: (bytes: Uint8Array) => AsyncIterable<StreamedPage>;
   parser: PageParser;
+  signal?: AbortSignal;
 };
 
-export async function parseDocumentPages(bytes: Uint8Array, filename: string, dependencies: ParseDocumentPagesDependencies) {
-  const pages = await (dependencies.renderPdfPages ?? renderPdfPages)(bytes);
-  const parsedPages: Array<{ page: RenderedPage; parsed: ParsedPage }> = [];
+type PipelinePage = RenderedPage | StreamedPage;
 
-  for (const page of pages) {
+type PersistedPageProvenance = {
+  pageNumber: number;
+  requestId: string | null;
+  model: string;
+  requestConfig: unknown;
+  raw: unknown;
+};
+
+type ParsedDocumentPages = {
+  html: string;
+  raw: { pages: PersistedPageProvenance[] };
+  requestId: string;
+  model: string | null;
+};
+
+export const MAX_PERSISTED_RAW_PROVENANCE_BYTES = 64 * 1024;
+
+async function* arrayPages(pages: Promise<RenderedPage[]>): AsyncGenerator<RenderedPage> {
+  for (const page of await pages) yield page;
+}
+
+function boundedRaw(raw: unknown, remainingBytes: number): { value: unknown; byteLength: number } {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(raw);
+  } catch {
+    serialized = '';
+  }
+  const byteLength = Buffer.byteLength(serialized, 'utf8');
+  if (serialized && byteLength <= remainingBytes) return { value: raw, byteLength };
+  return {
+    value: { omitted: true, reason: 'PERSISTED_RAW_PROVENANCE_LIMIT', byteLength },
+    byteLength: 0,
+  };
+}
+
+export function parseDocumentPages(bytes: Uint8Array, dependencies: ParseDocumentPagesDependencies): Promise<ParsedDocumentPages>;
+export function parseDocumentPages(bytes: Uint8Array, filename: string, dependencies: ParseDocumentPagesDependencies): Promise<ParsedDocumentPages>;
+export async function parseDocumentPages(
+  bytes: Uint8Array,
+  filenameOrDependencies: string | ParseDocumentPagesDependencies,
+  maybeDependencies?: ParseDocumentPagesDependencies,
+) {
+  const dependencies = typeof filenameOrDependencies === 'string' ? maybeDependencies! : filenameOrDependencies;
+  const pages: AsyncIterable<PipelinePage> = dependencies.streamPdfPages
+    ? dependencies.streamPdfPages(bytes)
+    : dependencies.renderPdfPages
+      ? arrayPages(dependencies.renderPdfPages(bytes))
+      : streamPdfPages(bytes, { signal: dependencies.signal, timeoutMs: Number(process.env.PROVIDER_TIMEOUT_MS || 120_000) });
+  const parsedPages: Array<{ page: PipelinePage; parsed: ParsedPage }> = [];
+  let persistedRawBytes = 0;
+
+  for await (const page of pages) {
     let parsed: ParsedPage;
     try {
       parsed = await dependencies.parser.parse(page.bytes, page.filename, {
         mimeType: page.mimeType,
         pageNumber: page.pageNumber,
+        signal: dependencies.signal,
       });
     } catch (error) {
+      if (dependencies.signal?.aborted) throw dependencies.signal.reason;
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`DOCUMENT_PARSE_PAGE_${page.pageNumber}: ${message}`, { cause: error });
     }
+    const safeRaw = boundedRaw(parsed.raw, MAX_PERSISTED_RAW_PROVENANCE_BYTES - persistedRawBytes);
+    persistedRawBytes += safeRaw.byteLength;
+    parsed = { ...parsed, raw: safeRaw.value };
     parsedPages.push({ page, parsed });
   }
 
@@ -59,12 +116,16 @@ export async function parseDocumentPages(bytes: Uint8Array, filename: string, de
   };
 }
 
-export async function processDocument(sourceId: string): Promise<{ revision: number; chunks: number; embeddingModel: string }> {
+export async function processDocument(
+  sourceId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<{ revision: number; chunks: number; embeddingModel: string }> {
   const sourceResult = await db.query<{ storage_path: string; original_name: string; subject: string | null; grade: string | null }>(
     'select storage_path, original_name, subject, grade from source_files where id = $1 and deleted_at is null', [sourceId],
   );
   const source = sourceResult.rows[0];
   if (!source) throw new Error('SOURCE_NOT_FOUND: 교과서 파일을 찾을 수 없습니다.');
+  options.signal?.throwIfAborted();
   const bytes = new Uint8Array(await readFile(source.storage_path));
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   await db.query("update source_files set status = 'PARSING', failed_stage = null, failure_code = null, failure_message = null, updated_at = now() where id = $1", [sourceId]);
@@ -72,7 +133,9 @@ export async function processDocument(sourceId: string): Promise<{ revision: num
     ? { html: `<section data-page="1"><h2>로컬 파이프라인 검증</h2><p>${source.original_name} 문서의 실제 내용은 MOCK 모드에서 추출하지 않습니다.</p></section>`, raw: { mock: true }, requestId: 'mock-document-parse', model: 'mock-document-parse' }
     : await parseDocumentPages(bytes, source.original_name, {
       parser: new UpstageDocumentParser({ apiKey: process.env.UPSTAGE_API_KEY ?? '', model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', baseUrl: process.env.UPSTAGE_BASE_URL }),
+      signal: options.signal,
     });
+  options.signal?.throwIfAborted();
   const parseHtml = /data-page=/.test(parsed.html) ? parsed.html : `<section data-page="1">${parsed.html}</section>`;
   const chunks = chunkTextbook(parseHtml, { maxTokens: 800 });
   if (!chunks.length) throw new Error('DOCUMENT_EMPTY: 문서에서 청크를 만들 수 없습니다.');
@@ -84,8 +147,12 @@ export async function processDocument(sourceId: string): Promise<{ revision: num
   if (mock) for (let index = 0; index < chunks.length; index += 1) vectors.push(new Array<number>(3072).fill(0));
   else {
     const embedder = new GeminiEmbedder({ apiKey: process.env.GOOGLE_API_KEY!, modelId: embeddingModel, dimensions: 3072, baseUrl: process.env.GEMINI_BASE_URL });
-    for (let start = 0; start < chunks.length; start += 50) vectors.push(...await embedder.embed(chunks.slice(start, start + 50).map((chunk) => chunk.content)));
+    for (let start = 0; start < chunks.length; start += 50) {
+      options.signal?.throwIfAborted();
+      vectors.push(...await embedder.embed(chunks.slice(start, start + 50).map((chunk) => chunk.content), options.signal));
+    }
   }
+  options.signal?.throwIfAborted();
   await withTransaction(async (client) => {
     await client.query("update source_files set status = 'PARSED', updated_at = now() where id = $1", [sourceId]);
     const sourceRevision = await client.query<{ id: string }>(
