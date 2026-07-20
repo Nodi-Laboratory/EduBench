@@ -2,10 +2,62 @@ import { readFile } from 'node:fs/promises';
 import { chunkTextbook } from '@/domain/chunking';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
+import { renderPdfPages, type RenderedPage } from '@/server/documents/page-renderer';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
-import { UpstageDocumentParser } from '@/server/providers/upstage-document';
+import { UpstageDocumentParser, type DocumentParseOptions } from '@/server/providers/upstage-document';
 
 function vectorLiteral(values: number[]): string { return `[${values.join(',')}]`; }
+
+type ParsedPage = {
+  html: string;
+  raw: unknown;
+  requestId: string | null;
+  model: string;
+  requestConfig: unknown;
+};
+
+type PageParser = {
+  parse(bytes: Uint8Array, filename: string, options: DocumentParseOptions): Promise<ParsedPage>;
+};
+
+export type ParseDocumentPagesDependencies = {
+  renderPdfPages?: (bytes: Uint8Array) => Promise<RenderedPage[]>;
+  parser: PageParser;
+};
+
+export async function parseDocumentPages(bytes: Uint8Array, filename: string, dependencies: ParseDocumentPagesDependencies) {
+  const pages = await (dependencies.renderPdfPages ?? renderPdfPages)(bytes);
+  const parsedPages: Array<{ page: RenderedPage; parsed: ParsedPage }> = [];
+
+  for (const page of pages) {
+    let parsed: ParsedPage;
+    try {
+      parsed = await dependencies.parser.parse(page.bytes, page.filename, {
+        mimeType: page.mimeType,
+        pageNumber: page.pageNumber,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`DOCUMENT_PARSE_PAGE_${page.pageNumber}: ${message}`, { cause: error });
+    }
+    parsedPages.push({ page, parsed });
+  }
+
+  return {
+    html: parsedPages.map(({ page, parsed }) => `<section data-page="${page.pageNumber}">${parsed.html}</section>`).join(''),
+    raw: {
+      pages: parsedPages.map(({ page, parsed }) => ({
+        pageNumber: page.pageNumber,
+        requestId: parsed.requestId,
+        model: parsed.model,
+        requestConfig: parsed.requestConfig,
+        raw: parsed.raw,
+      })),
+    },
+    requestId: parsedPages.map(({ parsed }) => parsed.requestId).join(','),
+    model: parsedPages[0]?.parsed.model ?? null,
+  };
+}
 
 export async function processDocument(sourceId: string): Promise<{ revision: number; chunks: number; embeddingModel: string }> {
   const sourceResult = await db.query<{ storage_path: string; original_name: string; subject: string | null; grade: string | null }>(
@@ -18,7 +70,9 @@ export async function processDocument(sourceId: string): Promise<{ revision: num
   await db.query("update source_files set status = 'PARSING', failed_stage = null, failure_code = null, failure_message = null, updated_at = now() where id = $1", [sourceId]);
   const parsed = mock
     ? { html: `<section data-page="1"><h2>로컬 파이프라인 검증</h2><p>${source.original_name} 문서의 실제 내용은 MOCK 모드에서 추출하지 않습니다.</p></section>`, raw: { mock: true }, requestId: 'mock-document-parse', model: 'mock-document-parse' }
-    : await new UpstageDocumentParser({ apiKey: process.env.UPSTAGE_API_KEY ?? '', model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', baseUrl: process.env.UPSTAGE_BASE_URL }).parse(bytes, source.original_name, { mimeType: 'application/pdf', pageNumber: 1 });
+    : await parseDocumentPages(bytes, source.original_name, {
+      parser: new UpstageDocumentParser({ apiKey: process.env.UPSTAGE_API_KEY ?? '', model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', baseUrl: process.env.UPSTAGE_BASE_URL }),
+    });
   const parseHtml = /data-page=/.test(parsed.html) ? parsed.html : `<section data-page="1">${parsed.html}</section>`;
   const chunks = chunkTextbook(parseHtml, { maxTokens: 800 });
   if (!chunks.length) throw new Error('DOCUMENT_EMPTY: 문서에서 청크를 만들 수 없습니다.');
