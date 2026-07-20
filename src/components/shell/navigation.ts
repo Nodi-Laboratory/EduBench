@@ -4,6 +4,7 @@ import {
   BookOpen,
   ClipboardCheck,
   Database,
+  FlaskConical,
   LayoutDashboard,
   PlayCircle,
   Settings,
@@ -19,6 +20,7 @@ export type NavItem = {
 
 export const NAV_ITEMS: readonly NavItem[] = [
   { href: '/dashboard', label: '운영 현황', icon: LayoutDashboard, group: '운영' },
+  { href: '/document-lab', label: 'Document Lab', icon: FlaskConical, group: '운영' },
   { href: '/sources', label: '교과서 자료 관리', icon: BookOpen, group: '운영' },
   { href: '/generation', label: '질문 생성', icon: Sparkles, group: '운영' },
   { href: '/review', label: '질문 검수', icon: ClipboardCheck, group: '운영' },
