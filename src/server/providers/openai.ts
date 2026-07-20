@@ -20,7 +20,7 @@ export class OpenAIProvider implements ModelProvider {
     this.apiKey = config.apiKey;
     this.modelId = config.modelId;
     this.fetcher = config.fetch ?? fetch;
-    this.baseUrl = config.baseUrl ?? 'https://api.openai.com/v1';
+    this.baseUrl = (config.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '');
   }
 
   async generate(request: GenerationRequest, signal?: AbortSignal): Promise<NormalizedGeneration> {

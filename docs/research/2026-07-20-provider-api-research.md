@@ -20,6 +20,21 @@
 
 EXAONE과 Mi:dm의 계약형 API 엔드포인트 세부 규격은 공개 공식 자료에서 확인되지 않았다. 따라서 URL, 모델 ID, 인증 헤더 방식은 `.env`에서 주입하고 OpenAI 호환을 기본 가정으로 하되, 실제 발급 문서가 다른 경우 해당 어댑터만 교체한다.
 
+### 공식 managed base URL 감사
+
+base URL은 개별 리소스 endpoint가 아니라 `scheme + host + 공통 경로 prefix`로 정의한다. 어댑터가 그 뒤에 버전 또는 리소스 경로를 붙인다. 공식 1차 자료를 2026-07-20에 다시 확인한 결과는 다음과 같다.
+
+| 제공사 | `.env.example` 값 | 공식 근거와 판단 |
+|---|---|---|
+| Google Gemini | `https://generativelanguage.googleapis.com` | Google은 이 값을 Gemini API의 service endpoint로 명시하고 모든 URI가 이 endpoint에 상대적이라고 설명한다. 현재 어댑터가 `/v1beta/...`를 담당하므로 버전은 base URL에 포함하지 않는다. [Gemini API all methods](https://ai.google.dev/api/all-methods) (접근일: 2026-07-20) |
+| Anthropic | `https://api.anthropic.com/v1` | 공식 시작 문서의 Messages 요청은 `https://api.anthropic.com/v1/messages`이다. EduBench는 공유 prefix인 `/v1`까지를 base로 두고 어댑터가 `/messages`를 붙인다. [Get started with Claude](https://platform.claude.com/docs/en/get-started) (접근일: 2026-07-20) |
+| OpenAI | `https://api.openai.com/v1` | 공식 Responses reference는 `https://api.openai.com/v1/responses`를 사용하며 공식 Node SDK도 기본 `baseURL`을 `https://api.openai.com/v1`로 정의한다. [Responses create reference](https://developers.openai.com/api/reference/resources/responses/methods/create), [official openai-node client](https://github.com/openai/openai-node/blob/main/src/client.ts) (접근일: 2026-07-20) |
+| Upstage | `https://api.upstage.ai/v1` | 공식 Console chat 예제는 이 값을 OpenAI SDK `base_url`로 사용하고, Document Parse 예제는 같은 prefix 아래 `/document-digitization`을 호출한다. [Chat API example](https://console.upstage.ai/api-keys?api=chat), [Document Parse API example](https://console.upstage.ai/api-keys?api=document-parsing) (접근일: 2026-07-20) |
+| LG AI Research EXAONE | 비움 | 검토한 LG AI Research 공식 공개 저장소는 사용자가 띄운 서버의 `http://localhost:8000/v1`을 예로 들며 자체 호스팅 OpenAI 호환 serving을 설명한다. 모든 사용자가 공유하는 LG 관리형 inference base URL은 이 공식 자료에 게시되어 있지 않다. 따라서 계약 또는 실제 배포가 발급한 URL만 입력한다. [EXAONE 4.5 official repository](https://github.com/LG-AI-EXAONE/EXAONE-4.5) (접근일: 2026-07-20) |
+| KT Mi:dm | 비움 | KT의 공식 모델 카드는 vLLM을 직접 실행해 로컬 OpenAI 호환 서버를 제공하는 방법과 외부 서비스 배포 진입점만 안내한다. KT가 모든 사용자에게 제공하는 하나의 안정적 managed inference base URL은 이 공식 자료에 게시되어 있지 않다. 따라서 자체·계약·외부 배포가 발급한 URL만 입력한다. [Mi:dm 2.0 official model card](https://huggingface.co/K-intelligence/Midm-2.0-Base-Instruct) (접근일: 2026-07-20) |
+
+`UPSTAGE_BASE_URL`에 `/document-digitization` 또는 `/chat/completions`를 넣거나 `ANTHROPIC_BASE_URL`에 `/messages`를 넣으면 안 된다. 끝의 slash는 어댑터가 정규화한다. 이 감사는 endpoint와 base prefix를 구분하며 기존 API 리소스 경로와 모델 ID를 변경하지 않는다.
+
 ## 2. 공통 내부 계약
 
 ### 요청
@@ -242,17 +257,20 @@ KT의 K-intelligence 공식 모델 카드는 Mi:dm 2.0 Base/Mini Instruct를 공
 DATABASE_URL=postgresql://edubench:edubench@postgres:5432/edubench
 
 # Google
-GEMINI_API_KEY=
+GOOGLE_API_KEY=
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com
 GEMINI_GENERATION_MODEL=
 GEMINI_EMBEDDING_MODEL=
 GEMINI_EMBEDDING_DIMENSIONS=1536
 
 # Anthropic
 ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
 ANTHROPIC_MODEL=
 
 # OpenAI
 OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=
 
 # Upstage
@@ -261,13 +279,13 @@ UPSTAGE_BASE_URL=https://api.upstage.ai/v1
 UPSTAGE_MODEL=
 UPSTAGE_DOCUMENT_PARSE_MODEL=document-parse
 
-# LG EXAONE: contract or self-hosted endpoint
+# LG EXAONE: 공개 단일 managed endpoint 없음; contract or self-hosted OpenAI-compatible deployment
 EXAONE_API_KEY=
 EXAONE_BASE_URL=
 EXAONE_MODEL=
 EXAONE_PROTOCOL=openai_chat_completions
 
-# KT Mi:dm: contract or self-hosted endpoint
+# KT Mi:dm: 공개 단일 managed endpoint 없음; contract or self-hosted OpenAI-compatible deployment
 MIDM_API_KEY=
 MIDM_BASE_URL=
 MIDM_MODEL=

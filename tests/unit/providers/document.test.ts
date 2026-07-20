@@ -3,7 +3,8 @@ import { UpstageDocumentParser } from '@/server/providers/upstage-document';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 
 test('sends the Upstage Enhanced multipart request for a PNG page', async () => {
-  const parser = new UpstageDocumentParser({ apiKey: 'secret', model: 'document-parse-enhanced', fetch: async (_url, init) => {
+  const parser = new UpstageDocumentParser({ apiKey: 'secret', model: 'document-parse-enhanced', baseUrl: 'https://upstage.test/v1/', fetch: async (url, init) => {
+    expect(url).toBe('https://upstage.test/v1/document-digitization');
     expect(init?.method).toBe('POST');
     expect(init?.body).toBeInstanceOf(FormData);
     const form = init?.body as FormData;
@@ -23,7 +24,10 @@ test('sends the Upstage Enhanced multipart request for a PNG page', async () => 
   });
 });
 
-test('normalizes Gemini batch embeddings', async () => {
-  const embedder = new GeminiEmbedder({ apiKey: 'secret', modelId: 'gemini-embedding-test', dimensions: 3, fetch: async () => new Response(JSON.stringify({ embeddings: [{ values: [0.1, 0.2, 0.3] }, { values: [0.4, 0.5, 0.6] }] })) });
+test('normalizes Gemini batch embeddings and uses its normalized base URL override', async () => {
+  const embedder = new GeminiEmbedder({ apiKey: 'secret', modelId: 'gemini-embedding-test', dimensions: 3, baseUrl: 'https://gemini.test/', fetch: async (url) => {
+    expect(url).toBe('https://gemini.test/v1beta/models/gemini-embedding-test:batchEmbedContents?key=secret');
+    return new Response(JSON.stringify({ embeddings: [{ values: [0.1, 0.2, 0.3] }, { values: [0.4, 0.5, 0.6] }] }));
+  } });
   await expect(embedder.embed(['원자', '분자'])).resolves.toEqual([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]);
 });

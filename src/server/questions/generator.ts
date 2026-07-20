@@ -30,7 +30,7 @@ export async function generateQuestions(batchId: string): Promise<{ questions: n
   let queryVector: string | null = null; const embeddingModel = process.env.GEMINI_EMBEDDING_MODEL ?? null;
   if (!mock) {
     if (!process.env.GOOGLE_API_KEY || !embeddingModel) throw new Error('GENERATION_EMBEDDING_NOT_CONFIGURED: 검색 질의 임베딩 환경변수가 필요합니다.');
-    const [vector] = await new GeminiEmbedder({ apiKey:process.env.GOOGLE_API_KEY, modelId:embeddingModel, dimensions:3072 }).embed([queryText], undefined, 'RETRIEVAL_QUERY');
+    const [vector] = await new GeminiEmbedder({ apiKey:process.env.GOOGLE_API_KEY, modelId:embeddingModel, dimensions:3072, baseUrl:process.env.GEMINI_BASE_URL }).embed([queryText], undefined, 'RETRIEVAL_QUERY');
     queryVector = `[${vector!.join(',')}]`;
   }
   const chunks = await db.query<{ id: string; content: string; page_start: number | null; unit: string | null }>(

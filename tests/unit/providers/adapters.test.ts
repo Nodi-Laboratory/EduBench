@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { GeminiProvider } from '@/server/providers/gemini';
 import { AnthropicProvider } from '@/server/providers/anthropic';
 import { OpenAIProvider } from '@/server/providers/openai';
@@ -86,6 +86,31 @@ test('registers all six providers from environment configuration', () => {
     MIDM_API_KEY: 'm', MIDM_MODEL: 'midm-model', MIDM_BASE_URL: 'https://midm.test/v1',
   });
   expect([...registry.keys()]).toEqual(['gemini', 'claude', 'openai', 'upstage', 'exaone', 'midm']);
+});
+
+test('uses normalized provider base URL overrides from environment configuration', async () => {
+  const requestedUrls: string[] = [];
+  vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+    requestedUrls.push(String(input));
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  try {
+    const registry = createProviderRegistry({
+      GOOGLE_API_KEY: 'g', GEMINI_GENERATION_MODEL: 'gemini-model', GEMINI_BASE_URL: 'https://gemini.test/',
+      ANTHROPIC_API_KEY: 'a', ANTHROPIC_MODEL: 'claude-model', ANTHROPIC_BASE_URL: 'https://anthropic.test/v1/',
+      OPENAI_API_KEY: 'o', OPENAI_MODEL: 'openai-model', OPENAI_BASE_URL: 'https://openai.test/v1/',
+      UPSTAGE_API_KEY: 'u', UPSTAGE_MODEL: 'solar-model', UPSTAGE_BASE_URL: 'https://upstage.test/v1/',
+    });
+    for (const provider of registry.values()) await provider.generate(request);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+  expect(requestedUrls).toEqual([
+    'https://gemini.test/v1beta/models/gemini-model:generateContent?key=g',
+    'https://anthropic.test/v1/messages',
+    'https://openai.test/v1/responses',
+    'https://upstage.test/v1/chat/completions',
+  ]);
 });
 
 test('registers only fully configured providers and supports explicit mock mode', () => {

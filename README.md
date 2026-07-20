@@ -26,6 +26,10 @@ docker compose up --build
 
 `.env`는 Git에서 제외됩니다. 화면에는 API 키를 입력하거나 연결을 확인하는 기능이 없습니다. 모델 선택 가능 여부만 필수 환경변수의 존재로 판단합니다.
 
+`*_BASE_URL`은 개별 요청 endpoint가 아니라 `scheme + host + 공통 경로 prefix`입니다. 기본값은 Gemini `https://generativelanguage.googleapis.com`, Anthropic `https://api.anthropic.com/v1`, OpenAI `https://api.openai.com/v1`, Upstage `https://api.upstage.ai/v1`입니다. 끝의 `/` 유무는 허용하지만 리소스 suffix는 넣지 않습니다. 예를 들어 `UPSTAGE_BASE_URL`에 `/document-digitization` 또는 `/chat/completions`를 붙이지 않고, `ANTHROPIC_BASE_URL`에 `/messages`를 붙이지 않습니다.
+
+EXAONE과 KT Mi:dm은 공개 공식 자료에서 모든 사용자가 공유하는 단일 관리형 inference base URL을 확인할 수 없으므로 예시 값을 비워 둡니다. 계약형 또는 자체 호스팅 OpenAI 호환 배포를 확보한 경우에만 해당 배포가 발급한 base URL을 입력합니다.
+
 로컬 파이프라인 자체를 API 비용 없이 검증해야 할 때만 `.env`의 `MOCK_PROVIDERS=true`를 사용합니다. 이 모드의 응답에는 공식 결과 사용 금지 경고가 포함됩니다. 근거 자료 산출 시에는 반드시 `false`로 두고 실제 API 설정을 사용해야 합니다.
 
 ## 개발 실행

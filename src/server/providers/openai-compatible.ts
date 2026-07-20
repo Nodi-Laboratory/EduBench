@@ -18,7 +18,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   constructor(config: { providerKey: string; apiKey: string; baseUrl: string; modelId: string; fetch?: FetchLike }) {
     this.key = config.providerKey;
     this.apiKey = config.apiKey;
-    this.baseUrl = config.baseUrl.replace(/\/$/, '');
+    this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.modelId = config.modelId;
     this.fetcher = config.fetch ?? fetch;
   }

@@ -20,12 +20,12 @@ export class AnthropicProvider implements ModelProvider {
     this.apiKey = config.apiKey;
     this.modelId = config.modelId;
     this.fetcher = config.fetch ?? fetch;
-    this.baseUrl = config.baseUrl ?? 'https://api.anthropic.com';
+    this.baseUrl = (config.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/+$/, '');
   }
 
   async generate(request: GenerationRequest, signal?: AbortSignal): Promise<NormalizedGeneration> {
     const started = performance.now();
-    const response = await executeFetch(() => this.fetcher(`${this.baseUrl}/v1/messages`, {
+    const response = await executeFetch(() => this.fetcher(`${this.baseUrl}/messages`, {
       method: 'POST', signal,
       headers: { 'content-type': 'application/json', 'x-api-key': this.apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({

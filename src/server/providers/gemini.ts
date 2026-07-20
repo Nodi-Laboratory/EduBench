@@ -18,7 +18,7 @@ export class GeminiProvider implements ModelProvider {
     this.apiKey = config.apiKey;
     this.modelId = config.modelId;
     this.fetcher = config.fetch ?? fetch;
-    this.baseUrl = config.baseUrl ?? 'https://generativelanguage.googleapis.com';
+    this.baseUrl = (config.baseUrl ?? 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
   }
 
   async generate(request: GenerationRequest, signal?: AbortSignal): Promise<NormalizedGeneration> {

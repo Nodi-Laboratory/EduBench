@@ -83,7 +83,7 @@ export async function processDocument(sourceId: string): Promise<{ revision: num
   const vectors: number[][] = [];
   if (mock) for (let index = 0; index < chunks.length; index += 1) vectors.push(new Array<number>(3072).fill(0));
   else {
-    const embedder = new GeminiEmbedder({ apiKey: process.env.GOOGLE_API_KEY!, modelId: embeddingModel, dimensions: 3072 });
+    const embedder = new GeminiEmbedder({ apiKey: process.env.GOOGLE_API_KEY!, modelId: embeddingModel, dimensions: 3072, baseUrl: process.env.GEMINI_BASE_URL });
     for (let start = 0; start < chunks.length; start += 50) vectors.push(...await embedder.embed(chunks.slice(start, start + 50).map((chunk) => chunk.content)));
   }
   await withTransaction(async (client) => {

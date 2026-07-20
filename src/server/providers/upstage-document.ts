@@ -28,7 +28,7 @@ export class UpstageDocumentParser {
     form.append('base64_encoding', JSON.stringify(requestConfig.base64_encoding));
     form.append('output_formats', JSON.stringify(requestConfig.output_formats));
     const response = await executeFetch(() => (this.options.fetch ?? fetch)(
-      `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/$/, '')}/document-digitization`,
+      `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/+$/, '')}/document-digitization`,
       { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal: options.signal },
     ));
     await assertProviderResponse(response, this.options.apiKey);
