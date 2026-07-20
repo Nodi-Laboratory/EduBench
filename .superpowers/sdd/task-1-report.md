@@ -6,11 +6,12 @@
 - Updated `UpstageDocumentParser.parse()` to create an Enhanced multipart request using `ocr=force`, `mode=enhanced`, `base64_encoding=["footnote"]`, and `output_formats=["html"]`.
 - The document blob now takes its MIME type from the parse options, allowing a rendered PNG page to be uploaded as `image/png`.
 - Normalized `raw.elements ?? []` and returned non-secret audit metadata in `requestConfig`. It includes the model, fixed request fields, MIME type, and page number; it deliberately excludes the API key and authorization header.
-- Preserved a two-argument compatibility fallback for the existing pipeline until its dedicated page-rendering task passes PNG/page options.
+- `parse()` requires `DocumentParseOptions`; the current legacy pipeline explicitly supplies its temporary PDF/page-one options until Task 3 replaces it with rendered PNG pages.
 
 ## Files changed
 
 - `src/server/providers/upstage-document.ts`
+- `src/server/documents/pipeline.ts`
 - `tests/unit/providers/document.test.ts`
 
 ## RED
@@ -76,3 +77,41 @@ Tests  30 passed (30)
 - Request metadata contains no API key or authorization value.
 - The response contract contains HTML, normalized elements, raw response, request ID, model, and request configuration.
 - Typecheck and focused/full unit tests pass.
+
+## Review fix verification
+
+The review found that parse options were optional. The adapter-level PDF fallback was removed, `DocumentParseOptions` is now required, and the sole legacy pipeline caller explicitly passes `{ mimeType: 'application/pdf', pageNumber: 1 }` as a temporary bridge to Task 3.
+
+Command:
+
+```text
+npm test -- tests/unit/providers/document.test.ts
+```
+
+Output:
+
+```text
+Test Files  1 passed (1)
+Tests  2 passed (2)
+```
+
+Command:
+
+```text
+npm run typecheck
+```
+
+Output:
+
+```text
+> edubench@0.1.0 typecheck
+> tsc --noEmit
+```
+
+Command:
+
+```text
+git diff --check
+```
+
+Output: no diff errors (Git emitted only line-ending warnings for the modified files).

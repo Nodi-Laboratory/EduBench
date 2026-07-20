@@ -9,8 +9,7 @@ export type DocumentParseOptions = {
 
 export class UpstageDocumentParser {
   constructor(private readonly options: { apiKey: string; model?: string; baseUrl?: string; fetch?: FetchLike }) {}
-  async parse(bytes: Uint8Array, filename: string, options?: DocumentParseOptions) {
-    const parseOptions = options ?? { mimeType: 'application/pdf', pageNumber: 1 };
+  async parse(bytes: Uint8Array, filename: string, options: DocumentParseOptions) {
     const form = new FormData();
     const model = this.options.model ?? 'document-parse';
     const requestConfig = {
@@ -19,10 +18,10 @@ export class UpstageDocumentParser {
       mode: 'enhanced',
       base64_encoding: ['footnote'],
       output_formats: ['html'],
-      mimeType: parseOptions.mimeType,
-      pageNumber: parseOptions.pageNumber,
+      mimeType: options.mimeType,
+      pageNumber: options.pageNumber,
     };
-    form.append('document', new Blob([bytes as BlobPart], { type: parseOptions.mimeType }), filename);
+    form.append('document', new Blob([bytes as BlobPart], { type: options.mimeType }), filename);
     form.append('model', model);
     form.append('ocr', requestConfig.ocr);
     form.append('mode', requestConfig.mode);
@@ -30,7 +29,7 @@ export class UpstageDocumentParser {
     form.append('output_formats', JSON.stringify(requestConfig.output_formats));
     const response = await executeFetch(() => (this.options.fetch ?? fetch)(
       `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/$/, '')}/document-digitization`,
-      { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal: parseOptions.signal },
+      { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal: options.signal },
     ));
     await assertProviderResponse(response, this.options.apiKey);
     const raw = await response.json() as { html?: string; content?: { html?: string }; elements?: unknown[]; model?: string };
