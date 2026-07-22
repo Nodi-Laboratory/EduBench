@@ -12,7 +12,7 @@ test('sends the Upstage Enhanced multipart request for a PNG page', async () => 
     const form = init?.body as FormData;
     expect(form.get('ocr')).toBe('force');
     expect(form.get('mode')).toBe('enhanced');
-    expect(form.get('base64_encoding')).toBe(JSON.stringify(['footnote']));
+    expect(form.get('base64_encoding')).toBe(JSON.stringify(['table', 'figure', 'chart', 'equation']));
     expect(form.get('output_formats')).toBe(JSON.stringify(['html']));
     expect(form.get('model')).toBe('document-parse-enhanced');
     const document = form.get('document');
@@ -22,7 +22,7 @@ test('sends the Upstage Enhanced multipart request for a PNG page', async () => 
   } });
   await expect(parser.parse(new Uint8Array([1, 2]), 'page-1.png', { mimeType: 'image/png', pageNumber: 1 })).resolves.toMatchObject({
     html: expect.stringContaining('원자'), elements: [], requestId: 'parse-1', model: 'document-parse-enhanced',
-    requestConfig: { model: 'document-parse-enhanced', ocr: 'force', mode: 'enhanced', base64_encoding: ['footnote'], output_formats: ['html'], mimeType: 'image/png', pageNumber: 1 },
+    requestConfig: { model: 'document-parse-enhanced', ocr: 'force', mode: 'enhanced', base64_encoding: ['table', 'figure', 'chart', 'equation'], output_formats: ['html'], mimeType: 'image/png', pageNumber: 1 },
   });
 });
 

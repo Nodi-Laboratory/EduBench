@@ -9,7 +9,7 @@ const generationSchema = z.object({
   subject: z.string().trim().min(1),
   grade: z.string().trim().min(1),
   sourceFileIds: z.array(z.uuid()).min(1),
-  units: z.array(z.string().trim().min(1)).default([]),
+  tocEntryIds: z.array(z.uuid()).default([]),
   purpose: z.string().trim().min(1),
   questionType: z.string().trim().min(1),
   difficulty: z.enum(['하', '중', '상']),
@@ -17,6 +17,7 @@ const generationSchema = z.object({
   chunkCount: z.number().int().min(3).max(30),
   crossUnit: z.boolean(),
   requestedCount: z.number().int().min(1).max(100),
+  executionMode: z.enum(['sequential', 'parallel']).default('sequential'),
 });
 
 export async function GET() {
@@ -44,6 +45,13 @@ export async function POST(request: Request) {
   if (sources.rowCount !== input.sourceFileIds.length || sources.rows.some((source) => source.status !== 'READY')) {
     return NextResponse.json({ code: 'SOURCE_NOT_READY', message: '처리가 완료된 교과서만 질문 생성에 사용할 수 있습니다.' }, { status: 409 });
   }
+  const tocEntries = input.tocEntryIds.length ? await db.query<{ id: string; source_file_id: string; title: string }>(
+    `select id, source_file_id, title from source_toc_entries where id = any($1::uuid[])`, [input.tocEntryIds],
+  ) : { rows: [], rowCount: 0 };
+  if (tocEntries.rowCount !== input.tocEntryIds.length
+    || tocEntries.rows.some((entry) => !input.sourceFileIds.includes(entry.source_file_id))) {
+    return NextResponse.json({ code: 'INVALID_TOC_SCOPE', message: '선택한 목차가 교과서 범위와 일치하지 않습니다.' }, { status: 400 });
+  }
 
   const id = randomUUID();
   const progress = {
@@ -55,13 +63,14 @@ export async function POST(request: Request) {
   const conditions = {
     subject: input.subject,
     grade: input.grade,
-    units: input.units,
+    units: tocEntries.rows.map((entry) => entry.title),
     purpose: input.purpose,
     questionType: input.questionType,
     difficulty: input.difficulty,
     direction: input.direction,
     chunkCount: input.chunkCount,
     crossUnit: input.crossUnit,
+    executionMode: input.executionMode,
   };
   await db.query(
     `insert into generation_batches(
@@ -72,7 +81,7 @@ export async function POST(request: Request) {
       id,
       input.requestedCount,
       JSON.stringify(conditions),
-      JSON.stringify({ sourceFileIds: input.sourceFileIds }),
+      JSON.stringify({ sourceFileIds: input.sourceFileIds, tocEntryIds: input.tocEntryIds }),
       process.env.GEMINI_GENERATION_MODEL ?? 'configured-via-env',
       JSON.stringify(progress),
     ],

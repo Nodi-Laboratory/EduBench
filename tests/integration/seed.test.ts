@@ -11,7 +11,7 @@ afterAll(async () => {
   await db.end();
 });
 
-test('creates a deterministic 500 by 6 sample workspace and remains idempotent', async () => {
+test('bootstraps runtime configuration without inserting sample questions, datasets, or runs', async () => {
   await seedDatabase();
   await seedDatabase();
 
@@ -19,13 +19,15 @@ test('creates a deterministic 500 by 6 sample workspace and remains idempotent',
   const questions = await db.query<{ count: string }>(
     `select count(*) from questions where public_id like 'SAMPLE-Q-%'`,
   );
-  const items = await db.query<{ count: string }>(
-    `select count(*) from run_items ri
-     join benchmark_runs br on br.id = ri.benchmark_run_id
-     where br.public_id = 'SAMPLE-RUN-001'`,
+  const datasets = await db.query<{ count: string }>(`select count(*) from dataset_versions where distribution->>'sample_data'='true'`);
+  const runs = await db.query<{ count: string }>(
+    `select count(*) from benchmark_runs where public_id like 'SAMPLE-RUN-%' or parameters->>'sample_data'='true'`,
   );
+  const scoreProfiles = await db.query<{ count: string }>('select count(*) from score_profiles');
 
-  expect(Number(providers.rows[0]?.count)).toBe(6);
-  expect(Number(questions.rows[0]?.count)).toBe(500);
-  expect(Number(items.rows[0]?.count)).toBe(3_000);
+  expect(Number(providers.rows[0]?.count)).toBe(3);
+  expect(Number(scoreProfiles.rows[0]?.count)).toBeGreaterThanOrEqual(1);
+  expect(Number(questions.rows[0]?.count)).toBe(0);
+  expect(Number(datasets.rows[0]?.count)).toBe(0);
+  expect(Number(runs.rows[0]?.count)).toBe(0);
 });

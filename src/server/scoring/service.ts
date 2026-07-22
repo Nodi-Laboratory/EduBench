@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { exactMatch, normalizeKoreanAnswer, tokenCost } from "@/domain/scoring";
+import { exactMatch, judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, requiredMetricsForQuestion, selectJudgeScore, tokenCost } from "@/domain/scoring";
+import { prerequisiteMetricRubrics } from '@/domain/prerequisite-benchmark';
 import { db } from "@/server/db/pool";
 import { withTransaction } from "@/server/db/transaction";
 import { createProviderRegistry } from "@/server/providers/registry";
@@ -8,18 +9,18 @@ const judgmentSchema = z.object({
   scores: z.array(
     z.object({
       metricKey: z.string(),
-      value: z.number().min(0).max(1),
-      label: z.string(),
-      rationale: z.string(),
-      evidence: z
-        .array(
+      value: z.preprocess(normalizeJudgeScoreValue, z.number().min(0).max(1)),
+      label: z.preprocess((value) => normalizeJudgeText(value, 'SCORED'), z.string()),
+      rationale: z.preprocess((value) => normalizeJudgeText(value, '채점 모델이 설명을 생략했습니다.'), z.string()),
+      evidence: z.preprocess(
+        normalizeJudgeEvidence,
+        z.array(
           z.object({
             claim: z.string().optional(),
             quote: z.string().optional(),
             chunkId: z.string().optional(),
           }),
-        )
-        .default([]),
+        )).default([]),
     }),
   ),
 });
@@ -44,6 +45,7 @@ type ScoreRow = {
   answer_text: string;
   accepted_answers: unknown;
   scoring_criteria: unknown;
+  quality_scores: unknown;
   evidence_mode: string;
   evidence: unknown;
   metrics: unknown;
@@ -58,7 +60,7 @@ export async function scoreRun(
   const rows = await db.query<ScoreRow>(
     `select mr.id response_id,mr.response_text,mr.input_tokens,mr.output_tokens,
     br.score_profile_id,br.price_profile_version,rm.provider_key,rm.model_id,q.evidence_mode,
-    qr.question_text,qr.answer_text,qr.accepted_answers,qr.scoring_criteria,
+    qr.question_text,qr.answer_text,qr.accepted_answers,qr.scoring_criteria,qr.quality_scores,
     sp.metrics,sp.rubric_prompt,sp.judge_provider,sp.judge_model,
     coalesce((select jsonb_agg(jsonb_build_object('chunkId',qe.source_chunk_id,'quote',qe.quote_text) order by qe.ordinal) from question_evidence qe where qe.question_id=ri.question_id and qe.question_revision=ri.question_revision),'[]'::jsonb) evidence
     from benchmark_runs br join score_profiles sp on sp.id=br.score_profile_id join run_items ri on ri.benchmark_run_id=br.id
@@ -66,15 +68,17 @@ export async function scoreRun(
     join questions q on q.id=ri.question_id join question_revisions qr on qr.question_id=ri.question_id and qr.revision=ri.question_revision where br.id=$1`,
     [runId],
   );
+  const expectedScorePairs = rows.rows.reduce((total, row) => {
+    const profileMetrics = Array.isArray(row.metrics) ? row.metrics.map(String) : [];
+    return total + requiredMetricsForQuestion(profileMetrics, row.quality_scores).length;
+  }, 0);
   const registry = createProviderRegistry();
   let scoredResponses = 0;
   for (const row of rows.rows) {
     const profileMetrics = Array.isArray(row.metrics)
       ? row.metrics.map(String)
       : [];
-    const required = [
-      ...new Set(["exact_match", "response_present", ...profileMetrics]),
-    ];
+    const required = requiredMetricsForQuestion(profileMetrics, row.quality_scores);
     const existing = await db.query<{ metric_key: string }>(
       "select metric_key from scores where model_response_id=$1 and score_profile_id=$2",
       [row.response_id, row.score_profile_id],
@@ -116,7 +120,7 @@ export async function scoreRun(
         );
       }
     });
-    const judgeMetrics = profileMetrics.filter(
+    const judgeMetrics = required.filter(
       (metric) =>
         missing.has(metric) &&
         !["exact_match", "response_present"].includes(metric),
@@ -131,45 +135,36 @@ export async function scoreRun(
         throw new Error(
           `SCORING_JUDGE_NOT_CONFIGURED: ${row.judge_provider} 환경변수가 필요합니다.`,
         );
-      const response = await judge.generate({
-        system:
-          "EDUBENCH_JUDGE_JSON. 모델 이름을 보지 말고 제공된 루브릭과 교과서 근거만으로 절대평가한다.",
-        prompt: JSON.stringify({
-          requiredMetrics: judgeMetrics,
-          rubricPrompt: row.rubric_prompt,
-          question: row.question_text,
-          referenceAnswer: row.answer_text,
-          acceptedAnswers: accepted,
-          scoringCriteria: row.scoring_criteria,
-          evidenceMode: row.evidence_mode,
-          textbookEvidence: row.evidence,
-          candidateResponse: row.response_text,
-          outputSchema: {
-            scores: [
-              {
-                metricKey: "required metric",
-                value: "0..1",
-                label: "short",
-                rationale: "Korean explanation",
-                evidence: [],
-              },
-            ],
-          },
-        }),
-        maxOutputTokens: 4096,
-        temperature: 0,
-      });
-      const judgment = judgmentSchema.parse(extractObject(response.text));
-      const byKey = new Map(
-        judgment.scores.map((score) => [score.metricKey, score]),
-      );
-      if (judgeMetrics.some((metric) => !byKey.has(metric)))
-        throw new Error(
-          "JUDGE_METRIC_MISSING: 채점 모델이 필수 지표를 모두 반환하지 않았습니다.",
-        );
-      await withTransaction(async (client) => {
-        for (const metric of judgeMetrics) {
-          const score = byKey.get(metric)!;
+      const requestJudgment = async (metrics: string[]) => {
+        const response = await judge.generate({
+          system:
+            "EDUBENCH_JUDGE_JSON. 지정된 metricKey만 빠짐없이 채점한다. 모델 이름을 보지 말고 제공된 루브릭과 교과서 근거만으로 절대평가한다.",
+          prompt: JSON.stringify({
+            requiredMetrics: metrics,
+            instruction: `scores 배열에 다음 metricKey를 각각 정확히 한 번씩 반환한다: ${metrics.join(', ')}. 다른 지표는 반환하지 않는다.`,
+            rubricPrompt: row.rubric_prompt,
+            question: row.question_text,
+            referenceAnswer: row.answer_text,
+            acceptedAnswers: accepted,
+            scoringCriteria: row.scoring_criteria,
+            benchmarkDesign: row.quality_scores && typeof row.quality_scores === 'object'
+              ? (row.quality_scores as Record<string, unknown>).benchmarkDesign ?? null : null,
+            prerequisiteMetricRubrics,
+            evidenceMode: row.evidence_mode,
+            textbookEvidence: row.evidence,
+            candidateResponse: row.response_text,
+            outputSchema: {
+              scores: metrics.map((metricKey) => ({ metricKey, value: "0..1", label: "short", rationale: "Korean explanation", evidence: [] })),
+            },
+          }),
+          maxOutputTokens: Number(process.env.JUDGE_MAX_OUTPUT_TOKENS ?? 8192),
+          temperature: 0,
+        });
+        const judgment = judgmentSchema.parse(extractObject(response.text));
+        return { response, scores: judgment.scores };
+      };
+      const persistScore = async (metric: string, score: z.infer<typeof judgmentSchema>['scores'][number], requestId: string | null | undefined) => {
+        await withTransaction(async (client) => {
           await client.query(
             `insert into scores(model_response_id,score_profile_id,metric_key,value,label,rationale,evidence,judge_provider,judge_model,judge_request_id) values($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) on conflict do nothing`,
             [
@@ -182,11 +177,26 @@ export async function scoreRun(
               JSON.stringify(score.evidence),
               row.judge_provider,
               judge.modelId,
-              response.requestId,
+              requestId,
             ],
           );
+        });
+      };
+      for (const metrics of judgeMetricBatches(judgeMetrics)) {
+        const batch = await requestJudgment(metrics);
+        const unresolved: string[] = [];
+        for (const metric of metrics) {
+          const score = batch.scores.find((candidate) => candidate.metricKey === metric);
+          if (score) await persistScore(metric, score, batch.response.requestId);
+          else unresolved.push(metric);
         }
-      });
+        for (const metric of unresolved) {
+          const fallback = await requestJudgment([metric]);
+          const score = selectJudgeScore(metric, fallback.scores);
+          if (!score) throw new Error(`JUDGE_METRIC_MISSING: ${metric} 지표가 채점 응답에 없습니다.`);
+          await persistScore(metric, score, fallback.response.requestId);
+        }
+      }
     }
     const price = await db.query<{
       input_per_million: string;
@@ -225,27 +235,23 @@ export async function scoreRun(
   await withTransaction(async (client) => {
     const locked = await client.query<{
       state: string;
-      metrics: unknown;
       responses: string;
       score_pairs: string;
     }>(
-      `select br.state,sp.metrics,(select count(*) from model_responses mr join run_items ri on ri.id=mr.run_item_id where ri.benchmark_run_id=br.id and not mr.ignored_after_cancel)::text responses,(select count(distinct s.model_response_id::text||':'||s.metric_key) from scores s join model_responses mr on mr.id=s.model_response_id join run_items ri on ri.id=mr.run_item_id where ri.benchmark_run_id=br.id)::text score_pairs from benchmark_runs br join score_profiles sp on sp.id=br.score_profile_id where br.id=$1 for update of br`,
+      `select br.state,
+       (select count(*) from model_responses mr join run_items ri on ri.id=mr.run_item_id where ri.benchmark_run_id=br.id and not mr.ignored_after_cancel)::text responses,
+       (select count(distinct s.model_response_id::text||':'||s.metric_key) from scores s join model_responses mr on mr.id=s.model_response_id join run_items ri on ri.id=mr.run_item_id where ri.benchmark_run_id=br.id)::text score_pairs
+       from benchmark_runs br where br.id=$1 for update of br`,
       [runId],
     );
     const run = locked.rows[0];
     if (run?.state === "SCORING") {
-      const metrics = Array.isArray(run.metrics) ? run.metrics.map(String) : [];
-      const requiredCount = new Set([
-        "exact_match",
-        "response_present",
-        ...metrics,
-      ]).size;
-      if (Number(run.score_pairs) !== Number(run.responses) * requiredCount)
+      if (Number(run.score_pairs) !== expectedScorePairs)
         throw new Error(
           "SCORING_INCOMPLETE: 모든 응답의 필수 지표가 저장되지 않았습니다.",
         );
       await client.query(
-        "update benchmark_runs set state='COMPLETED',completed_at=now(),updated_at=now() where id=$1",
+        "update benchmark_runs set state='COMPLETED',completed_at=now(),last_scoring_error=null,updated_at=now() where id=$1",
         [runId],
       );
       await client.query(
@@ -255,11 +261,34 @@ export async function scoreRun(
           JSON.stringify({
             state: "COMPLETED",
             scoredResponses,
-            requiredMetrics: requiredCount,
+            requiredScorePairs: expectedScorePairs,
           }),
         ],
       );
     }
   });
   return { scoredResponses };
+}
+
+export async function recordScoringFailure(runId: string, error: unknown): Promise<{ attempts: number; state: string }> {
+  const message = (error instanceof Error ? error.message : '알 수 없는 채점 오류').slice(0, 1000);
+  const code = message.split(':', 1)[0] || 'SCORING_FAILED';
+  return withTransaction(async (client) => {
+    const locked = await client.query<{ state: string; last_scoring_error: { attempts?: number } | null }>(
+      'select state,last_scoring_error from benchmark_runs where id=$1 for update', [runId],
+    );
+    const previous = Number(locked.rows[0]?.last_scoring_error?.attempts ?? 0);
+    const attempts = previous + 1;
+    const state = attempts >= 3 ? 'FAILED' : 'SCORING';
+    await client.query(
+      `update benchmark_runs set state=$2,last_scoring_error=$3::jsonb,updated_at=now() where id=$1`,
+      [runId, state, JSON.stringify({ code, message, attempts, at: new Date().toISOString() })],
+    );
+    await client.query(
+      `insert into job_events(aggregate_type,aggregate_id,event_type,payload)
+       values('benchmark_run',$1,'RUN_SCORING_FAILED',$2::jsonb)`,
+      [runId, JSON.stringify({ code, message, attempts, state })],
+    );
+    return { attempts, state };
+  });
 }

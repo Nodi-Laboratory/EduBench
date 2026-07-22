@@ -123,7 +123,8 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
 }
 
 const eventForCommand: Record<RunCommand, string> = {
-  QUEUE: 'RUN_QUEUED', START: 'RUN_STARTED', PAUSE: 'RUN_PAUSED', RESUME: 'RUN_RESUMED',
+  QUEUE: 'RUN_QUEUED', START: 'RUN_STARTED', PAUSE: 'RUN_PAUSE_REQUESTED', FINISH_PAUSE: 'RUN_PAUSED',
+  STOP: 'RUN_STOP_REQUESTED', FINISH_STOP: 'RUN_STOPPED', RESUME: 'RUN_RESUMED',
   BEGIN_SCORING: 'RUN_SCORING_STARTED', CANCEL: 'RUN_CANCEL_REQUESTED',
   FINISH_CANCEL: 'RUN_CANCELLED', COMPLETE: 'RUN_COMPLETED', FAIL: 'RUN_FAILED',
 };
@@ -139,6 +140,7 @@ export async function commandRun(runId: string, command: RunCommand): Promise<{ 
     await client.query(
       `update benchmark_runs set state = $2,
          pause_requested_at = case when $3 = 'PAUSE' then now() when $3 = 'RESUME' then null else pause_requested_at end,
+         control_requested_at = case when $3 in ('PAUSE','STOP') then now() when $3 = 'RESUME' then null else control_requested_at end,
          cancel_requested_at = case when $3 = 'CANCEL' then now() else cancel_requested_at end,
          started_at = case when $3 = 'START' then coalesce(started_at, now()) else started_at end,
          completed_at = case when $3 in ('COMPLETE','FINISH_CANCEL') then now() else completed_at end,
@@ -212,6 +214,17 @@ export async function renewRunItemLease(itemId: string, workerId: string, leaseM
   return Boolean(result.rowCount);
 }
 
+export async function interruptRunItem(itemId: string, workerId: string): Promise<boolean> {
+  const { db } = await import('@/server/db/pool');
+  const result = await db.query(
+    `update run_items set state='PENDING', attempts=greatest(attempts-1,0), available_at=now(),
+       lease_owner=null, lease_expires_at=null, error_code=null, error_message=null, completed_at=null
+     where id=$1 and state='LEASED' and lease_owner=$2`,
+    [itemId, workerId],
+  );
+  return Boolean(result.rowCount);
+}
+
 export async function failRunItem(
   itemId: string,
   workerId: string,
@@ -242,6 +255,8 @@ export async function failRunItem(
 
 export async function retryFailedRunItems(runId: string): Promise<number> {
   return withTransaction(async (client) => {
+    const run = await client.query<{ state: RunState }>('select state from benchmark_runs where id=$1 for update', [runId]);
+    if (!run.rows[0]) throw new DomainError('RUN_NOT_FOUND', '실행을 찾을 수 없습니다.');
     const result = await client.query(
       `update run_items set state = 'PENDING', attempts = 0, available_at = now(),
          error_code = null, error_message = null, completed_at = null
@@ -250,11 +265,57 @@ export async function retryFailedRunItems(runId: string): Promise<number> {
     );
     const count = result.rowCount ?? 0;
     if (count) {
-      await client.query('update benchmark_runs set failed_items = greatest(failed_items - $2, 0), updated_at = now() where id = $1', [runId, count]);
-      await appendRunEvent(client, runId, 'RUN_ITEMS_RETRIED', { count });
+      const nextState = ['SCORING', 'FAILED'].includes(run.rows[0].state) ? 'RUNNING' : run.rows[0].state;
+      await client.query(
+        'update benchmark_runs set state=$3, failed_items=greatest(failed_items-$2,0), completed_at=null, last_scoring_error=null, updated_at=now() where id=$1',
+        [runId, count, nextState],
+      );
+      await appendRunEvent(client, runId, 'RUN_ITEMS_RETRIED', { count, state: nextState });
     }
     return count;
   });
+}
+
+export async function retryScoringRun(runId: string): Promise<{ state: 'SCORING' }> {
+  return withTransaction(async (client) => {
+    const run = await client.query<{ state: RunState; last_scoring_error: unknown }>(
+      'select state,last_scoring_error from benchmark_runs where id=$1 for update', [runId],
+    );
+    if (!run.rows[0]) throw new DomainError('RUN_NOT_FOUND', '실행을 찾을 수 없습니다.');
+    if (run.rows[0].state !== 'FAILED' || !run.rows[0].last_scoring_error) {
+      throw new DomainError('SCORING_RETRY_NOT_AVAILABLE', '채점 실패 상태에서만 채점을 재개할 수 있습니다.');
+    }
+    await client.query("update benchmark_runs set state='SCORING',last_scoring_error=null,updated_at=now() where id=$1", [runId]);
+    await appendRunEvent(client, runId, 'RUN_SCORING_RETRIED', { state:'SCORING' });
+    return { state:'SCORING' };
+  });
+}
+
+async function finishControlWhenDrained(
+  runId: string,
+  waitingState: 'PAUSING' | 'STOPPING',
+  finalState: 'PAUSED' | 'STOPPED',
+  eventType: 'RUN_PAUSED' | 'RUN_STOPPED',
+): Promise<boolean> {
+  return withTransaction(async (client) => {
+    const run = await client.query<{ state: RunState }>('select state from benchmark_runs where id=$1 for update', [runId]);
+    if (run.rows[0]?.state !== waitingState) return false;
+    const active = await client.query<{ count: string }>(
+      "select count(*) from run_items where benchmark_run_id=$1 and state='LEASED'", [runId],
+    );
+    if (Number(active.rows[0]?.count) > 0) return false;
+    await client.query('update benchmark_runs set state=$2,updated_at=now() where id=$1', [runId, finalState]);
+    await appendRunEvent(client, runId, eventType, { state: finalState });
+    return true;
+  });
+}
+
+export function finishPauseWhenDrained(runId: string): Promise<boolean> {
+  return finishControlWhenDrained(runId, 'PAUSING', 'PAUSED', 'RUN_PAUSED');
+}
+
+export function finishStopWhenDrained(runId: string): Promise<boolean> {
+  return finishControlWhenDrained(runId, 'STOPPING', 'STOPPED', 'RUN_STOPPED');
 }
 
 export async function getRunEventsAfter(runId: string, afterId = 0, limit = 200) {

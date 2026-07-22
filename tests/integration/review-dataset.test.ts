@@ -57,29 +57,24 @@ test('edit-and-approve creates a new revision and an audit action', async () => 
   expect(revision.rows[0]?.question_text).toBe('수정된 질문');
 });
 
-test('freezes 500 approved questions with a stable hash and blocks mutation', async () => {
-  const firstSample = await db.query<{ id: string; current_revision: number }>(
-    `select id, current_revision from questions where public_id = 'SAMPLE-Q-001' for update`,
-  );
-  const sample = firstSample.rows[0]!;
-  const nextRevision = sample.current_revision + 1;
-  await db.query(
-    `insert into question_revisions(
-       question_id, revision, question_text, answer_text, answer_options,
-       scoring_criteria, accepted_answers, design_summary, evidence_summary,
-       quality_scores, change_reason
-     ) select question_id, $2, question_text, answer_text, answer_options,
-       scoring_criteria, accepted_answers, design_summary, evidence_summary,
-       quality_scores, 'integration test isolation'
-     from question_revisions where question_id = $1 and revision = $3`,
-    [sample.id, nextRevision, sample.current_revision],
-  );
-  await db.query('update questions set current_revision = $2 where id = $1', [sample.id, nextRevision]);
-  const ids = await db.query<{ id: string }>(
-    `select id from questions where public_id like 'SAMPLE-Q-%' order by public_id`,
-  );
+test('freezes the available approved real questions with their actual count and stable hash', async () => {
+  const ids: string[] = [];
+  for (const purpose of ['핵심 개념 이해', '개념 적용·문제풀이']) {
+    const id = randomUUID();
+    ids.push(id);
+    await db.query(
+      `insert into questions(id,public_id,status,subject,grade,purpose,difficulty,question_type,evidence_mode)
+       values($1,$2,'APPROVED','과학','고등학교 1학년',$3,'중','구조화 서술형','GROUNDED')`,
+      [id, `REAL-Q-${id.slice(0, 8)}`, purpose],
+    );
+    await db.query(
+      `insert into question_revisions(question_id,revision,question_text,answer_text,scoring_criteria)
+       values($1,1,$2,'실제 답안','[{"key":"accuracy","maxScore":1}]')`,
+      [id, `${purpose} 실제 질문`],
+    );
+  }
   const version = `test-${randomUUID().slice(0, 8)}`;
-  const requestBody = { version, title: '통합 테스트 데이터셋', questionIds: ids.rows.map((row) => row.id) };
+  const requestBody = { version, title: '통합 테스트 데이터셋', questionIds: ids };
 
   const first = await freezeDataset(new Request('http://localhost/api/datasets', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(requestBody),
@@ -93,6 +88,11 @@ test('freezes 500 approved questions with a stable hash and blocks mutation', as
   expect(first.status).toBe(201);
   expect(second.status).toBe(200);
   expect(secondBody).toMatchObject({ id: firstBody.id, contentHash: firstBody.contentHash, existing: true });
+  const stored = await db.query<{ question_count: number; distribution: { capabilities: Record<string, number> } }>(
+    'select question_count,distribution from dataset_versions where id=$1', [firstBody.id],
+  );
+  expect(stored.rows[0]?.question_count).toBe(2);
+  expect(stored.rows[0]?.distribution.capabilities).toMatchObject({ '핵심 개념 이해': 1, '개념 적용·문제풀이': 1 });
   await expect(db.query(
     `update dataset_versions set title = '변조' where id = $1`, [firstBody.id],
   )).rejects.toThrow(/immutable/i);

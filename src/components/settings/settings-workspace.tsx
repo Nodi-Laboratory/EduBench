@@ -2,12 +2,12 @@
 
 import { useState } from 'react';
 import { BadgeDollarSign, FileSliders, ServerCog } from 'lucide-react';
+import { ScoreProfileAudit, type ScoreProfileAuditData } from '@/components/settings/score-profile-audit';
 
 type Provider = { provider_key: string; display_name: string; protocol: string; configured: boolean; envNames: string[] };
-type Score = { version: string; title: string; judge_provider: string | null; created_at: string };
 type Price = { version: string; provider_key: string; model_pattern: string; currency: string; input_per_million: string; output_per_million: string };
 
-export function SettingsWorkspace({ providers, scores, prices, mockMode }: { providers: Provider[]; scores: Score[]; prices: Price[]; mockMode: boolean }) {
+export function SettingsWorkspace({ providers, scores, prices, mockMode }: { providers: Provider[]; scores: ScoreProfileAuditData[]; prices: Price[]; mockMode: boolean }) {
   const [notice, setNotice] = useState('');
 
   async function save(body: Record<string, unknown>) {
@@ -30,7 +30,7 @@ export function SettingsWorkspace({ providers, scores, prices, mockMode }: { pro
     </section>
     <div className="settings-grid">
       <section className="panel">
-        <div className="panel-heading"><div><FileSliders size={16}/><h2>채점 프로필</h2></div></div>
+        <div className="panel-heading"><div><FileSliders size={16}/><h2>채점 프로필 연구 감사</h2></div><span className="count-label">정의 · 루브릭 · 실행 추적</span></div>
         <form className="dense-form" action={(form) => save({
           kind: 'score', version: form.get('version'), title: form.get('title'),
           metrics: String(form.get('metrics')).split(',').map((value) => value.trim()).filter(Boolean),
@@ -42,7 +42,7 @@ export function SettingsWorkspace({ providers, scores, prices, mockMode }: { pro
           <label>루브릭 프롬프트<textarea name="rubricPrompt" placeholder="블라인드 절대평가 기준"/></label>
           <button className="button primary">채점 프로필 추가</button>
         </form>
-        <div className="compact-list">{scores.map((score) => <div key={score.version}><strong className="mono">{score.version}</strong><span>{score.title}</span><small>{score.judge_provider ?? '결정론적 채점'}</small></div>)}</div>
+        <div className="score-profile-list">{scores.map((score) => <ScoreProfileAudit key={score.version} profile={score}/>)}</div>
       </section>
       <section className="panel">
         <div className="panel-heading"><div><BadgeDollarSign size={16}/><h2>가격 프로필</h2></div></div>

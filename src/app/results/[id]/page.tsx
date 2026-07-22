@@ -2,6 +2,8 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, Download, FileJson, FileText } from "lucide-react";
 import { db } from "@/server/db/pool";
+import { getResultAnalytics } from '@/server/results/analytics';
+import { ResultAnalyticsDashboard } from '@/components/results/result-analytics-dashboard';
 
 export const dynamic = "force-dynamic";
 const metricLabels: Record<string, string> = {
@@ -14,6 +16,12 @@ const metricLabels: Record<string, string> = {
   hallucination: "환각 억제",
   exact_match: "완전 일치",
   response_present: "응답 존재",
+  target_concept_correctness: "목표 개념 정확성",
+  prerequisite_identification: "선수 개념 식별",
+  prerequisite_relation_accuracy: "선수 관계 방향 정확성",
+  prerequisite_application: "선수 개념 적용",
+  reasoning_chain_completeness: "추론 사슬 완결성",
+  textbook_grounding: "교과서 근거 충실성",
 };
 
 export default async function ResultDetailPage({
@@ -22,7 +30,7 @@ export default async function ResultDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const [run, models, metricSummary, capabilities] = await Promise.all([
+  const [run, models, metricSummary, capabilities, analytics] = await Promise.all([
     db.query<{
       public_id: string;
       title: string;
@@ -85,6 +93,7 @@ export default async function ResultDetailPage({
        where ri.benchmark_run_id = $1 group by rm.blind_id, q.purpose order by q.purpose, rm.blind_id`,
       [id],
     ),
+    getResultAnalytics(id),
   ]);
   if (!run.rows[0]) notFound();
   const summary = run.rows[0];
@@ -144,6 +153,7 @@ export default async function ResultDetailPage({
           <div className="metric-value mono">{summary.state}</div>
         </div>
       </section>
+      <ResultAnalyticsDashboard analytics={analytics} />
       <section className="panel">
         <div className="panel-heading">
           <div>

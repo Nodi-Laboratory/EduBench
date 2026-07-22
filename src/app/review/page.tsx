@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 export default async function ReviewPage() {
   const result = await db.query<ReviewQuestion>(`
     select q.id, q.public_id, q.status, q.subject, q.grade, q.purpose, q.difficulty,
-      qr.question_text, qr.answer_text, qr.scoring_criteria, qr.evidence_summary
+      qr.question_text, qr.answer_text, qr.scoring_criteria, qr.evidence_summary, qr.quality_scores
     from questions q join question_revisions qr
       on qr.question_id = q.id and qr.revision = q.current_revision
     where q.status in ('DRAFT', 'IN_REVIEW', 'HELD') and q.deleted_at is null

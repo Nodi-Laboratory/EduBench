@@ -3,9 +3,16 @@ import { transitionDocument, transitionQuestion, transitionRun } from '@/domain/
 
 describe('run state machine', () => {
   test('pauses and resumes only from valid states', () => {
-    expect(transitionRun('RUNNING', 'PAUSE')).toBe('PAUSED');
+    expect(transitionRun('RUNNING', 'PAUSE')).toBe('PAUSING');
+    expect(transitionRun('PAUSING', 'FINISH_PAUSE')).toBe('PAUSED');
     expect(transitionRun('PAUSED', 'RESUME')).toBe('RUNNING');
     expect(() => transitionRun('COMPLETED', 'PAUSE')).toThrow('INVALID_RUN_TRANSITION');
+  });
+
+  test('stops cooperatively and resumes unfinished work', () => {
+    expect(transitionRun('RUNNING', 'STOP')).toBe('STOPPING');
+    expect(transitionRun('STOPPING', 'FINISH_STOP')).toBe('STOPPED');
+    expect(transitionRun('STOPPED', 'RESUME')).toBe('RUNNING');
   });
 
   test('moves a running benchmark through scoring before completion', () => {

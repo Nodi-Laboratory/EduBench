@@ -12,6 +12,7 @@ import {
   LoaderCircle,
   ScrollText,
 } from 'lucide-react';
+import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
 
 type LabPage = {
   pageNumber: number;
@@ -156,7 +157,7 @@ export function DocumentLabWorkspace() {
         <div className="lab-config-values" aria-label="고정 요청 설정">
           <div><span>MODE</span><strong>Enhanced</strong></div>
           <div><span>OCR</span><code>ocr=force</code></div>
-          <div><span>BASE64</span><code>{"base64_encoding=['footnote']"}</code></div>
+          <div><span>BASE64</span><code>{`base64_encoding=${JSON.stringify(DOCUMENT_PARSE_BASE64_ENCODING)}`}</code></div>
           <div><span>OUTPUT</span><code>{"output_formats=['html']"}</code></div>
           <div className="lab-runtime-state"><span>ENV</span><strong className={result?.mock ? 'is-mock' : ''}>{loading ? 'PARSING' : result ? (result.mock ? 'MOCK' : 'LIVE') : '실행 전'}</strong></div>
         </div>

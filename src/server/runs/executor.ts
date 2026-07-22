@@ -3,7 +3,7 @@ import type { ModelProvider, ProviderError } from '@/server/providers/types';
 import { withProviderRetry } from '@/server/providers/retry';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
-import { renewRunItemLease, type RunItemRecord } from './service';
+import { interruptRunItem, renewRunItemLease, type RunItemRecord } from './service';
 
 type ExecutionContext = {
   id: string; attempts: number; benchmark_run_id: string; state: string; lease_owner: string | null;
@@ -58,21 +58,46 @@ export async function executeRunItem(
     ? `다음 근거만 사용하십시오.\n\n${evidence.join('\n\n')}`
     : context.evidence_mode === 'GROUNDED' ? '연결된 교과서 근거가 없습니다. 근거 부족을 명시하십시오.' : '외부 검색 없이 답하십시오.';
   const retryHistory: Array<Record<string, unknown>> = [];
+  const request = {
+    system: context.system_prompt,
+    prompt: `${evidenceBlock}\n\n[질문]\n${context.question_text}${options}`,
+    maxOutputTokens: 2048,
+    temperature: 0,
+  };
+  await db.query(
+    `update run_items set request_snapshot=$3::jsonb
+     where id=$1 and state='LEASED' and lease_owner=$2`,
+    [item.id, workerId, JSON.stringify({
+      ...request, providerKey: context.provider_key, modelId: context.model_id,
+      attempt: context.attempts, evidence, question: context.question_text, options: context.answer_options,
+    })],
+  );
   const leaseMs = 150_000; const leaseAbort = new AbortController();
-  const signal = AbortSignal.any([leaseAbort.signal, AbortSignal.timeout(Number(process.env.PROVIDER_TIMEOUT_MS ?? 90_000))]);
+  const controlAbort = new AbortController();
+  const signal = AbortSignal.any([leaseAbort.signal, controlAbort.signal, AbortSignal.timeout(Number(process.env.PROVIDER_TIMEOUT_MS ?? 90_000))]);
   const heartbeat = setInterval(() => { renewRunItemLease(item.id, workerId, leaseMs).then((renewed) => { if (!renewed) leaseAbort.abort(new Error('RUN_ITEM_LEASE_LOST')); }).catch(() => leaseAbort.abort(new Error('RUN_ITEM_LEASE_RENEWAL_FAILED'))); }, 30_000);
+  const controlPoll = setInterval(() => {
+    db.query<{ state: string }>('select state from benchmark_runs where id=$1', [context.benchmark_run_id])
+      .then((result) => { if (result.rows[0]?.state === 'STOPPING') controlAbort.abort(new Error('RUN_STOP_REQUESTED')); })
+      .catch(() => undefined);
+  }, 500);
   let generated;
   try {
-    generated = await withProviderRetry(() => provider.generate({
-      system: context.system_prompt,
-      prompt: `${evidenceBlock}\n\n[질문]\n${context.question_text}${options}`,
-      maxOutputTokens: 2048,
-      temperature: 0,
-    }, signal), {
+    generated = await withProviderRetry(() => provider.generate(request, signal), {
       maxAttempts: 3,
+      baseDelayMs: provider.key === 'exaone'
+        ? Number(process.env.EXAONE_RETRY_BASE_DELAY_MS ?? 15_000)
+        : 500,
       onRetry: ({ attempt, delayMs, error }) => retryHistory.push({ attempt, delayMs, kind: error.kind, status: error.status, requestId: error.requestId }),
     });
-  } finally { clearInterval(heartbeat); }
+  } catch (error) {
+    const state = await db.query<{ state: string }>('select state from benchmark_runs where id=$1', [context.benchmark_run_id]);
+    if (state.rows[0]?.state === 'STOPPING') {
+      await interruptRunItem(item.id, workerId);
+      return;
+    }
+    throw error;
+  } finally { clearInterval(heartbeat); clearInterval(controlPoll); }
 
   await withTransaction(async (client) => {
     const locked = await client.query<{ benchmark_run_id: string; attempts: number; state: string; lease_owner: string | null; run_state: string }>(
@@ -83,6 +108,19 @@ export async function executeRunItem(
     const current = locked.rows[0];
     if (!current || current.state !== 'LEASED' || current.lease_owner !== workerId) {
       throw new DomainError('RUN_ITEM_LEASE_MISMATCH', '응답 저장 전에 실행 임대가 만료되었거나 변경되었습니다.');
+    }
+    if (current.run_state === 'STOPPING') {
+      await client.query(
+        `update run_items set state='PENDING',attempts=greatest(attempts-1,0),available_at=now(),
+           lease_owner=null,lease_expires_at=null,error_code=null,error_message=null,completed_at=null where id=$1`,
+        [item.id],
+      );
+      await client.query(
+        `insert into job_events(aggregate_type,aggregate_id,event_type,payload)
+         values('benchmark_run',$1,'RUN_ITEM_INTERRUPTED',$2::jsonb)`,
+        [current.benchmark_run_id, JSON.stringify({ itemId: item.id, providerKey: context.provider_key })],
+      );
+      return;
     }
     await client.query(
       `insert into model_responses(

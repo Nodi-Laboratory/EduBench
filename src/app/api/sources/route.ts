@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { db } from '@/server/db/pool';
-import { enqueueJob, enqueueJobWithClient } from '@/server/jobs/queue';
+import { enqueueJobWithClient } from '@/server/jobs/queue';
 import { storeSourceFile } from '@/server/files/storage';
 import { withTransaction } from '@/server/db/transaction';
 
@@ -18,14 +18,22 @@ type SourceRow = {
   failure_code: string | null;
   created_at: Date;
   updated_at: Date;
+  current_job_id: string | null;
+  current_job_state: string | null;
 };
 
 export async function GET() {
   const result = await db.query<SourceRow>(
-    `select id, sha256, original_name, mime_type, byte_size, subject, grade,
-       status, failed_stage, failure_code, created_at, updated_at
-     from source_files where deleted_at is null
-     order by created_at desc limit 200`,
+    `select s.id, s.sha256, s.original_name, s.mime_type, s.byte_size, s.subject, s.grade,
+       s.status, s.failed_stage, s.failure_code, s.created_at, s.updated_at,
+       j.id as current_job_id, j.state as current_job_state
+     from source_files s
+     left join lateral (
+       select id, state from jobs where kind = 'document.parse' and payload->>'sourceId' = s.id::text
+       order by created_at desc limit 1
+     ) j on true
+     where s.deleted_at is null
+     order by s.created_at desc limit 200`,
   );
   return NextResponse.json({ items: result.rows });
 }
@@ -46,14 +54,27 @@ export async function POST(request: Request) {
   }
 
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  const existing = await db.query<{ id: string }>('select id from source_files where sha256 = $1', [sha256]);
+  const existing = await db.query<{ id: string; status: string; deleted_at: Date | null }>(
+    'select id, status, deleted_at from source_files where sha256 = $1', [sha256],
+  );
   if (existing.rows[0]) {
-    await enqueueJob({
-      kind: 'document.parse',
-      payload: { sourceId: existing.rows[0].id },
-      idempotencyKey: `document.parse:${existing.rows[0].id}:v1`,
-    });
-    return NextResponse.json({ id: existing.rows[0].id, existing: true });
+    const found = existing.rows[0];
+    if (found.deleted_at || ['FAILED', 'CANCELLED'].includes(found.status)) {
+      const job = await withTransaction(async (client) => {
+        await client.query(
+          `update source_files set original_name=$2, subject=$3, grade=$4, deleted_at=null,
+             status='UPLOADED', failed_stage=null, failure_code=null, failure_message=null, updated_at=now()
+           where id=$1`,
+          [found.id, file.name, form.get('subject')?.toString() || null, form.get('grade')?.toString() || null],
+        );
+        return enqueueJobWithClient(client, {
+          kind: 'document.parse', payload: { sourceId: found.id },
+          idempotencyKey: `document.parse:${found.id}:restore:${randomUUID()}`,
+        });
+      });
+      return NextResponse.json({ id: found.id, jobId: job.id, existing: true, restored: Boolean(found.deleted_at) });
+    }
+    return NextResponse.json({ id: found.id, existing: true, restored: false });
   }
 
   const id = randomUUID();

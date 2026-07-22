@@ -1,5 +1,6 @@
 import { assertProviderResponse, executeFetch, requestIdFrom } from './http';
 import { ProviderError, type FetchLike } from './types';
+import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
 
 export type DocumentParseOptions = {
   mimeType: string;
@@ -16,7 +17,7 @@ export class UpstageDocumentParser {
       model,
       ocr: 'force',
       mode: 'enhanced',
-      base64_encoding: ['footnote'],
+      base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING],
       output_formats: ['html'],
       mimeType: options.mimeType,
       pageNumber: options.pageNumber,

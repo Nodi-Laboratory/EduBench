@@ -1,6 +1,7 @@
 import { streamPdfPages, type RenderedPage, type StreamedPage } from '@/server/documents/page-renderer';
 import { UpstageDocumentParser, type DocumentParseOptions } from '@/server/providers/upstage-document';
 import { ProviderError, type ProviderErrorKind } from '@/server/providers/types';
+import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 
@@ -131,7 +132,7 @@ function mockPage(page: DocumentLabPageInput): LabPage {
     model: 'mock-document-parse',
     ocr: 'force',
     mode: 'enhanced',
-    base64_encoding: ['footnote'],
+    base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING],
     output_formats: ['html'],
     mimeType: page.mimeType,
     pageNumber: page.pageNumber,
@@ -193,8 +194,8 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
 
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   const requestConfig = mock
-    ? { model: 'mock-document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: ['footnote'], output_formats: ['html'] }
-    : { model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: ['footnote'], output_formats: ['html'] };
+    ? { model: 'mock-document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING], output_formats: ['html'] }
+    : { model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING], output_formats: ['html'] };
   const apiKey = process.env.UPSTAGE_API_KEY;
   if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
 

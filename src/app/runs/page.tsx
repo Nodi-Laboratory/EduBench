@@ -6,8 +6,7 @@ export const metadata: Metadata = { title: '벤치마크 실행' };
 export const dynamic = 'force-dynamic';
 
 const modelEnv: Record<string, string> = {
-  exaone: 'EXAONE_MODEL', gemini: 'GEMINI_GENERATION_MODEL', claude: 'ANTHROPIC_MODEL',
-  openai: 'OPENAI_MODEL', upstage: 'UPSTAGE_MODEL', midm: 'MIDM_MODEL',
+  exaone: 'EXAONE_MODEL', gemini: 'GEMINI_GENERATION_MODEL', upstage: 'UPSTAGE_MODEL',
 };
 
 export default async function RunsPage() {
@@ -32,6 +31,9 @@ export default async function RunsPage() {
       ...provider,
       modelId: mockMode ? `mock-${provider.provider_key}` : (process.env[modelEnv[provider.provider_key]!] ?? ''),
       envName: modelEnv[provider.provider_key]!,
+      requestIntervalMs: provider.provider_key === 'exaone'
+        ? Number(process.env.EXAONE_REQUEST_INTERVAL_MS ?? 30_000)
+        : Number(process.env.DEFAULT_MODEL_REQUEST_INTERVAL_MS ?? 0),
     }))}
     initialRuns={runs.rows}
   />;

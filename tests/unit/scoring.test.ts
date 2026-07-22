@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
-import { exactMatch, normalizeKoreanAnswer, tokenCost } from '@/domain/scoring';
+import { exactMatch, judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, selectJudgeScore, tokenCost } from '@/domain/scoring';
+import { requiredMetricsForQuestion } from '@/domain/scoring';
 import { mcnemar, pairedBootstrap } from '@/domain/statistics';
 
 test('normalizes Korean answers without destroying meaningful internal spacing', () => {
@@ -20,4 +21,31 @@ test('paired bootstrap is deterministic with a seeded random source', () => {
 
 test('McNemar reports discordant pairs and an exact two-sided p-value', () => {
   expect(mcnemar([1, 1, 0, 1], [0, 1, 1, 0])).toMatchObject({ aOnly: 2, bOnly: 1, n: 3, pValue: 1 });
+});
+
+test('normalizes string and object evidence returned by a judge model', () => {
+  expect(normalizeJudgeEvidence(['교과서와 일치', { quote: '원문', ignored: true }, null])).toEqual([
+    { claim: '교과서와 일치' },
+    { quote: '원문' },
+  ]);
+});
+
+test('adds prerequisite metrics only for prerequisite benchmark questions', () => {
+  const quality = { benchmarkDesign: { benchmarkType: 'PREREQUISITE_RELATIONSHIP' } };
+  const required = requiredMetricsForQuestion(['accuracy'], quality);
+  expect(required).toContain('accuracy');
+  expect(required).toContain('prerequisite_relation_accuracy');
+  expect(required).toContain('reasoning_chain_completeness');
+  expect(requiredMetricsForQuestion(['accuracy'], {})).toEqual(['exact_match', 'response_present', 'accuracy']);
+});
+
+test('starts with one efficient judge batch and accepts a single mislabeled score', () => {
+  expect(judgeMetricBatches(['a', 'b', 'c', 'd', 'e'])).toEqual([['a', 'b', 'c', 'd', 'e']]);
+  expect(selectJudgeScore('accuracy', [{ metricKey:'정확성', value:0.8 }])).toMatchObject({
+    metricKey:'accuracy', value:0.8,
+  });
+  expect(selectJudgeScore('accuracy', [])).toBeNull();
+  expect(normalizeJudgeScoreValue('0.8')).toBe(0.8);
+  expect(normalizeJudgeScoreValue('not-a-score')).toBe('not-a-score');
+  expect(normalizeJudgeText(undefined, '설명 없음')).toBe('설명 없음');
 });

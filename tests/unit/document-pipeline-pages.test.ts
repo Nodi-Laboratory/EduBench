@@ -90,6 +90,8 @@ test('consumes the PDF spool one page at a time and releases each page before re
         return { html: `<p>${options.pageNumber}</p>`, raw: {}, requestId: null, model: 'document-parse', requestConfig: {} };
       },
     },
+    batchSize: 1,
+    concurrency: 1,
   });
 
   await Promise.race([started, resultPromise]);
@@ -98,6 +100,39 @@ test('consumes the PDF spool one page at a time and releases each page before re
   await expect(resultPromise).resolves.toMatchObject({ html: expect.stringContaining('data-page="2"') });
   expect(produced).toEqual([1, 2]);
 });
+
+test('parses page batches concurrently and preserves page order', async () => {
+  const started: number[] = [];
+  const releases = new Map<number, () => void>();
+  const resultPromise = parseDocumentPages(new Uint8Array([37, 80, 68, 70]), {
+    renderPdfPages: async () => [1, 2, 3].map((pageNumber) => ({
+      pageNumber, bytes: new Uint8Array([pageNumber]), mimeType: 'image/png' as const,
+      filename: `page-${pageNumber}.png`, dataUrl: '',
+    })),
+    batchSize: 1,
+    concurrency: 2,
+    parser: { parse: async (_bytes, _filename, options) => {
+      started.push(options.pageNumber);
+      await new Promise<void>((resolve) => releases.set(options.pageNumber, resolve));
+      return { html: `<p>${options.pageNumber}</p>`, raw: {}, requestId: String(options.pageNumber), model: 'document-parse', requestConfig: {} };
+    } },
+  });
+  await waitUntil(() => started.length === 2);
+  expect(started).toEqual([1, 2]);
+  releases.get(2)!();
+  releases.get(1)!();
+  await waitUntil(() => started.length === 3);
+  releases.get(3)!();
+  const result = await resultPromise;
+  expect(result.html).toContain('data-page="1"');
+  expect(result.html.indexOf('data-page="1"')).toBeLessThan(result.html.indexOf('data-page="2"'));
+  expect(result.html.indexOf('data-page="2"')).toBeLessThan(result.html.indexOf('data-page="3"'));
+});
+
+async function waitUntil(predicate: () => boolean) {
+  for (let index = 0; index < 100 && !predicate(); index += 1) await Promise.resolve();
+  expect(predicate()).toBe(true);
+}
 
 test('bounds aggregate persistent raw provenance without retaining oversized provider payloads', async () => {
   const oversizedRaw = { duplicatedBase64: 'A'.repeat(MAX_PERSISTED_RAW_PROVENANCE_BYTES + 1) };

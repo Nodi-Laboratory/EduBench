@@ -1,18 +1,10 @@
 import Link from 'next/link';
 import { AlertCircle, ArrowRight, BookOpenCheck, Play, RefreshCw } from 'lucide-react';
 
-const capabilities = [
-  ['핵심 개념 이해', 150],
-  ['개념 적용·문제풀이', 120],
-  ['여러 단원 연결 추론', 80],
-  ['학생 수준별 설명', 80],
-  ['오개념·주장 교정', 70],
-] as const;
-
 type LatestRun = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number };
 type ModelRow = { display_name: string; model_id: string; total: string; done: string; failed: string; latency: string | null; tokens: string | null; cost: string | null };
 type RecentRun = { id: string; public_id: string; title: string; state: string; completed_items: number; total_items: number };
-const neutralModels: ModelRow[] = ['EXAONE','Gemini','Claude','OpenAI','Upstage','KT Mi:dm'].map((display_name) => ({ display_name, model_id: '환경변수에서 모델 ID 로드', total: '0', done: '0', failed: '0', latency: null, tokens: null, cost: null }));
+const neutralModels: ModelRow[] = ['EXAONE','Gemini','Upstage'].map((display_name) => ({ display_name, model_id: '환경변수에서 모델 ID 로드', total: '0', done: '0', failed: '0', latency: null, tokens: null, cost: null }));
 
 export function DashboardOverview({ approved = 0, readySources = 0, attention = 0, latest = null, models = neutralModels, recent = [] }: { approved?: number; readySources?: number; attention?: number; latest?: LatestRun | null; models?: ModelRow[]; recent?: RecentRun[] } = {}) {
   const percent = latest?.total_items ? (latest.completed_items / latest.total_items) * 100 : 0;
@@ -22,10 +14,9 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
         <div>
           <div className="eyebrow-row">
             <span className="eyebrow">OPERATIONS / OVERVIEW</span>
-            <span className="sample-badge">초기 작업공간</span>
           </div>
           <h1>벤치마크 운영 현황</h1>
-          <p>교과서 준비부터 6개 모델 실행과 결과 산출까지 한 화면에서 추적합니다.</p>
+          <p>교과서 준비부터 실제 모델 실행과 결과 산출까지 한 화면에서 추적합니다.</p>
         </div>
         <Link className="button primary" href="/runs">
           <Play size={16} aria-hidden="true" /> 새 벤치마크 실행
@@ -39,9 +30,9 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
           <div className="metric-footer"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest ? `${latest.public_id} · ${latest.state}` : '아직 생성된 실행이 없습니다'}</div>
         </article>
         <article className="metric-card">
-          <div className="metric-label"><span>승인된 문항</span><b>DATASET</b></div>
-          <div className="metric-value mono">{approved} <small>/ 500</small></div>
-          <div className="metric-footer">목표 프로필 대비 <strong>{Math.min(100, approved / 5).toFixed(0)}%</strong></div>
+          <div className="metric-label"><span>실제 승인 문항</span><b>DATASET</b></div>
+          <div className="metric-value mono">{approved} <small>개</small></div>
+          <div className="metric-footer">데이터셋 버전에 포함 가능한 실제 문항</div>
         </article>
         <article className="metric-card">
           <div className="metric-label"><span>준비된 교과서</span><b>SOURCES</b></div>
@@ -92,19 +83,11 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
 
         <aside className="dashboard-rail">
           <section className="panel composition-panel">
-            <div className="panel-heading compact"><div><span className="section-index mono">02</span><h2>500문항 목표 구성</h2></div></div>
-            <div className="mode-strip">
-              <span>근거 제공 400</span>
-              <span>폐쇄형 75</span>
-              <span>근거 부족 판단 25</span>
-            </div>
+            <div className="panel-heading compact"><div><span className="section-index mono">02</span><h2>실제 데이터 흐름</h2></div></div>
             <div className="capability-list">
-              {capabilities.map(([label, count]) => (
-                <div key={label}>
-                  <div><span>{label}</span><strong className="mono">{count}</strong></div>
-                  <div className="progress-track thin"><span style={{ width: `${(count / 150) * 100}%` }} /></div>
-                </div>
-              ))}
+              <div><div><span>교과서 등록·파싱</span><strong className="mono">{readySources}</strong></div></div>
+              <div><div><span>질문 검수·승인</span><strong className="mono">{approved}</strong></div></div>
+              <div><div><span>실행 가능한 데이터셋</span><strong className="mono">{approved > 0 ? 'READY' : 'WAIT'}</strong></div></div>
             </div>
           </section>
 

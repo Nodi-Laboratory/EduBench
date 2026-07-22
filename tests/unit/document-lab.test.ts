@@ -52,7 +52,7 @@ test('returns a representative, stateless parsed page for a mock PDF', async () 
       model: 'mock-document-parse',
       ocr: 'force',
       mode: 'enhanced',
-      base64_encoding: ['footnote'],
+      base64_encoding: ['table', 'figure', 'chart', 'equation'],
       output_formats: ['html'],
     },
     pages: [{
@@ -69,7 +69,7 @@ test('returns a representative, stateless parsed page for a mock PDF', async () 
         model: 'mock-document-parse',
         ocr: 'force',
         mode: 'enhanced',
-        base64_encoding: ['footnote'],
+        base64_encoding: ['table', 'figure', 'chart', 'equation'],
         output_formats: ['html'],
         mimeType: 'image/png',
         pageNumber: 1,

@@ -67,6 +67,22 @@ describe('provider response normalization', () => {
   });
 });
 
+test('sends Gemini structured-output and thinking configuration', async () => {
+  let sent: { generationConfig?: Record<string, unknown> } = {};
+  const provider = new GeminiProvider({
+    apiKey: 'secret', modelId: 'gemini-test',
+    fetch: async (_input, init) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[]' }] } }] }), { status: 200 });
+    },
+  });
+  await provider.generate({ ...request, responseMimeType: 'application/json', responseJsonSchema: { type: 'object' }, thinkingLevel: 'LOW' });
+  expect(sent.generationConfig).toMatchObject({
+    responseMimeType: 'application/json', responseJsonSchema: { type: 'object' },
+    thinkingConfig: { thinkingLevel: 'LOW' },
+  });
+});
+
 test('normalizes a provider error without exposing the API key', async () => {
   const provider = new OpenAIProvider({
     apiKey: 'top-secret-key', modelId: 'openai-test',

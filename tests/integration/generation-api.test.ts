@@ -35,16 +35,18 @@ test('creates a persistent nine-stage generation batch limited to selected files
       chunkCount: 8,
       crossUnit: false,
       requestedCount: 12,
+      executionMode: 'parallel',
     }),
   }));
   const body = await response.json();
 
   expect(response.status).toBe(201);
   expect(body.progress.stages).toHaveLength(9);
-  const batch = await db.query<{ source_scope: { sourceFileIds: string[] } }>(
-    'select source_scope from generation_batches where id = $1', [body.id],
+  const batch = await db.query<{ source_scope: { sourceFileIds: string[] }; conditions: { executionMode: string } }>(
+    'select source_scope, conditions from generation_batches where id = $1', [body.id],
   );
   expect(batch.rows[0]?.source_scope.sourceFileIds).toEqual([sourceId]);
+  expect(batch.rows[0]?.conditions.executionMode).toBe('parallel');
   const job = await db.query<{ count: string }>(
     `select count(*) from jobs where kind = 'question.generate' and payload->>'batchId' = $1`, [body.id],
   );

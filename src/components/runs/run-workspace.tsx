@@ -6,7 +6,7 @@ import { Activity, ArrowRight, PlayCircle, ServerCog } from 'lucide-react';
 
 type Dataset = { id: string; version: string; title: string; question_count: number };
 type Profile = { id: string; version: string; title: string };
-type Provider = { provider_key: string; display_name: string; protocol: string; modelId: string; envName: string };
+type Provider = { provider_key: string; display_name: string; protocol: string; modelId: string; envName: string; requestIntervalMs: number };
 type Run = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; created_at: string };
 
 export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }: {
@@ -24,7 +24,13 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }
       title: formData.get('title'), datasetVersionId: formData.get('datasetVersionId'), scoreProfileId: formData.get('scoreProfileId'),
       priceProfileVersion: String(formData.get('priceProfileVersion')), systemPrompt: formData.get('systemPrompt'),
       questionLimit: Number(formData.get('questionLimit')),
-      models: selectedProviders.map((provider) => ({ providerKey: provider.provider_key, displayName: provider.display_name, modelId: provider.modelId, protocol: provider.protocol })),
+      models: selectedProviders.map((provider) => ({
+        providerKey: provider.provider_key,
+        displayName: provider.display_name,
+        modelId: provider.modelId,
+        protocol: provider.protocol,
+        requestIntervalMs: provider.requestIntervalMs,
+      })),
     }) });
     const body = await response.json();
     if (!response.ok) setNotice(body.message ?? '실행을 만들지 못했습니다. 입력값을 확인하세요.');
@@ -43,7 +49,7 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }
         <form className="dense-form" action={submit}>
           <label>실행 제목<input name="title" defaultValue={`공식 비교 실행 ${seoulDate}`} required /></label>
           <div className="form-row"><label>불변 데이터셋<select name="datasetVersionId" required>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required>{scoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
-          <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input name="questionLimit" type="number" min="1" max="500" defaultValue="500" required /></label></div>
+          <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input name="questionLimit" type="number" min="1" max="5000" defaultValue={datasets[0]?.question_count ?? 1} required /></label></div>
           <label>시스템 프롬프트<textarea name="systemPrompt" defaultValue="제공된 교과서 근거와 질문의 지시를 따르며, 근거가 부족하면 부족하다고 명시한다." required /></label>
           <button className="button primary" disabled={submitting || selected.length === 0}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
           {notice && <p className="inline-notice">{notice}</p>}

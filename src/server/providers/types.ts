@@ -6,6 +6,9 @@ export type GenerationRequest = {
   maxOutputTokens: number;
   temperature: number;
   stopSequences?: string[];
+  responseMimeType?: 'application/json';
+  responseJsonSchema?: Record<string, unknown>;
+  thinkingLevel?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
 
 export type NormalizedGeneration = {

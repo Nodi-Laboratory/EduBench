@@ -44,6 +44,18 @@ async function appendEvent(
   );
 }
 
+export async function cancelJobWithClient(client: PoolClient, jobId: string): Promise<boolean> {
+  const cancelled = await client.query(
+    `update jobs set state = 'CANCELLED', lease_owner = null, lease_expires_at = null,
+       completed_at = now(), updated_at = now()
+     where id = $1 and state in ('PENDING', 'RETRY_WAIT', 'LEASED') returning id`,
+    [jobId],
+  );
+  if (!cancelled.rowCount) return false;
+  await appendEvent(client, jobId, 'JOB_CANCELLED', { requestedBy: 'user' });
+  return true;
+}
+
 export async function enqueueJobWithClient(client: PoolClient, input: EnqueueInput): Promise<{ id: string; existing: boolean }> {
   const inserted = await client.query<{ id: string }>(
       `insert into jobs(kind, payload, idempotency_key, priority, max_attempts, available_at)
