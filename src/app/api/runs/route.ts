@@ -2,11 +2,13 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { DomainError } from '@/domain/errors';
 import { db } from '@/server/db/pool';
+import { generationParametersSchema } from '@/server/providers/types';
 import { createRun } from '@/server/runs/service';
 
 const modelSchema = z.object({
   providerKey: z.string().min(1), displayName: z.string().min(1), modelId: z.string().min(1),
   protocol: z.enum(['gemini', 'anthropic', 'openai-responses', 'openai-compatible']),
+  parameters: generationParametersSchema.optional(),
   concurrency: z.number().int().min(1).max(50).optional(),
   requestIntervalMs: z.number().int().min(0).max(60_000).optional(),
 });

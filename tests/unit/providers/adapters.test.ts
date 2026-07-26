@@ -4,7 +4,7 @@ import { AnthropicProvider } from '@/server/providers/anthropic';
 import { OpenAIProvider } from '@/server/providers/openai';
 import { OpenAICompatibleProvider } from '@/server/providers/openai-compatible';
 import type { FetchLike, GenerationRequest } from '@/server/providers/types';
-import { createProviderRegistry } from '@/server/providers/registry';
+import { createProviderForModel, createProviderRegistry } from '@/server/providers/registry';
 
 const request: GenerationRequest = {
   system: '교과서 근거만 사용한다.',
@@ -83,6 +83,79 @@ test('sends Gemini structured-output and thinking configuration', async () => {
   });
 });
 
+test('maps optional Gemini sampling parameters while omitted sampling values stay absent', async () => {
+  let sent: { generationConfig?: Record<string, unknown> } = {};
+  const provider = new GeminiProvider({
+    apiKey: 'secret', modelId: 'gemini-test',
+    fetch: async (_input, init) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }), { status: 200 });
+    },
+  });
+
+  await provider.generate({
+    ...request,
+    temperature: undefined,
+    stopSequences: ['<END>'],
+    thinkingLevel: 'HIGH',
+    topP: undefined,
+    presencePenalty: 0.25,
+    frequencyPenalty: -0.5,
+    seed: 17,
+  });
+
+  expect(sent.generationConfig).toEqual({
+    maxOutputTokens: 300,
+    stopSequences: ['<END>'],
+    presencePenalty: 0.25,
+    frequencyPenalty: -0.5,
+    seed: 17,
+    thinkingConfig: { thinkingLevel: 'HIGH' },
+  });
+});
+
+test('maps persisted OpenAI-compatible sampling fields including EXAONE thinking', async () => {
+  let sent: Record<string, unknown> = {};
+  const provider = new OpenAICompatibleProvider({
+    providerKey: 'exaone',
+    apiKey: 'secret',
+    baseUrl: 'https://example.test/v1',
+    modelId: 'exaone-test',
+    fetch: async (_input, init) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      }), { status: 200 });
+    },
+  });
+
+  await provider.generate({
+    ...request,
+    maxOutputTokens: 16_384,
+    temperature: 1,
+    stopSequences: ['<END>'],
+    topP: 0.95,
+    presencePenalty: 0.1,
+    frequencyPenalty: -0.2,
+    seed: 23,
+    enableThinking: true,
+  });
+
+  expect(sent).toMatchObject({
+    model: 'exaone-test',
+    max_tokens: 16_384,
+    temperature: 1,
+    stop: ['<END>'],
+    top_p: 0.95,
+    presence_penalty: 0.1,
+    frequency_penalty: -0.2,
+    seed: 23,
+    chat_template_kwargs: {
+      enable_thinking: true,
+    },
+  });
+});
+
 test('normalizes a provider error without exposing the API key', async () => {
   const provider = new OpenAIProvider({
     apiKey: 'top-secret-key', modelId: 'openai-test',
@@ -134,4 +207,36 @@ test('registers only fully configured providers and supports explicit mock mode'
   const mocked = createProviderRegistry({ MOCK_PROVIDERS: 'true' });
   expect([...mocked.keys()]).toEqual(['gemini', 'claude', 'openai', 'upstage', 'exaone', 'midm']);
   expect(mocked.get('gemini')?.modelId).toBe('mock-gemini');
+});
+
+test('constructs a provider with the exact requested model instead of the environment default', () => {
+  const env = {
+    GOOGLE_API_KEY: 'g',
+    GEMINI_GENERATION_MODEL: 'environment-default',
+    MOCK_PROVIDERS: 'false',
+  };
+  expect(createProviderForModel('gemini', 'judge-exact-v7', env)?.modelId).toBe('judge-exact-v7');
+  expect(createProviderForModel('gemini', 'judge-exact-v7', { MOCK_PROVIDERS:'true' })?.modelId).toBe('judge-exact-v7');
+});
+
+test('resolves and caches run providers by the exact persisted provider and model pair', async () => {
+  const registryModule = await import('@/server/providers/registry') as typeof import('@/server/providers/registry') & {
+    createRunProviderResolver?: (
+      env: Record<string, string | undefined>,
+    ) => (providerKey: string, modelId: string) => import('@/server/providers/types').ModelProvider | undefined;
+  };
+  const createResolver = registryModule.createRunProviderResolver;
+
+  expect(createResolver).toEqual(expect.any(Function));
+  if (!createResolver) return;
+
+  const resolve = createResolver({
+    MOCK_PROVIDERS: 'true',
+    GEMINI_GENERATION_MODEL: 'environment-model-a',
+  });
+  const persistedModelB = resolve('gemini', 'persisted-model-b');
+
+  expect(persistedModelB?.modelId).toBe('persisted-model-b');
+  expect(resolve('gemini', 'persisted-model-b')).toBe(persistedModelB);
+  expect(resolve('gemini', 'environment-model-a')).not.toBe(persistedModelB);
 });

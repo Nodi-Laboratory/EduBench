@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import { GenerationWorkspace } from '@/components/generation/generation-workspace';
 import { ReviewWorkspace } from '@/components/review/review-workspace';
@@ -192,13 +192,14 @@ test('run detail exposes exact prompts, responses, failures, scores, and the eva
   render(<RunController
     initialRun={{ id:'run-1', public_id:'RUN-1', title:'실행', state:'RUNNING', total_items:1, completed_items:1, failed_items:0, dataset_version:'actual-v1', score_version:'score-v1', price_profile_version:'price-v1', created_at:'2026-07-22T00:00:00Z' }}
     models={[{ id:'model-1', display_name:'Gemini', blind_id:'M01', model_id:'gemini-test', protocol:'gemini', concurrency:1 }]}
-    profile={{ version:'score-v1', title:'선수관계 평가', metrics:['accuracy'], rubricPrompt:'절대평가한다.', judgeProvider:'gemini', judgeModel:'gemini-test', contentHash:'abc123', dynamicMetrics:['prerequisite_relation_accuracy'] }}
+    profile={{ version:'score-v1', title:'선수관계 평가', metrics:['accuracy'], rubricPrompt:'절대평가한다.', judgeProvider:'gemini', judgeModel:'gemini-test', contentHash:'abc123', dynamicMetrics:['prerequisite_relation_accuracy'], snapshotProvenance:'LEGACY_BACKFILL_UNVERIFIED' }}
     initialItems={[{ id:'item-1', state:'SUCCEEDED', attempts:1, errorCode:null, errorMessage:null, questionPublicId:'Q-1', questionText:'질문', providerKey:'gemini', displayName:'Gemini', modelId:'gemini-test', blindId:'M01', request:{ system:'시스템 지시', prompt:'실제 질문 입력' }, response:{ text:'모델 답변', raw:{ id:'raw' }, requestId:'req-1', retryHistory:[] }, scores:[{ metricKey:'accuracy', value:0.8, label:'GOOD', rationale:'근거에 부합', evidence:[] }] }]}
   />);
   expect(screen.getByText('평가 프로필')).toBeInTheDocument();
   expect(screen.getByText('실제 전송 프롬프트')).toBeInTheDocument();
   expect(screen.getByText('모델 응답')).toBeInTheDocument();
   expect(screen.getByText('점수와 판정 근거')).toBeInTheDocument();
+  expect(screen.getByText(/생성 시점 스냅샷 출처가 검증되지 않았습니다/)).toBeInTheDocument();
 });
 
 test('settings exposes the complete evaluation profile configuration', () => {
@@ -212,13 +213,53 @@ test('settings exposes the complete evaluation profile configuration', () => {
   expect(screen.getByText('hash-123')).toBeInTheDocument();
 });
 
+test('settings marks unresolved legacy score profiles as deprecated', () => {
+  const unresolvedProfiles = [{
+    version:'legacy-score-v0',
+    title:'이전 프로필',
+    judge_provider:'gemini',
+    judge_model:'legacy-environment-default-unrecorded',
+    metrics:['accuracy'],
+    rubric_prompt:'이전 평가',
+    content_hash:'legacy-hash',
+    created_at:'2026-07-01T00:00:00Z',
+    provenance_unresolved:true,
+  }];
+  render(<SettingsWorkspace providers={[]} prices={[]} mockMode={false} scores={unresolvedProfiles}/>);
+
+  expect(screen.getByText('폐기됨 · Judge 출처 미확정')).toBeInTheDocument();
+  expect(screen.getByText(/새 채점 프로필 버전을 만들어야/)).toBeInTheDocument();
+});
+
+test('run setup excludes unresolved score profiles and explains why', () => {
+  const scoreProfiles = [
+    { id:'legacy-profile', version:'legacy-v0', title:'출처 미확정', provenance_unresolved:true },
+    { id:'verified-profile', version:'score-v2', title:'검증 프로필', provenance_unresolved:false },
+  ];
+  render(<RunWorkspace
+    datasets={[{ id:'dataset-1', version:'actual-v1', title:'실제', question_count:1 }]}
+    scoreProfiles={scoreProfiles}
+    providers={[{ provider_key:'gemini', display_name:'Gemini', protocol:'gemini', modelId:'gemini-test', envName:'GEMINI_GENERATION_MODEL', requestIntervalMs:0 }]}
+    initialRuns={[]}
+  />);
+
+  expect(screen.getByText(/출처가 확인되지 않은 채점 프로필 1개를 실행 선택에서 제외/)).toBeInTheDocument();
+  expect(screen.queryByRole('option', { name:/legacy-v0/ })).not.toBeInTheDocument();
+  expect(screen.getByRole('option', { name:/score-v2/ })).toBeInTheDocument();
+});
+
 test('benchmark run preserves provider request pacing in the execution spec', async () => {
-  const fetchMock = vi.fn(async (_input: string, _init?: RequestInit) => ({ ok:true, json:async () => ({ id:'run-1', publicId:'RUN-1', totalItems:1 }) }));
+  const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+    void input;
+    void init;
+    return { ok:true, json:async () => ({ id:'run-1', publicId:'RUN-1', totalItems:1 }) };
+  });
   vi.stubGlobal('fetch', fetchMock);
   render(<RunWorkspace
     datasets={[{ id:'dataset-1', version:'actual-v1', title:'실제', question_count:1 }]}
     scoreProfiles={[{ id:'profile-1', version:'score-v1', title:'평가' }]}
     providers={[{ provider_key:'exaone', display_name:'EXAONE', protocol:'openai-compatible', modelId:'exaone-test', envName:'EXAONE_MODEL', requestIntervalMs:20000 }]}
+    modelProfile={{ id:'model-profile-1', version:'benchmark-models-test-v1', contentHash:'a'.repeat(64) }}
     initialRuns={[]}
   />);
   fireEvent.click(screen.getByRole('button', { name:'실행 초안 생성' }));
@@ -278,6 +319,50 @@ test('source workspace opens live expandable logs and exposes cancellation', asy
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/sources/source-12345678/cancel', { method: 'POST' }));
 });
 
+test('source activity exposes the immutable document and embedding execution profiles', async () => {
+  const source = {
+    id: 'source-profile-audit', original_name: 'history.pdf', subject: '한국사', grade: '고등학교',
+    byte_size: 10, status: 'READY', failed_stage: null, created_at: '2026-07-20T10:00:00Z',
+    current_job_id: 'job-profile', current_job_state: 'SUCCEEDED',
+  };
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.endsWith('/activity')) return { ok: true, json: async () => ({
+      source: { ...source, updated_at: source.created_at },
+      job: { id: 'job-profile', state: 'SUCCEEDED', attempts: 1, max_attempts: 4 },
+      events: [],
+      executionProfiles: {
+        documentParse: {
+          kind: 'document_parse',
+          profileId: '11111111-1111-4111-8111-111111111111',
+          contentHash: 'a'.repeat(64),
+          provenance: 'AT_CREATION_VERIFIED',
+          definition: { kind: 'document_parse', version: 'document-parse-v1' },
+        },
+        embeddingRag: {
+          kind: 'embedding_rag',
+          profileId: '22222222-2222-4222-8222-222222222222',
+          contentHash: 'b'.repeat(64),
+          provenance: 'AT_CREATION_VERIFIED',
+          definition: { kind: 'embedding_rag', version: 'embedding-rag-v1' },
+        },
+      },
+    }) };
+    return { ok: true, json: async () => ({ items: [source] }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<SourcesWorkspace initialSources={[source]} />);
+
+  fireEvent.click(screen.getByText('history.pdf'));
+
+  const audit = await screen.findByRole('region', { name: '고정 실행 설정' });
+  expect(within(audit).getByRole('heading', { name: '고정 실행 설정' })).toBeInTheDocument();
+  expect(within(audit).getByText('Document Parse')).toBeInTheDocument();
+  expect(within(audit).getByText('Embedding · RAG')).toBeInTheDocument();
+  expect(within(audit).getByText('11111111-1111-4111-8111-111111111111')).toBeInTheDocument();
+  expect(within(audit).getByText('a'.repeat(64))).toBeInTheDocument();
+  expect(within(audit).getAllByText('AT_CREATION_VERIFIED')).toHaveLength(2);
+});
+
 test('question generation exposes source scope and the nine-stage pipeline', () => {
   render(<GenerationWorkspace sources={[]} batches={[]} />);
   expect(screen.getByRole('heading', { name: '질문 생성' })).toBeInTheDocument();
@@ -326,6 +411,82 @@ test('question generation selects every textbook unit and submits parallel mode'
   const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')!;
   const body = JSON.parse(String(post[1]?.body));
   expect(body).toMatchObject({ sourceFileIds: [sourceId], tocEntryIds: tocIds, executionMode: 'parallel' });
+});
+
+test('question generation exposes durable item errors and resumes only unfinished work', async () => {
+  const batchId = '44444444-4444-4444-8444-444444444444';
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/resume') && init?.method === 'POST') {
+      return { ok: true, json: async () => ({ state: 'QUEUED', resumeSequence: 2 }) };
+    }
+    if (url.endsWith('/activity')) {
+      return {
+        ok: true,
+        json: async () => ({
+          batch: {
+            id: batchId,
+            state: 'FAILED',
+            requested_count: 3,
+            conditions: { executionMode: 'parallel' },
+            progress: { completedQuestions: 2, failedQuestions: 1, error: '일부 문항 실패' },
+          },
+          job: {
+            state: 'TERMINAL_FAILED',
+            attempts: 3,
+            max_attempts: 3,
+            last_error_code: 'GENERATION_ITEMS_INCOMPLETE',
+            last_error_message: '일부 문항 실패',
+          },
+          events: [],
+          questions: [],
+          canResume: true,
+          items: [{
+            id: 'item-2',
+            ordinal: 2,
+            state: 'FAILED',
+            attempts: 1,
+            retryable: true,
+            direction: { directionSummary: '선수관계 적용' },
+            error: { code: 'MODEL_TIMEOUT', message: '모델 응답 제한 시간 초과', retryable: true },
+            latestRetrieval: {
+              id: 'retrieval-2',
+              attempt: 1,
+              queryText: '속도 가속도 선수관계',
+              candidateScope: {},
+              selectedChunks: [],
+              createdAt: '2026-07-26T00:00:00Z',
+            },
+            questionId: null,
+            questionPublicId: null,
+            startedAt: '2026-07-26T00:00:00Z',
+            completedAt: null,
+            updatedAt: '2026-07-26T00:00:01Z',
+          }],
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({ items: [] }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<GenerationWorkspace sources={[]} batches={[{
+    id: batchId,
+    state: 'FAILED',
+    requested_count: 3,
+    created_at: '2026-07-26T00:00:00Z',
+    progress: { completedQuestions: 2, failedQuestions: 1 },
+  }]} />);
+
+  expect(await screen.findByText('문항별 실행 기록')).toBeInTheDocument();
+  expect(screen.getByText('2번 문항')).toBeInTheDocument();
+  expect(screen.getByText(/MODEL_TIMEOUT/)).toBeInTheDocument();
+  expect(screen.getByText('모델 응답 제한 시간 초과')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '미완료 문항 생성 재개' }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    `/api/generation/${batchId}/resume`,
+    { method: 'POST' },
+  ));
+  expect(await screen.findByText(/재개 순번 2/)).toBeInTheDocument();
 });
 
 test('review workspace keeps question, rubric, and evidence visible together', () => {

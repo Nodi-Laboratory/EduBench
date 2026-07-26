@@ -64,13 +64,26 @@ export function chunkTextbook(html: string, options: { maxTokens: number }): Tex
   const sections = $('[data-page]').toArray().filter((element) => $(element).parents('[data-page]').length === 0);
   const chunks: TextbookChunk[] = [];
   const maxCharacters = options.maxTokens * 3;
+  let carriedChapter: string | null = null;
+  let carriedUnit: string | null = null;
 
   for (const sectionElement of sections) {
     const section = $(sectionElement);
     const pageStart = Number.parseInt(section.attr('data-page') ?? '', 10);
     const pageEndValue = Number.parseInt(section.attr('data-page-end') ?? '', 10);
-    const chapter = section.attr('data-chapter') ?? null;
-    const unit = section.attr('data-unit') ?? (normalizedText(section.find('h2').first().text()) || null);
+    const explicitChapter = normalizedText(section.attr('data-chapter') ?? '')
+      || normalizedText(section.find('h1').first().text())
+      || null;
+    const explicitUnit = normalizedText(section.attr('data-unit') ?? '')
+      || normalizedText(section.find('h2').first().text())
+      || null;
+    if (explicitChapter) {
+      if (normalizedText(carriedChapter ?? '') !== explicitChapter) carriedUnit = null;
+      carriedChapter = explicitChapter;
+    }
+    if (explicitUnit) carriedUnit = explicitUnit;
+    const chapter = carriedChapter;
+    const unit = carriedUnit;
     const blocks = semanticBlocks($, section);
 
     for (const block of blocks) {

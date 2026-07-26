@@ -1,0 +1,17 @@
+export const resultMetricLabels: Record<string, string> = {
+  accuracy: '정확성',
+  faithfulness: '교과서 충실성',
+  completeness: '완결성',
+  curriculum_alignment: '교육과정 정합성',
+  student_fit: '학생 수준 적합성',
+  misconception: '오개념 대응',
+  hallucination: '환각 억제',
+  exact_match: '완전 일치',
+  response_present: '응답 존재',
+  target_concept_correctness: '목표 개념 정확성',
+  prerequisite_identification: '선수 개념 식별',
+  prerequisite_relation_accuracy: '선수 관계 방향 정확성',
+  prerequisite_application: '선수 개념 적용',
+  reasoning_chain_completeness: '추론 사슬 완결성',
+  textbook_grounding: '교과서 근거 충실성',
+};

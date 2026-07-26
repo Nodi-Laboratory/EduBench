@@ -87,6 +87,33 @@ test('marks an exhausted job as terminal instead of retrying forever', async () 
   expect(stored.rows[0]?.state).toBe('TERMINAL_FAILED');
 });
 
+test('terminates a non-retryable failure immediately without consuming remaining attempts', async () => {
+  await enqueueJob({
+    kind: 'question.generate',
+    payload: { batchId: '00000000-0000-4000-8000-000000000001' },
+    idempotencyKey: 'generation:non-retryable',
+    maxAttempts: 5,
+  });
+  const [job] = await claimJobs('worker-a', 1, 60_000);
+  const state = await failJob({
+    jobId: job!.id,
+    workerId: 'worker-a',
+    attempt: job!.attempts,
+  }, {
+    code: 'GENERATION_FORMAT_MISMATCH',
+    message: '구조화 출력이 스키마와 일치하지 않습니다.',
+    retryDelayMs: 0,
+    retryable: false,
+  });
+
+  expect(state).toBe('TERMINAL_FAILED');
+  const stored = await db.query<{ state: string; attempts: number; max_attempts: number }>(
+    'select state,attempts,max_attempts from jobs where id=$1',
+    [job!.id],
+  );
+  expect(stored.rows[0]).toEqual({ state: 'TERMINAL_FAILED', attempts: 1, max_attempts: 5 });
+});
+
 test('renews a slow job through its claim attempt until all sequential work finishes', async () => {
   await enqueueJob({ kind: 'document.parse', payload: { sourceId: 'slow' }, idempotencyKey: 'parse:slow' });
   const [job] = await claimJobs('worker-heartbeat', 1, 120);

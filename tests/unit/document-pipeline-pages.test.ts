@@ -136,13 +136,21 @@ async function waitUntil(predicate: () => boolean) {
 
 test('bounds aggregate persistent raw provenance without retaining oversized provider payloads', async () => {
   const oversizedRaw = { duplicatedBase64: 'A'.repeat(MAX_PERSISTED_RAW_PROVENANCE_BYTES + 1) };
+  const fullMarkdown = `# 원문\n\n${'문'.repeat(MAX_PERSISTED_RAW_PROVENANCE_BYTES + 1)}`;
 
   const result = await parseDocumentPages(new Uint8Array([37, 80, 68, 70]), {
     streamPdfPages: async function* () {
       yield { pageNumber: 1, bytes: new Uint8Array([1]), mimeType: 'image/png', filename: 'page-1.png', width: null, height: null };
     },
     parser: {
-      parse: async () => ({ html: '<p>page</p>', raw: oversizedRaw, requestId: 'request-1', model: 'document-parse', requestConfig: {} }),
+      parse: async () => ({
+        html: '<p>page</p>',
+        markdown: fullMarkdown,
+        raw: oversizedRaw,
+        requestId: 'request-1',
+        model: 'document-parse',
+        requestConfig: {},
+      }),
     },
   });
 
@@ -152,6 +160,8 @@ test('bounds aggregate persistent raw provenance without retaining oversized pro
     byteLength: expect.any(Number),
   });
   expect(JSON.stringify(result.raw)).not.toContain(oversizedRaw.duplicatedBase64);
+  expect(result.markdown).toBe(`<!-- page:1 -->\n${fullMarkdown}`);
+  expect(result.raw.pages[0]).not.toHaveProperty('markdown');
 });
 
 test('preserves the document cancellation reason instead of wrapping it as a page failure', async () => {

@@ -3,7 +3,21 @@ import { z } from 'zod';
 import { DomainError } from '@/domain/errors';
 import { commandRun, retryFailedRunItems, retryScoringRun } from '@/server/runs/service';
 
-const schema = z.object({ command: z.enum(['QUEUE','START','PAUSE','FINISH_PAUSE','STOP','FINISH_STOP','RESUME','CANCEL','FINISH_CANCEL','BEGIN_SCORING','COMPLETE','FAIL','RETRY_FAILED','RETRY_SCORING']) });
+// Completion and drain transitions are worker-owned. Exposing them here would
+// let a client bypass item/Judge completion checks and manufacture a terminal
+// run state with unfinished work.
+const schema = z.object({
+  command: z.enum([
+    'QUEUE',
+    'START',
+    'PAUSE',
+    'STOP',
+    'RESUME',
+    'CANCEL',
+    'RETRY_FAILED',
+    'RETRY_SCORING',
+  ]),
+});
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   try {

@@ -27,6 +27,35 @@ test('renders PDF pages as ordered 150-DPI PNG data URLs', async () => {
   await expect(access(dirname(calls[0]!.args.at(-1)!))).rejects.toThrow();
 });
 
+test('applies pinned JPEG DPI and quality rasterization settings', async () => {
+  const calls: string[][] = [];
+  const pages = await renderPdfPages(new Uint8Array([37, 80, 68, 70]), {
+    format:'jpeg',
+    dpi:300,
+    jpegQuality:92,
+    commandRunner:async (_command, args) => {
+      calls.push(args);
+      const outputPrefix = args.at(-1)!;
+      await writeFile(`${outputPrefix}-1.jpg`, new Uint8Array([0xff, 0xd8]));
+    },
+  });
+
+  expect(calls[0]).toEqual([
+    '-jpeg',
+    '-jpegopt',
+    'quality=92',
+    '-r',
+    '300',
+    expect.stringContaining('source.pdf'),
+    expect.stringContaining('page'),
+  ]);
+  expect(pages[0]).toMatchObject({
+    mimeType:'image/jpeg',
+    filename:'page-1.jpg',
+    dataUrl:'data:image/jpeg;base64,/9g=',
+  });
+});
+
 test('cleans up temporary PDF files when rendering fails', async () => {
   let tempDirectory = '';
 

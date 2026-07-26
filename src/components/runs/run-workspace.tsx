@@ -3,19 +3,45 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { Activity, ArrowRight, PlayCircle, ServerCog } from 'lucide-react';
+import { JsonBlock } from '@/components/ui/json-block';
 
 type Dataset = { id: string; version: string; title: string; question_count: number };
-type Profile = { id: string; version: string; title: string };
-type Provider = { provider_key: string; display_name: string; protocol: string; modelId: string; envName: string; requestIntervalMs: number };
+type Profile = { id: string; version: string; title: string; provenance_unresolved?: boolean };
+type Provider = {
+  provider_key:string;
+  display_name:string;
+  protocol:string;
+  modelId:string;
+  configured?:boolean;
+  envNames?:string[];
+  envName?:string;
+  parameters?:Record<string, unknown>;
+  concurrency?:number;
+  requestIntervalMs:number;
+  requestTimeoutMs?:number;
+};
+type ModelProfile = {
+  id:string;
+  version:string;
+  contentHash:string;
+};
 type Run = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; created_at: string };
 
-export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }: {
-  datasets: Dataset[]; scoreProfiles: Profile[]; providers: Provider[]; initialRuns: Run[];
+export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile = null, initialRuns }: {
+  datasets: Dataset[];
+  scoreProfiles: Profile[];
+  providers: Provider[];
+  modelProfile?:ModelProfile | null;
+  initialRuns: Run[];
 }) {
-  const [selected, setSelected] = useState(() => providers.filter((provider) => provider.modelId).map((provider) => provider.provider_key));
+  const [selected, setSelected] = useState(() => providers
+    .filter((provider) => provider.configured ?? Boolean(provider.modelId))
+    .map((provider) => provider.provider_key));
   const [runs, setRuns] = useState(initialRuns);
   const [notice, setNotice] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const selectableScoreProfiles = scoreProfiles.filter((profile) => !profile.provenance_unresolved);
+  const unresolvedProfileCount = scoreProfiles.length - selectableScoreProfiles.length;
 
   async function submit(formData: FormData) {
     setSubmitting(true); setNotice('');
@@ -29,6 +55,8 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }
         displayName: provider.display_name,
         modelId: provider.modelId,
         protocol: provider.protocol,
+        parameters:provider.parameters ?? {},
+        concurrency:provider.concurrency ?? 1,
         requestIntervalMs: provider.requestIntervalMs,
       })),
     }) });
@@ -48,16 +76,20 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, initialRuns }
       <section className="panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>실행 명세</h2></div></div>
         <form className="dense-form" action={submit}>
           <label>실행 제목<input name="title" defaultValue={`공식 비교 실행 ${seoulDate}`} required /></label>
-          <div className="form-row"><label>불변 데이터셋<select name="datasetVersionId" required>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required>{scoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
+          {unresolvedProfileCount > 0 && <p className="result-warning">Judge 출처가 확인되지 않은 채점 프로필 {unresolvedProfileCount}개를 실행 선택에서 제외했습니다. 설정에서 정확한 Judge 제공자와 모델을 지정한 새 프로필 버전을 만드십시오.</p>}
+          <div className="form-row"><label>불변 데이터셋<select name="datasetVersionId" required>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required disabled={selectableScoreProfiles.length === 0}>{selectableScoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
           <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input name="questionLimit" type="number" min="1" max="5000" defaultValue={datasets[0]?.question_count ?? 1} required /></label></div>
           <label>시스템 프롬프트<textarea name="systemPrompt" defaultValue="제공된 교과서 근거와 질문의 지시를 따르며, 근거가 부족하면 부족하다고 명시한다." required /></label>
-          <button className="button primary" disabled={submitting || selected.length === 0}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
+          {!modelProfile && <p className="result-warning">활성 벤치마크 모델 연구 설정이 없습니다. 시스템 설정에서 프로필을 활성화하십시오.</p>}
+          <button className="button primary" disabled={submitting || selected.length === 0 || selectableScoreProfiles.length === 0 || !modelProfile}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
           {notice && <p className="inline-notice">{notice}</p>}
         </form>
       </section>
       <section className="panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>모델 선택</h2></div><span className="count-label mono">{selected.length} SELECTED</span></div>
-        <div className="provider-selector">{providers.map((provider, index) => <label key={provider.provider_key} className={!provider.modelId ? 'disabled-provider' : ''}><input type="checkbox" checked={selected.includes(provider.provider_key)} disabled={!provider.modelId} onChange={(event) => setSelected((current) => event.target.checked ? [...current, provider.provider_key] : current.filter((key) => key !== provider.provider_key))} /><span className={`model-key model-${index + 1}`} /><span><strong>{provider.display_name}</strong><small className="mono">{provider.modelId || `${provider.envName} 미설정`}</small></span><b>{provider.protocol}</b></label>)}</div>
-        <div className="dataset-note"><ServerCog size={17} /><p>API 키와 모델 ID는 <strong>.env</strong>에서만 읽습니다. 별도의 연결 확인 단계는 두지 않습니다.</p></div>
+        {modelProfile && <div className="dataset-note"><ServerCog size={17}/><p>활성 모델 프로필 <strong>{modelProfile.version}</strong><br/><span className="mono">{modelProfile.contentHash}</span></p></div>}
+        <div className="provider-selector">{providers.map((provider, index) => { const configured=provider.configured ?? Boolean(provider.modelId); return <label key={provider.provider_key} className={!configured ? 'disabled-provider' : ''}><input type="checkbox" checked={selected.includes(provider.provider_key)} disabled={!configured} onChange={(event) => setSelected((current) => event.target.checked ? [...current, provider.provider_key] : current.filter((key) => key !== provider.provider_key))} /><span className={`model-key model-${index + 1}`} /><span><strong>{provider.display_name}</strong><small className="mono">{provider.modelId}</small><small>{configured ? `동시 ${provider.concurrency ?? 1} · timeout ${provider.requestTimeoutMs ?? 90_000}ms` : `${(provider.envNames ?? [provider.envName ?? 'API key']).join(' · ')} 미설정`}</small></span><b>{provider.protocol}</b></label>; })}</div>
+        <div className="compact-list">{providers.map((provider) => <details key={`${provider.provider_key}-parameters`}><summary><strong>{provider.display_name}</strong> 실제 생성 파라미터</summary><JsonBlock value={provider.parameters ?? {}}/></details>)}</div>
+        <div className="dataset-note"><ServerCog size={17} /><p>API 키와 Base URL만 <strong>.env</strong>에서 읽습니다. 모델 ID와 생성값은 위 불변 연구 프로필에서 고정됩니다.</p></div>
       </section>
     </div>
     <section className="panel recent-panel"><div className="panel-heading"><div><span className="section-index mono">03</span><h2>실행 기록</h2></div><span className="count-label mono">{runs.length} RUNS</span></div>

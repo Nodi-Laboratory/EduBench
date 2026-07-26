@@ -41,7 +41,10 @@ export function DatasetWorkspace({ approvedQuestionIds, workingDistribution, wor
   const [evidenceMode, setEvidenceMode] = useState('');
   const seoulDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   const selectedVersion = versions.find((version) => version.id === selectedVersionId) ?? versions[0] ?? null;
-  const scopedQuestions = scope === 'working' ? workingQuestions : selectedVersion?.questions ?? [];
+  const scopedQuestions = useMemo(
+    () => scope === 'working' ? workingQuestions : selectedVersion?.questions ?? [],
+    [scope, selectedVersion, workingQuestions],
+  );
   const filteredQuestions = useMemo(() => scopedQuestions.filter((question) => {
     const needle = query.trim().toLocaleLowerCase('ko-KR');
     const haystack = [question.publicId, question.questionText, question.answerText, question.subject, question.grade, question.chapter, question.unit, question.purpose, question.benchmarkDesign?.targetConcept].filter(Boolean).join(' ').toLocaleLowerCase('ko-KR');

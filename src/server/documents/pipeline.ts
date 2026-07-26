@@ -2,18 +2,25 @@ import { readFile } from 'node:fs/promises';
 import { chunkTextbook } from '@/domain/chunking';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
-import { streamPdfPages, type RenderedPage, type StreamedPage } from '@/server/documents/page-renderer';
+import {
+  streamPdfPages,
+  type RenderedPage,
+  type RenderPdfPagesOptions,
+  type StreamedPage,
+} from '@/server/documents/page-renderer';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 import { UpstageDocumentParser, type DocumentParseOptions } from '@/server/providers/upstage-document';
 import { recordSourceEvent } from '@/server/sources/activity';
 import { extractTableOfContents } from '@/domain/toc';
 import { replaceSourceTocEntries } from '@/server/sources/toc';
 import { mapConcurrentOrdered } from '@/domain/parallel';
+import { resolveSourceExecutionPins } from '@/server/settings/execution-pins';
 
 function vectorLiteral(values: number[]): string { return `[${values.join(',')}]`; }
 
 type ParsedPage = {
   html: string;
+  markdown?:string;
   raw: unknown;
   requestId: string | null;
   model: string;
@@ -32,6 +39,10 @@ export type ParseDocumentPagesDependencies = {
   onEvent?: (eventType: string, payload: Record<string, unknown>) => Promise<void> | void;
   batchSize?: number;
   concurrency?: number;
+  rasterization?: Pick<
+    RenderPdfPagesOptions,
+    'format' | 'dpi' | 'jpegQuality' | 'timeoutMs'
+  >;
 };
 
 type PipelinePage = RenderedPage | StreamedPage;
@@ -46,6 +57,7 @@ type PersistedPageProvenance = {
 
 type ParsedDocumentPages = {
   html: string;
+  markdown:string | null;
   raw: { pages: PersistedPageProvenance[] };
   requestId: string;
   model: string | null;
@@ -84,7 +96,14 @@ export async function parseDocumentPages(
     ? dependencies.streamPdfPages(bytes)
     : dependencies.renderPdfPages
       ? arrayPages(dependencies.renderPdfPages(bytes))
-      : streamPdfPages(bytes, { signal: dependencies.signal, timeoutMs: Number(process.env.PROVIDER_TIMEOUT_MS || 120_000) });
+      : streamPdfPages(bytes, {
+        signal:dependencies.signal,
+        timeoutMs:dependencies.rasterization?.timeoutMs
+          ?? Number(process.env.PROVIDER_TIMEOUT_MS || 120_000),
+        format:dependencies.rasterization?.format,
+        dpi:dependencies.rasterization?.dpi,
+        jpegQuality:dependencies.rasterization?.jpegQuality,
+      });
   const parsedPages: Array<{ page: PipelinePage; parsed: ParsedPage }> = [];
   let persistedRawBytes = 0;
   const batchSize = dependencies.batchSize ?? Math.max(1, Number(process.env.DOCUMENT_PARSE_BATCH_SIZE ?? 4));
@@ -150,6 +169,10 @@ export async function parseDocumentPages(
     },
     requestId: parsedPages.map(({ parsed }) => parsed.requestId).join(','),
     model: parsedPages[0]?.parsed.model ?? null,
+    markdown:parsedPages.some(({ parsed }) => parsed.markdown != null)
+      ? parsedPages.map(({ page, parsed }) =>
+        `<!-- page:${page.pageNumber} -->\n${parsed.markdown ?? ''}`).join('\n\n')
+      : null,
   };
 }
 
@@ -162,6 +185,9 @@ export async function processDocument(
   );
   const source = sourceResult.rows[0];
   if (!source) throw new Error('SOURCE_NOT_FOUND: 교과서 파일을 찾을 수 없습니다.');
+  const executionPins = await resolveSourceExecutionPins(sourceId);
+  const parseSettings = executionPins.documentParse.definition.settings;
+  const embeddingSettings = executionPins.embeddingRag.definition.settings;
   options.signal?.throwIfAborted();
   const log = (eventType: string, payload: Record<string, unknown> = {}) =>
     recordSourceEvent(sourceId, options.jobId ?? null, eventType, payload);
@@ -171,66 +197,190 @@ export async function processDocument(
   await db.query("update source_files set status = 'PARSING', failed_stage = null, failure_code = null, failure_message = null, updated_at = now() where id = $1", [sourceId]);
   await log('DOCUMENT_PARSE_STARTED', {
     provider: mock ? 'mock' : 'upstage',
-    model: mock ? 'mock-document-parse' : (process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse'),
+    model:mock ? 'mock-document-parse' : parseSettings.model,
+    profileId:executionPins.documentParse.profileId,
+    profileHash:executionPins.documentParse.contentHash,
+    settings:parseSettings,
     sourceBytes: bytes.byteLength,
   });
   const parsed = mock
-    ? { html: `<section data-page="1"><h2>로컬 파이프라인 검증</h2><p>${source.original_name} 문서의 실제 내용은 MOCK 모드에서 추출하지 않습니다.</p></section>`, raw: { mock: true }, requestId: 'mock-document-parse', model: 'mock-document-parse' }
+    ? {
+      html:`<section data-page="1"><h2>로컬 파이프라인 검증</h2><p>${source.original_name} 문서의 실제 내용은 MOCK 모드에서 추출하지 않습니다.</p></section>`,
+      markdown:`# 로컬 파이프라인 검증\n\n${source.original_name}`,
+      raw:{ mock:true, settings:parseSettings },
+      requestId:'mock-document-parse',
+      model:'mock-document-parse',
+    }
     : await parseDocumentPages(bytes, source.original_name, {
-      parser: new UpstageDocumentParser({ apiKey: process.env.UPSTAGE_API_KEY ?? '', model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', baseUrl: process.env.UPSTAGE_BASE_URL }),
+      parser:new UpstageDocumentParser({
+        apiKey:process.env.UPSTAGE_API_KEY ?? '',
+        model:parseSettings.model,
+        baseUrl:process.env.UPSTAGE_BASE_URL,
+        timeoutMs:parseSettings.requestTimeoutMs,
+        mode:parseSettings.mode,
+        ocr:parseSettings.ocr,
+        base64Encoding:parseSettings.base64Encoding,
+        outputFormats:parseSettings.outputFormat === 'both'
+          ? ['html', 'markdown']
+          : [parseSettings.outputFormat],
+      }),
       signal: options.signal,
       onEvent: log,
+      batchSize:parseSettings.pagesPerBatch,
+      concurrency:parseSettings.pageConcurrency,
+      rasterization:{
+        format:parseSettings.rasterization.format,
+        dpi:parseSettings.rasterization.dpi,
+        ...(parseSettings.rasterization.format === 'jpeg'
+          ? { jpegQuality:parseSettings.rasterization.jpegQuality }
+          : {}),
+        timeoutMs:parseSettings.requestTimeoutMs,
+      },
     });
   options.signal?.throwIfAborted();
   await log('DOCUMENT_PARSE_COMPLETED', { model: parsed.model, requestId: parsed.requestId });
   const parseHtml = /data-page=/.test(parsed.html) ? parsed.html : `<section data-page="1">${parsed.html}</section>`;
-  await log('CHUNKING_STARTED', { htmlBytes: Buffer.byteLength(parseHtml, 'utf8'), maxTokens: 800 });
-  const chunks = chunkTextbook(parseHtml, { maxTokens: 800 });
+  await log('CHUNKING_STARTED', {
+    htmlBytes:Buffer.byteLength(parseHtml, 'utf8'),
+    maxTokens:embeddingSettings.chunkTargetTokens,
+    embeddingProfileId:executionPins.embeddingRag.profileId,
+    vectorSpaceId:embeddingSettings.vectorSpaceId,
+  });
+  const chunks = chunkTextbook(parseHtml, {
+    maxTokens:embeddingSettings.chunkTargetTokens,
+  });
   if (!chunks.length) throw new Error('DOCUMENT_EMPTY: 문서에서 청크를 만들 수 없습니다.');
   await log('CHUNKING_COMPLETED', { chunkCount: chunks.length });
   const tocEntries = extractTableOfContents(parseHtml, 10);
   await log('TABLE_OF_CONTENTS_EXTRACTED', { scannedPages: 10, entryCount: tocEntries.length, entries: tocEntries });
   const revisionResult = await db.query<{ revision: number }>('select coalesce(max(revision), 0)::int + 1 as revision from source_revisions where source_file_id = $1', [sourceId]);
   const revision = revisionResult.rows[0]!.revision;
-  const embeddingModel = mock ? 'mock-embedding-3072' : (process.env.GEMINI_EMBEDDING_MODEL ?? '');
-  if (!mock && (!process.env.GOOGLE_API_KEY || !embeddingModel)) throw new Error('EMBEDDING_NOT_CONFIGURED: GOOGLE_API_KEY와 GEMINI_EMBEDDING_MODEL이 필요합니다.');
+  const embeddingModel = mock
+    ? 'mock-embedding-3072'
+    : embeddingSettings.model;
+  if (!mock && !process.env.GOOGLE_API_KEY) {
+    throw new Error(
+      'EMBEDDING_NOT_CONFIGURED: GOOGLE_API_KEY가 필요합니다.',
+    );
+  }
   await db.query("update source_files set status = 'EMBEDDING', updated_at = now() where id = $1", [sourceId]);
-  await log('GEMINI_EMBEDDING_STARTED', { provider: mock ? 'mock' : 'gemini', model: embeddingModel, chunkCount: chunks.length, dimensions: 3072 });
+  await log('GEMINI_EMBEDDING_STARTED', {
+    provider:mock ? 'mock' : 'gemini',
+    model:embeddingModel,
+    chunkCount:chunks.length,
+    dimensions:embeddingSettings.dimensions,
+    profileId:executionPins.embeddingRag.profileId,
+    profileHash:executionPins.embeddingRag.contentHash,
+    vectorSpaceId:embeddingSettings.vectorSpaceId,
+    taskType:embeddingSettings.documentTaskType,
+    prefixStrategy:embeddingSettings.prefixStrategy,
+  });
   const vectors: number[][] = [];
-  if (mock) for (let index = 0; index < chunks.length; index += 1) vectors.push(new Array<number>(3072).fill(0));
+  if (mock) {
+    for (let index = 0; index < chunks.length; index += 1) {
+      vectors.push(new Array<number>(embeddingSettings.dimensions).fill(0));
+    }
+  }
   else {
-    const embedder = new GeminiEmbedder({ apiKey: process.env.GOOGLE_API_KEY!, modelId: embeddingModel, dimensions: 3072, baseUrl: process.env.GEMINI_BASE_URL });
-    const embeddingBatchSize = Math.max(1, Number(process.env.EMBEDDING_BATCH_SIZE ?? 50));
-    const embeddingConcurrency = Math.max(1, Number(process.env.EMBEDDING_CONCURRENCY ?? 3));
+    const embedder = new GeminiEmbedder({
+      apiKey:process.env.GOOGLE_API_KEY!,
+      modelId:embeddingModel,
+      dimensions:embeddingSettings.dimensions,
+      baseUrl:process.env.GEMINI_BASE_URL,
+      timeoutMs:embeddingSettings.requestTimeoutMs,
+    });
+    const embeddingBatchSize = embeddingSettings.batchSize;
+    const embeddingConcurrency = embeddingSettings.concurrency;
     const batches = Array.from({ length: Math.ceil(chunks.length / embeddingBatchSize) }, (_, index) => ({
       index, start: index * embeddingBatchSize, chunks: chunks.slice(index * embeddingBatchSize, (index + 1) * embeddingBatchSize),
     }));
     const batchVectors = await mapConcurrentOrdered(batches, embeddingConcurrency, async (batch) => {
       options.signal?.throwIfAborted();
       await log('EMBEDDING_BATCH_STARTED', { batchIndex: batch.index + 1, start: batch.start + 1, count: batch.chunks.length, total: chunks.length, concurrency: embeddingConcurrency });
-      const result = await embedder.embed(batch.chunks.map((chunk) => chunk.content), options.signal);
+      const result = await embedder.embed(
+        batch.chunks.map((chunk) =>
+          embeddingSettings.prefixStrategy === 'text_prefix'
+            ? `${embeddingSettings.documentPrefix}${chunk.content}`
+            : chunk.content),
+        options.signal,
+        embeddingSettings.documentTaskType,
+      );
       await log('EMBEDDING_BATCH_COMPLETED', { model: embeddingModel, batchIndex: batch.index + 1, start: batch.start + 1, count: batch.chunks.length, total: chunks.length });
       return result;
     });
     vectors.push(...batchVectors.flat());
   }
   options.signal?.throwIfAborted();
-  await log('GEMINI_EMBEDDING_COMPLETED', { model: embeddingModel, vectorCount: vectors.length, dimensions: 3072 });
-  await withTransaction(async (client) => {
+  await log('GEMINI_EMBEDDING_COMPLETED', {
+    model:embeddingModel,
+    vectorCount:vectors.length,
+    dimensions:embeddingSettings.dimensions,
+    vectorSpaceId:embeddingSettings.vectorSpaceId,
+  });
+  const tocAlignment = await withTransaction(async (client) => {
     await client.query("update source_files set status = 'PARSED', updated_at = now() where id = $1", [sourceId]);
     const sourceRevision = await client.query<{ id: string }>(
-      `insert into source_revisions(source_file_id, revision, parse_model, parse_request_id, raw_response, raw_html, reviewed_html, review_summary)
-       values ($1,$2,$3,$4,$5::jsonb,$6,$6,'자동 파이프라인 검수: 원문 HTML 보존') returning id`,
-      [sourceId, revision, parsed.model, parsed.requestId, JSON.stringify(parsed.raw), parseHtml],
+      `insert into source_revisions(
+         source_file_id, revision, parse_model, parse_request_id,
+         raw_response, raw_html, raw_markdown, reviewed_html, review_summary
+       )
+       values (
+         $1,$2,$3,$4,$5::jsonb,$6,$7,$6,
+         '자동 파이프라인 검수: 원문 HTML·Markdown 보존'
+       )
+       returning id`,
+      [
+        sourceId,
+        revision,
+        parsed.model,
+        parsed.requestId,
+        JSON.stringify(parsed.raw),
+        parseHtml,
+        parsed.markdown,
+      ],
     );
-    await replaceSourceTocEntries(client, sourceId, tocEntries);
     await client.query("update source_files set status = 'CHUNKING' where id = $1", [sourceId]);
-    for (const [index, chunk] of chunks.entries()) await client.query(
-      `insert into source_chunks(source_file_id, source_revision_id, ordinal, subject, grade, chapter, unit, page_start, page_end, kind, html, content, token_count, embedding, embedding_model, embedding_version)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::vector,$15,'v1')`,
-      [sourceId, sourceRevision.rows[0]!.id, chunk.ordinal, source.subject, source.grade, chunk.chapter, chunk.unit, chunk.pageStart, chunk.pageEnd, chunk.kind, chunk.html, chunk.content, chunk.estimatedTokens, vectorLiteral(vectors[index]!), embeddingModel],
+    const persistedChunks = [];
+    for (const [index, chunk] of chunks.entries()) {
+      const inserted = await client.query<{ id: string }>(
+        `insert into source_chunks(source_file_id, source_revision_id, ordinal, subject, grade, chapter, unit, page_start, page_end, kind, html, content, token_count, embedding, embedding_model, embedding_version)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::vector,$15,$16)
+         returning id`,
+        [
+          sourceId,
+          sourceRevision.rows[0]!.id,
+          chunk.ordinal,
+          source.subject,
+          source.grade,
+          chunk.chapter,
+          chunk.unit,
+          chunk.pageStart,
+          chunk.pageEnd,
+          chunk.kind,
+          chunk.html,
+          chunk.content,
+          chunk.estimatedTokens,
+          vectorLiteral(vectors[index]!),
+          embeddingModel,
+          embeddingSettings.vectorSpaceId,
+        ],
+      );
+      persistedChunks.push({ ...chunk, id: inserted.rows[0]!.id });
+    }
+    const alignment = await replaceSourceTocEntries(
+      client,
+      sourceId,
+      sourceRevision.rows[0]!.id,
+      tocEntries,
+      persistedChunks,
     );
     await client.query("update source_files set status = 'READY', updated_at = now() where id = $1", [sourceId]);
+    return alignment;
+  });
+  await log('TABLE_OF_CONTENTS_ALIGNED', {
+    mappedEntries: tocAlignment.entries.filter((entry) => entry.mappingStatus === 'MAPPED').length,
+    unmappedEntries: tocAlignment.entries.filter((entry) => entry.mappingStatus === 'UNMAPPED').length,
+    chunkMappings: tocAlignment.mappings.length,
   });
   await log('PIPELINE_COMPLETED', { revision, chunks: chunks.length, embeddingModel });
   return { revision, chunks: chunks.length, embeddingModel };

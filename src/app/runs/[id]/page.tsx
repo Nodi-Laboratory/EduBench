@@ -8,5 +8,13 @@ export default async function RunDetailPage({ params }: { params: Promise<{ id: 
   const { id } = await params;
   const details = await getRunDetails(id);
   if (!details) notFound();
-  return <RunController initialRun={details.run} models={details.models} profile={details.profile} initialItems={details.items} />;
+  return <RunController
+    initialRun={details.run}
+    models={details.models}
+    profile={details.profile}
+    scoringEngine={details.scoringEngine}
+    initialItems={details.items}
+    initialEvents={details.events}
+    initialEventCursor={details.eventCursor}
+  />;
 }

@@ -1,9 +1,40 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { POST } from '@/app/api/document-lab/parse/route';
-import { DOCUMENT_LAB_LIMITS, parseDocumentLabFile } from '@/server/documents/lab';
+import {
+  createDocumentLabPostHandler,
+  loadActiveDocumentParseProfile,
+} from '@/app/api/document-lab/parse/route';
+import { DomainError } from '@/domain/errors';
+import {
+  DOCUMENT_LAB_LIMITS,
+  parseDocumentLabFile,
+  type DocumentLabProfileConfig,
+} from '@/server/documents/lab';
 
 const originalMockProviders = process.env.MOCK_PROVIDERS;
 const originalUpstageApiKey = process.env.UPSTAGE_API_KEY;
+
+const documentParseProfile: DocumentLabProfileConfig = {
+  id: '2d250a46-a96e-4a23-90e8-c32d15b1e0d9',
+  version: 'document-parse-lab-test-v2',
+  contentHash: 'a'.repeat(64),
+  settings: {
+    provider: 'upstage',
+    model: 'document-parse-profile-model',
+    mode: 'standard',
+    ocr: 'auto',
+    outputFormat: 'both',
+    base64Encoding: ['table', 'figure', 'chart', 'equation'],
+    rasterization: {
+      format: 'jpeg',
+      lossless: false,
+      dpi: 300,
+      jpegQuality: 92,
+    },
+    pagesPerBatch: 8,
+    pageConcurrency: 2,
+    requestTimeoutMs: 45_000,
+  },
+};
 
 function metadataFile(bytes: Uint8Array, size: number, name = 'document.png', type = 'image/png'): File {
   return {
@@ -49,11 +80,17 @@ test('returns a representative, stateless parsed page for a mock PDF', async () 
   expect(result).toEqual({
     mock: true,
     requestConfig: {
-      model: 'mock-document-parse',
+      profile: null,
+      provider: 'upstage',
+      model: 'document-parse',
       ocr: 'force',
       mode: 'enhanced',
       base64_encoding: ['table', 'figure', 'chart', 'equation'],
       output_formats: ['html'],
+      rasterization: { format: 'png', lossless: true, dpi: 300 },
+      pages_per_batch: 10,
+      page_concurrency: 4,
+      request_timeout_ms: 120_000,
     },
     pages: [{
       pageNumber: 1,
@@ -66,13 +103,20 @@ test('returns a representative, stateless parsed page for a mock PDF', async () 
       requestId: 'mock-document-lab-page-1',
       model: 'mock-document-parse',
       requestConfig: {
+        profile: null,
+        provider: 'upstage',
         model: 'mock-document-parse',
         ocr: 'force',
         mode: 'enhanced',
         base64_encoding: ['table', 'figure', 'chart', 'equation'],
         output_formats: ['html'],
+        rasterization: { format: 'png', lossless: true, dpi: 300 },
+        pages_per_batch: 10,
+        page_concurrency: 4,
+        request_timeout_ms: 120_000,
         mimeType: 'image/png',
         pageNumber: 1,
+        mock: true,
       },
     }],
   });
@@ -204,7 +248,9 @@ test('returns a typed configured error without exposing credentials', async () =
   const form = new FormData();
   form.set('file', new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], 'page.png', { type: 'image/png' }));
 
-  const response = await POST(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
+  const response = await createDocumentLabPostHandler({
+    loadActiveProfile: async () => documentParseProfile,
+  })(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
 
   expect(response.status).toBe(409);
   await expect(response.json()).resolves.toEqual({
@@ -271,7 +317,9 @@ test('returns safe page and request provenance while redacting provider bodies a
   const form = new FormData();
   form.set('file', new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'page.png', { type: 'image/png' }));
 
-  const response = await POST(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
+  const response = await createDocumentLabPostHandler({
+    loadActiveProfile: async () => documentParseProfile,
+  })(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
   const body = await response.json();
 
   expect(response.status).toBe(502);
@@ -298,4 +346,200 @@ test('extracts original PNG dimensions for the page-coordinate signature', async
   const result = await parseDocumentLabFile(new File([png], 'page.png', { type: 'image/png' }));
 
   expect(result.pages[0]).toMatchObject({ width: 640, height: 480 });
+});
+
+test('applies the explicit active profile to rasterization and concurrent parsing while preserving page order', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const pdf = new File(
+    [new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])],
+    'lesson.pdf',
+    { type: 'application/pdf' },
+  );
+  const releases = new Map<number, () => void>();
+  const parserCalls: number[] = [];
+  let activeParsers = 0;
+  let maximumActiveParsers = 0;
+  let renderOptions: unknown;
+  let parserOptions: unknown;
+
+  const parsing = parseDocumentLabFile(pdf, {
+    profile: documentParseProfile,
+    streamPdfPages: async function* (_bytes, options) {
+      renderOptions = options;
+      for (const pageNumber of [1, 2, 3]) {
+        yield {
+          pageNumber,
+          bytes: new Uint8Array([pageNumber]),
+          mimeType: 'image/jpeg',
+          filename: `page-${pageNumber}.jpg`,
+          width: null,
+          height: null,
+        };
+      }
+    },
+    createParser: (options) => {
+      parserOptions = options;
+      return {
+        parse: async (_bytes, _filename, parseOptions) => {
+          parserCalls.push(parseOptions.pageNumber);
+          activeParsers += 1;
+          maximumActiveParsers = Math.max(maximumActiveParsers, activeParsers);
+          await new Promise<void>((resolve) => releases.set(parseOptions.pageNumber, resolve));
+          activeParsers -= 1;
+          return {
+            html: `<p>page ${parseOptions.pageNumber}</p>`,
+            markdown: `page ${parseOptions.pageNumber}`,
+            elements: [],
+            raw: { pageNumber: parseOptions.pageNumber },
+            requestId: `request-${parseOptions.pageNumber}`,
+            model: documentParseProfile.settings.model,
+            requestConfig: { pageNumber: parseOptions.pageNumber },
+          };
+        },
+      };
+    },
+  });
+
+  await vi.waitFor(() => expect(parserCalls).toEqual([1, 2]));
+  releases.get(2)!();
+  await vi.waitFor(() => expect(parserCalls).toEqual([1, 2, 3]));
+  releases.get(3)!();
+  releases.get(1)!();
+  const result = await parsing;
+
+  expect(maximumActiveParsers).toBe(2);
+  expect(renderOptions).toEqual({
+    format: 'jpeg',
+    dpi: 300,
+    jpegQuality: 92,
+    timeoutMs: 45_000,
+  });
+  expect(parserOptions).toMatchObject({
+    apiKey: 'server-only-key',
+    model: 'document-parse-profile-model',
+    mode: 'standard',
+    ocr: 'auto',
+    base64Encoding: ['table', 'figure', 'chart', 'equation'],
+    outputFormats: ['html', 'markdown'],
+    timeoutMs: 45_000,
+  });
+  expect(result.requestConfig).toEqual({
+    profile: {
+      id: documentParseProfile.id,
+      version: documentParseProfile.version,
+      contentHash: documentParseProfile.contentHash,
+    },
+    provider: 'upstage',
+    model: 'document-parse-profile-model',
+    ocr: 'auto',
+    mode: 'standard',
+    base64_encoding: ['table', 'figure', 'chart', 'equation'],
+    output_formats: ['html', 'markdown'],
+    rasterization: {
+      format: 'jpeg',
+      lossless: false,
+      dpi: 300,
+      jpegQuality: 92,
+    },
+    pages_per_batch: 8,
+    page_concurrency: 2,
+    request_timeout_ms: 45_000,
+  });
+  expect(result.pages.map((page) => ({
+    pageNumber: page.pageNumber,
+    html: page.html,
+    markdown: page.markdown,
+  }))).toEqual([
+    { pageNumber: 1, html: '<p>page 1</p>', markdown: 'page 1' },
+    { pageNumber: 2, html: '<p>page 2</p>', markdown: 'page 2' },
+    { pageNumber: 3, html: '<p>page 3</p>', markdown: 'page 3' },
+  ]);
+});
+
+test('strictly resolves exactly one active document parse profile', async () => {
+  const loaded = await loadActiveDocumentParseProfile(async () => ({
+    items: [{
+      id: documentParseProfile.id,
+      kind: 'document_parse',
+      version: documentParseProfile.version,
+      title: 'Document Lab test profile',
+      definition: {
+        schemaVersion: 1,
+        kind: 'document_parse',
+        version: documentParseProfile.version,
+        title: 'Document Lab test profile',
+        description: 'Document Lab에서 활성 프로필을 엄격히 읽는 동작을 검증하기 위한 설정입니다.',
+        applyScope: '활성화한 이후의 Document Lab 분석 요청에만 해당 설정이 적용됩니다.',
+        reprocessingImpact: 'Document Lab은 결과를 저장하지 않으므로 기존 문서를 다시 처리할 필요가 없습니다.',
+        settings: documentParseProfile.settings,
+      },
+      contentHash: documentParseProfile.contentHash,
+      createdAt: '2026-07-26T00:00:00.000Z',
+      active: true,
+    }],
+    activeByKind: { document_parse: documentParseProfile.id },
+  }));
+
+  expect(loaded).toEqual(documentParseProfile);
+});
+
+test('returns a typed configuration error when no active document parse profile exists', async () => {
+  const post = createDocumentLabPostHandler({
+    loadActiveProfile: () => loadActiveDocumentParseProfile(async () => ({
+      items: [],
+      activeByKind: {},
+    })),
+  });
+  const form = new FormData();
+  form.set(
+    'file',
+    new File(
+      [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+      'page.png',
+      { type: 'image/png' },
+    ),
+  );
+
+  const response = await post(new Request(
+    'http://localhost/api/document-lab/parse',
+    { method: 'POST', body: form },
+  ));
+
+  expect(response.status).toBe(409);
+  await expect(response.json()).resolves.toEqual({
+    code: 'DOCUMENT_PARSE_PROFILE_NOT_CONFIGURED',
+    message: '활성 문서 파싱 연구 프로필이 없습니다.',
+  });
+});
+
+test('returns a typed integrity error when the stored active profile fails verification', async () => {
+  const post = createDocumentLabPostHandler({
+    loadActiveProfile: async () => {
+      throw new DomainError(
+        'RESEARCH_PROFILE_INTEGRITY_ERROR',
+        '저장된 프로필 정의와 해시가 일치하지 않습니다.',
+      );
+    },
+  });
+  const form = new FormData();
+  form.set(
+    'file',
+    new File(
+      [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+      'page.png',
+      { type: 'image/png' },
+    ),
+  );
+
+  const response = await post(new Request(
+    'http://localhost/api/document-lab/parse',
+    { method: 'POST', body: form },
+  ));
+
+  expect(response.status).toBe(500);
+  await expect(response.json()).resolves.toEqual({
+    code: 'DOCUMENT_PARSE_PROFILE_INTEGRITY_ERROR',
+    message: '활성 문서 파싱 연구 프로필의 무결성을 확인하지 못했습니다.',
+  });
 });

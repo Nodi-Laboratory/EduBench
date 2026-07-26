@@ -39,11 +39,9 @@ test('adds prerequisite metrics only for prerequisite benchmark questions', () =
   expect(requiredMetricsForQuestion(['accuracy'], {})).toEqual(['exact_match', 'response_present', 'accuracy']);
 });
 
-test('starts with one efficient judge batch and accepts a single mislabeled score', () => {
+test('starts with one efficient judge batch and rejects a mislabeled score', () => {
   expect(judgeMetricBatches(['a', 'b', 'c', 'd', 'e'])).toEqual([['a', 'b', 'c', 'd', 'e']]);
-  expect(selectJudgeScore('accuracy', [{ metricKey:'정확성', value:0.8 }])).toMatchObject({
-    metricKey:'accuracy', value:0.8,
-  });
+  expect(selectJudgeScore('accuracy', [{ metricKey:'정확성', value:0.8 }])).toBeNull();
   expect(selectJudgeScore('accuracy', [])).toBeNull();
   expect(normalizeJudgeScoreValue('0.8')).toBe(0.8);
   expect(normalizeJudgeScoreValue('not-a-score')).toBe('not-a-score');

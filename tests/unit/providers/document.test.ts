@@ -26,12 +26,108 @@ test('sends the Upstage Enhanced multipart request for a PNG page', async () => 
   });
 });
 
+test('sends an explicitly pinned parser profile and preserves Markdown output', async () => {
+  const parser = new UpstageDocumentParser({
+    apiKey:'secret',
+    model:'document-parse',
+    mode:'standard',
+    ocr:'auto',
+    base64Encoding:['table', 'figure', 'chart', 'equation'],
+    outputFormats:['markdown'],
+    fetch:async (_url, init) => {
+      const form = init?.body as FormData;
+      expect(form.get('mode')).toBe('standard');
+      expect(form.get('ocr')).toBe('auto');
+      expect(form.get('base64_encoding')).toBe(
+        JSON.stringify(['table', 'figure', 'chart', 'equation']),
+      );
+      expect(form.get('output_formats')).toBe(JSON.stringify(['markdown']));
+      return new Response(JSON.stringify({
+        content:{ markdown:'# 원자\n\n원자는 물질을 구성한다.' },
+        model:'document-parse',
+      }));
+    },
+  });
+
+  await expect(parser.parse(
+    new Uint8Array([1]),
+    'page-1.png',
+    { mimeType:'image/png', pageNumber:1 },
+  )).resolves.toMatchObject({
+    markdown:'# 원자\n\n원자는 물질을 구성한다.',
+    requestConfig:{
+      mode:'standard',
+      ocr:'auto',
+      output_formats:['markdown'],
+    },
+  });
+});
+
 test('normalizes Gemini batch embeddings and uses its normalized base URL override', async () => {
   const embedder = new GeminiEmbedder({ apiKey: 'secret', modelId: 'gemini-embedding-test', dimensions: 3, baseUrl: 'https://gemini.test/', fetch: async (url) => {
     expect(url).toBe('https://gemini.test/v1beta/models/gemini-embedding-test:batchEmbedContents?key=secret');
     return new Response(JSON.stringify({ embeddings: [{ values: [0.1, 0.2, 0.3] }, { values: [0.4, 0.5, 0.6] }] }));
   } });
   await expect(embedder.embed(['원자', '분자'])).resolves.toEqual([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]);
+});
+
+test('omits unsupported taskType for Gemini Embedding 2 while preserving prefixed input', async () => {
+  let sent: {
+    requests?: Array<{
+      model?:string;
+      content?:{ parts?:Array<{ text?:string }> };
+      taskType?:string;
+      outputDimensionality?:number;
+    }>;
+  } = {};
+  const embedder = new GeminiEmbedder({
+    apiKey:'secret',
+    modelId:'gemini-embedding-2',
+    dimensions:3072,
+    fetch:async (_url, init) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        embeddings:[{ values:[0.1, 0.2, 0.3] }],
+      }));
+    },
+  });
+
+  await embedder.embed(
+    ['task: search result | query: 광합성에 필요한 선수 개념'],
+    undefined,
+    'RETRIEVAL_QUERY',
+  );
+
+  expect(sent.requests).toEqual([{
+    model:'models/gemini-embedding-2',
+    content:{
+      parts:[{
+        text:'task: search result | query: 광합성에 필요한 선수 개념',
+      }],
+    },
+    outputDimensionality:3072,
+  }]);
+});
+
+test('aborts a Gemini embedding request at its pinned deadline', async () => {
+  vi.useFakeTimers();
+  const embedder = new GeminiEmbedder({
+    apiKey:'secret',
+    modelId:'gemini-embedding-test',
+    timeoutMs:25,
+    fetch:async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        'abort',
+        () => reject(init.signal?.reason),
+        { once:true },
+      );
+    }),
+  });
+
+  const embedding = embedder.embed(['원자']);
+  const assertion = expect(embedding).rejects.toMatchObject({ kind:'TIMEOUT' });
+  await vi.advanceTimersByTimeAsync(26);
+  await assertion;
 });
 
 test('aborts an Upstage document request at its configured deadline', async () => {

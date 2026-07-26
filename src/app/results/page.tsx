@@ -8,10 +8,12 @@ export const dynamic = 'force-dynamic';
 
 export default async function ResultsPage() {
   const runs = await db.query<{ id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; completed_at: string | null; exact_match: string | null }>(
-    `select br.id, br.public_id, br.title, br.state, br.total_items, br.completed_items, br.failed_items,
+    `select br.id, br.public_id, br.title, br.state, br.total_items,
+       count(distinct mr.id)::int completed_items, br.failed_items,
        br.completed_at::text, avg(s.value) filter (where s.metric_key = 'exact_match')::text as exact_match
      from benchmark_runs br left join run_items ri on ri.benchmark_run_id = br.id
-     left join model_responses mr on mr.run_item_id = ri.id left join scores s on s.model_response_id = mr.id
+     left join eligible_model_responses mr on mr.run_item_id = ri.id
+     left join scores s on s.model_response_id = mr.id and s.score_profile_id=br.score_profile_id
      where br.state in ('COMPLETED','SCORING','FAILED','CANCELLED')
      group by br.id order by br.created_at desc`,
   );

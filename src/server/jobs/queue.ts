@@ -22,6 +22,30 @@ export type JobLease = {
   attempt: number;
 };
 
+export async function assertJobLeaseWithClient(
+  client: PoolClient,
+  lease: JobLease,
+): Promise<void> {
+  const current = await client.query(
+    `select id
+       from jobs
+      where id=$1
+        and state='LEASED'
+        and lease_owner=$2
+        and attempts=$3
+        and lease_expires_at>now()
+      for update`,
+    [lease.jobId, lease.workerId, lease.attempt],
+  );
+  if (!current.rowCount) {
+    throw new DomainError(
+      'JOB_LEASE_MISMATCH',
+      '작업 lease가 만료되었거나 다른 실행 시도에 선점되었습니다.',
+      lease,
+    );
+  }
+}
+
 export type EnqueueInput = {
   kind: string;
   payload: Record<string, unknown>;
@@ -42,6 +66,121 @@ async function appendEvent(
      values ($1, 'job', $1, $2, $3::jsonb)`,
     [jobId, eventType, JSON.stringify(payload)],
   );
+}
+
+async function reconcileTerminalGenerationLease(
+  client: PoolClient,
+  job: {
+    id: string;
+    attempts: number;
+    payload: Record<string, unknown>;
+  },
+) {
+  const batchId = job.payload.batchId;
+  if (typeof batchId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(batchId)) {
+    return;
+  }
+  const batch = await client.query<{ state: string }>(
+    `select state
+       from generation_batches
+      where id=$1
+      for update`,
+    [batchId],
+  );
+  if (!batch.rows[0]) return;
+
+  const message = 'LEASE_EXPIRED: 최종 실행 시도의 작업자 lease가 만료되었습니다.';
+  if (batch.rows[0].state !== 'COMPLETED') {
+    await client.query(
+      `update generation_items
+          set state='FAILED',
+              retryable=true,
+              error_code='LEASE_EXPIRED',
+              error_message=$4,
+              completed_at=null,
+              updated_at=now()
+        where generation_batch_id=$1
+          and state='RUNNING'
+          and claimed_job_id=$2
+          and claimed_job_attempt=$3`,
+      [batchId, job.id, job.attempts, message],
+    );
+    const summary = await client.query<{
+      completed: number;
+      failed: number;
+      running: number;
+      pending: number;
+      item_errors: Array<{
+        ordinal: number;
+        code: string;
+        message: string;
+        retryable: boolean;
+      }>;
+    }>(
+      `select count(*) filter(where state='COMPLETED')::int as completed,
+              count(*) filter(where state='FAILED')::int as failed,
+              count(*) filter(where state='RUNNING')::int as running,
+              count(*) filter(where state='PENDING')::int as pending,
+              coalesce(
+                jsonb_agg(
+                  jsonb_build_object(
+                    'ordinal',ordinal,
+                    'code',coalesce(error_code,'GENERATION_ITEM_FAILED'),
+                    'message',coalesce(error_message,'문항 생성에 실패했습니다.'),
+                    'retryable',retryable
+                  )
+                  order by ordinal
+                ) filter(where state='FAILED'),
+                '[]'::jsonb
+              ) as item_errors
+         from generation_items
+        where generation_batch_id=$1`,
+      [batchId],
+    );
+    const counts = summary.rows[0]!;
+    await client.query(
+      `update generation_batches
+          set state='FAILED',
+              progress=(progress-'error'-'itemErrors')
+                || jsonb_build_object(
+                  'currentStage',7,
+                  'completedQuestions',$2::int,
+                  'failedQuestions',$3::int,
+                  'runningQuestions',$4::int,
+                  'pendingQuestions',$5::int,
+                  'itemErrors',$6::jsonb,
+                  'error',$7::text
+                ),
+              updated_at=now()
+        where id=$1 and state<>'COMPLETED'`,
+      [
+        batchId,
+        counts.completed,
+        counts.failed,
+        counts.running,
+        counts.pending,
+        JSON.stringify(counts.item_errors),
+        message,
+      ],
+    );
+    await client.query(
+      `insert into job_events(job_id,aggregate_type,aggregate_id,event_type,payload)
+       values($1,'generation',$2,'GENERATION_FAILED',$3::jsonb)`,
+      [
+        job.id,
+        batchId,
+        JSON.stringify({
+          code: 'LEASE_EXPIRED',
+          message,
+          retryable: true,
+          attempt: job.attempts,
+          completedQuestions: counts.completed,
+          failedQuestions: counts.failed,
+        }),
+      ],
+    );
+  }
 }
 
 export async function cancelJobWithClient(client: PoolClient, jobId: string): Promise<boolean> {
@@ -188,7 +327,7 @@ export async function completeJob(
   });
 }
 
-type JobFailure = { code: string; message: string; retryDelayMs: number };
+type JobFailure = { code: string; message: string; retryDelayMs: number; retryable?: boolean };
 
 export async function failJob(lease: JobLease, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
 export async function failJob(jobId: string, workerId: string, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
@@ -210,7 +349,9 @@ export async function failJob(
     );
     const job = current.rows[0];
     if (!job) throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', lease);
-    const state = job.attempts >= job.max_attempts ? 'TERMINAL_FAILED' : 'RETRY_WAIT';
+    const state = error.retryable === false || job.attempts >= job.max_attempts
+      ? 'TERMINAL_FAILED'
+      : 'RETRY_WAIT';
     await client.query(
       `update jobs set state = $3, last_error_code = $4, last_error_message = $5,
          available_at = case when $3 = 'RETRY_WAIT'
@@ -222,7 +363,11 @@ export async function failJob(
       [lease.jobId, lease.workerId, state, error.code, error.message, error.retryDelayMs, lease.attempt],
     );
     await appendEvent(client, lease.jobId, state === 'RETRY_WAIT' ? 'JOB_RETRY_SCHEDULED' : 'JOB_TERMINAL_FAILED', {
-      workerId: lease.workerId, attempt: lease.attempt, code: error.code, retryDelayMs: error.retryDelayMs,
+      workerId: lease.workerId,
+      attempt: lease.attempt,
+      code: error.code,
+      retryable: error.retryable ?? true,
+      retryDelayMs: error.retryDelayMs,
     });
     return state;
   });
@@ -230,15 +375,68 @@ export async function failJob(
 
 export async function recoverExpiredLeases(): Promise<number> {
   return withTransaction(async (client) => {
-    const expired = await client.query<{ id: string; lease_owner: string | null }>(
-      `update jobs set state = 'RETRY_WAIT', available_at = now(),
-         lease_owner = null, lease_expires_at = null, updated_at = now(),
-         last_error_code = 'LEASE_EXPIRED', last_error_message = '작업자 lease가 만료되어 재선점 대기 중입니다.'
-       where state = 'LEASED' and lease_expires_at < now()
-       returning id, lease_owner`,
+    const expired = await client.query<{
+      id: string;
+      previous_lease_owner: string | null;
+      state: 'RETRY_WAIT' | 'TERMINAL_FAILED';
+      attempts: number;
+      kind: string;
+      payload: Record<string, unknown>;
+    }>(
+      `with expired_jobs as (
+         select id,lease_owner,attempts,max_attempts,kind,payload
+           from jobs
+          where state='LEASED' and lease_expires_at<now()
+          order by id
+          for update
+       )
+       update jobs job
+          set state=case
+                when expired_jobs.attempts>=expired_jobs.max_attempts
+                  then 'TERMINAL_FAILED'
+                else 'RETRY_WAIT'
+              end,
+              available_at=case
+                when expired_jobs.attempts<expired_jobs.max_attempts then now()
+                else job.available_at
+              end,
+              lease_owner=null,
+              lease_expires_at=null,
+              completed_at=case
+                when expired_jobs.attempts>=expired_jobs.max_attempts then now()
+                else null
+              end,
+              updated_at=now(),
+              last_error_code='LEASE_EXPIRED',
+              last_error_message=case
+                when expired_jobs.attempts>=expired_jobs.max_attempts
+                  then '최종 실행 시도의 작업자 lease가 만료되어 작업을 종료했습니다.'
+                else '작업자 lease가 만료되어 재선점 대기 중입니다.'
+              end
+         from expired_jobs
+        where job.id=expired_jobs.id
+        returning job.id,
+                  expired_jobs.lease_owner as previous_lease_owner,
+                  job.state,
+                  job.attempts,
+                  expired_jobs.kind,
+                  expired_jobs.payload`,
     );
     for (const job of expired.rows) {
-      await appendEvent(client, job.id, 'JOB_LEASE_RECOVERED', { previousWorkerId: job.lease_owner });
+      await appendEvent(
+        client,
+        job.id,
+        job.state === 'TERMINAL_FAILED' ? 'JOB_TERMINAL_FAILED' : 'JOB_LEASE_RECOVERED',
+        {
+          previousWorkerId: job.previous_lease_owner,
+          attempt: job.attempts,
+          code: 'LEASE_EXPIRED',
+          retryable: job.state === 'RETRY_WAIT',
+        },
+      );
+      if (job.state === 'TERMINAL_FAILED' && job.kind === 'question.generate') {
+        await reconcileTerminalGenerationLease(client, job);
+      }
     }
     return expired.rowCount ?? 0;
   });

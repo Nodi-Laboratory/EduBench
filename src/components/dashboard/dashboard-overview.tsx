@@ -1,13 +1,13 @@
 import Link from 'next/link';
 import { AlertCircle, ArrowRight, BookOpenCheck, Play, RefreshCw } from 'lucide-react';
 
-type LatestRun = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number };
+type LatestRun = { id: string; public_id: string; title: string; state: string; total_items: number; eligible_response_count: number; execution_completed_items: number; failed_items: number };
 type ModelRow = { display_name: string; model_id: string; total: string; done: string; failed: string; latency: string | null; tokens: string | null; cost: string | null };
-type RecentRun = { id: string; public_id: string; title: string; state: string; completed_items: number; total_items: number };
+type RecentRun = { id: string; public_id: string; title: string; state: string; eligible_response_count: number; execution_completed_items: number; total_items: number };
 const neutralModels: ModelRow[] = ['EXAONE','Gemini','Upstage'].map((display_name) => ({ display_name, model_id: '환경변수에서 모델 ID 로드', total: '0', done: '0', failed: '0', latency: null, tokens: null, cost: null }));
 
 export function DashboardOverview({ approved = 0, readySources = 0, attention = 0, latest = null, models = neutralModels, recent = [] }: { approved?: number; readySources?: number; attention?: number; latest?: LatestRun | null; models?: ModelRow[]; recent?: RecentRun[] } = {}) {
-  const percent = latest?.total_items ? (latest.completed_items / latest.total_items) * 100 : 0;
+  const percent = latest?.total_items ? (latest.eligible_response_count / latest.total_items) * 100 : 0;
   return (
     <div className="dashboard-page">
       <header className="page-heading">
@@ -25,9 +25,9 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
 
       <section className="metric-grid" aria-label="운영 핵심 지표">
         <article className="metric-card metric-feature">
-          <div className="metric-label"><span>최근 실행</span><b>RUN</b></div>
-          <div className="metric-value mono">{latest?.completed_items ?? 0} <small>/ {latest?.total_items ?? 0}</small></div>
-          <div className="metric-footer"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest ? `${latest.public_id} · ${latest.state}` : '아직 생성된 실행이 없습니다'}</div>
+          <div className="metric-label"><span>평가 가능 응답</span><b>RUN</b></div>
+          <div className="metric-value mono">{latest?.eligible_response_count ?? 0} <small>/ {latest?.total_items ?? 0}</small></div>
+          <div className="metric-footer"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest ? `${latest.public_id} · ${latest.state} · 실행 성공 ${latest.execution_completed_items}` : '아직 생성된 실행이 없습니다'}</div>
         </article>
         <article className="metric-card">
           <div className="metric-label"><span>실제 승인 문항</span><b>DATASET</b></div>
@@ -58,7 +58,7 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
           <div className="run-summary">
             <div>
               <strong className="mono">{percent.toFixed(1)}%</strong>
-              <span>전체 {latest?.total_items ?? 0}호출</span>
+              <span>전체 {latest?.total_items ?? 0}호출 중 평가 응답 {latest?.eligible_response_count ?? 0}</span>
             </div>
             <div className="progress-track"><span style={{ width: `${percent}%` }} /></div>
             <span className="status-chip muted"><span className={`status-dot ${latest?.state === 'RUNNING' ? '' : 'idle'}`} /> {latest?.state ?? '실행 전'}</span>
@@ -112,7 +112,7 @@ export function DashboardOverview({ approved = 0, readySources = 0, attention = 
           <span className="mono">NO RUN RECORDS</span>
           <strong>아직 벤치마크 실행이 없습니다.</strong>
           <p>문항 데이터셋 버전을 확정한 뒤 새 실행을 생성하세요.</p>
-        </div> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>실행 ID</th><th>제목</th><th>상태</th><th className="numeric">진행</th></tr></thead><tbody>{recent.map((run) => <tr key={run.id}><td><Link className="text-link mono" href={`/runs/${run.id}`}>{run.public_id}</Link></td><td>{run.title}</td><td><span className={`state-label state-${run.state}`}>{run.state}</span></td><td className="numeric mono">{run.completed_items}/{run.total_items}</td></tr>)}</tbody></table></div>}
+        </div> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>실행 ID</th><th>제목</th><th>상태</th><th className="numeric">평가 응답 / 전체</th></tr></thead><tbody>{recent.map((run) => <tr key={run.id}><td><Link className="text-link mono" href={`/runs/${run.id}`}>{run.public_id}</Link></td><td>{run.title}</td><td><span className={`state-label state-${run.state}`}>{run.state}</span></td><td className="numeric mono">{run.eligible_response_count}/{run.total_items}</td></tr>)}</tbody></table></div>}
       </section>
     </div>
   );

@@ -1,7 +1,20 @@
-import { streamPdfPages, type RenderedPage, type StreamedPage } from '@/server/documents/page-renderer';
-import { UpstageDocumentParser, type DocumentParseOptions } from '@/server/providers/upstage-document';
+import {
+  streamPdfPages,
+  type RenderedPage,
+  type RenderPdfPagesOptions,
+  type StreamedPage,
+} from '@/server/documents/page-renderer';
+import {
+  UpstageDocumentParser,
+  type DocumentParseOptions,
+  type UpstageDocumentParserOptions,
+} from '@/server/providers/upstage-document';
 import { ProviderError, type ProviderErrorKind } from '@/server/providers/types';
-import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
+import {
+  defaultResearchConfigDefinitions,
+  documentParseResearchConfigSchema,
+  type DocumentParseResearchConfig,
+} from '@/domain/research-config';
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 
@@ -21,6 +34,7 @@ type SupportedMimeType = 'application/pdf' | 'image/png' | 'image/jpeg' | 'image
 
 type ParsedPage = {
   html: string;
+  markdown?: string;
   elements: unknown[];
   raw: unknown;
   requestId: string | null;
@@ -43,17 +57,76 @@ type DocumentLabPageInput = {
 };
 
 export type DocumentLabDependencies = {
-  renderPdfPages?: (bytes: Uint8Array) => Promise<RenderedPage[]>;
-  streamPdfPages?: (bytes: Uint8Array) => AsyncIterable<StreamedPage>;
+  profile?: DocumentLabProfileConfig;
+  renderPdfPages?: (bytes: Uint8Array, options: RenderPdfPagesOptions) => Promise<RenderedPage[]>;
+  streamPdfPages?: (bytes: Uint8Array, options: RenderPdfPagesOptions) => AsyncIterable<StreamedPage>;
   parser?: PageParser;
+  createParser?: (options: UpstageDocumentParserOptions) => PageParser;
   limits?: DocumentLabLimits;
 };
+
+export type DocumentLabProfileConfig = {
+  id: string;
+  version: string;
+  contentHash: string;
+  settings: DocumentParseResearchConfig['settings'];
+};
+
+const defaultDocumentParseSettings = documentParseResearchConfigSchema.parse(
+  defaultResearchConfigDefinitions.find((definition) => definition.kind === 'document_parse'),
+).settings;
+
+function outputFormatsFor(
+  outputFormat: DocumentParseResearchConfig['settings']['outputFormat'],
+): readonly ('html' | 'markdown')[] {
+  if (outputFormat === 'both') return ['html', 'markdown'];
+  return [outputFormat];
+}
+
+function renderOptionsFor(
+  settings: DocumentParseResearchConfig['settings'],
+): RenderPdfPagesOptions {
+  return {
+    format: settings.rasterization.format,
+    dpi: settings.rasterization.dpi,
+    ...(settings.rasterization.format === 'jpeg'
+      ? { jpegQuality: settings.rasterization.jpegQuality }
+      : {}),
+    timeoutMs: settings.requestTimeoutMs,
+  };
+}
+
+function requestConfigFor(
+  profile: DocumentLabProfileConfig | undefined,
+  settings: DocumentParseResearchConfig['settings'],
+) {
+  return {
+    profile: profile
+      ? {
+          id: profile.id,
+          version: profile.version,
+          contentHash: profile.contentHash,
+        }
+      : null,
+    provider: settings.provider,
+    model: settings.model,
+    ocr: settings.ocr,
+    mode: settings.mode,
+    base64_encoding: [...settings.base64Encoding],
+    output_formats: [...outputFormatsFor(settings.outputFormat)],
+    rasterization: structuredClone(settings.rasterization),
+    pages_per_batch: settings.pagesPerBatch,
+    page_concurrency: settings.pageConcurrency,
+    request_timeout_ms: settings.requestTimeoutMs,
+  };
+}
 
 export class DocumentLabError extends Error {
   constructor(
     public readonly code: 'INVALID_DOCUMENT_FILE' | 'FILE_TOO_LARGE' | 'UPSTAGE_NOT_CONFIGURED'
-      | 'LAB_PAGE_LIMIT_EXCEEDED' | 'LAB_RENDERED_BYTES_LIMIT_EXCEEDED' | 'LAB_RESPONSE_LIMIT_EXCEEDED',
-    public readonly status: 400 | 409 | 413,
+      | 'LAB_PAGE_LIMIT_EXCEEDED' | 'LAB_RENDERED_BYTES_LIMIT_EXCEEDED' | 'LAB_RESPONSE_LIMIT_EXCEEDED'
+      | 'DOCUMENT_PARSE_PROFILE_NOT_CONFIGURED' | 'DOCUMENT_PARSE_PROFILE_INTEGRITY_ERROR',
+    public readonly status: 400 | 409 | 413 | 500,
     message: string,
   ) {
     super(message);
@@ -83,6 +156,7 @@ type LabPage = {
   mimeType: string;
   dataUrl: string;
   html: string;
+  markdown?: string;
   elements: unknown[];
   raw: unknown;
   requestId: string | null;
@@ -125,17 +199,19 @@ function imagePage(file: File, bytes: Uint8Array, mimeType: Exclude<SupportedMim
   };
 }
 
-function mockPage(page: DocumentLabPageInput): LabPage {
+function mockPage(
+  page: DocumentLabPageInput,
+  requestConfig: ReturnType<typeof requestConfigFor>,
+): LabPage {
   const html = '<h2>Document Lab mock page</h2><p>Mock parsing is enabled.</p>';
+  const markdown = '# Document Lab mock page\n\nMock parsing is enabled.';
   const elements = [{ type: 'paragraph', content: 'Mock parsing is enabled.' }];
-  const requestConfig = {
+  const pageRequestConfig = {
+    ...requestConfig,
     model: 'mock-document-parse',
-    ocr: 'force',
-    mode: 'enhanced',
-    base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING],
-    output_formats: ['html'],
     mimeType: page.mimeType,
     pageNumber: page.pageNumber,
+    mock: true,
   };
   return {
     pageNumber: page.pageNumber,
@@ -143,11 +219,20 @@ function mockPage(page: DocumentLabPageInput): LabPage {
     mimeType: page.mimeType,
     dataUrl: page.dataUrl,
     html,
+    ...(requestConfig.output_formats.includes('markdown') ? { markdown } : {}),
     elements,
-    raw: { mock: true, pageNumber: page.pageNumber, content: { html }, elements },
+    raw: {
+      mock: true,
+      pageNumber: page.pageNumber,
+      content: {
+        html,
+        ...(requestConfig.output_formats.includes('markdown') ? { markdown } : {}),
+      },
+      elements,
+    },
     requestId: `mock-document-lab-page-${page.pageNumber}`,
     model: 'mock-document-parse',
-    requestConfig,
+    requestConfig: pageRequestConfig,
     ...(page.width == null ? {} : { width: page.width }),
     ...(page.height == null ? {} : { height: page.height }),
   };
@@ -160,6 +245,7 @@ function toLabPage(page: DocumentLabPageInput, parsed: ParsedPage): LabPage {
     mimeType: page.mimeType,
     dataUrl: page.dataUrl,
     html: parsed.html,
+    ...(parsed.markdown == null ? {} : { markdown: parsed.markdown }),
     elements: parsed.elements,
     raw: parsed.raw,
     requestId: parsed.requestId,
@@ -172,6 +258,29 @@ function toLabPage(page: DocumentLabPageInput, parsed: ParsedPage): LabPage {
 
 async function* legacyPages(pages: Promise<RenderedPage[]>): AsyncGenerator<RenderedPage> {
   for (const page of await pages) yield page;
+}
+
+async function mapConcurrentInOrder<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  transform: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await transform(items[index]!);
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, items.length) },
+      () => worker(),
+    ),
+  );
+  return results;
 }
 
 function labResult<T extends { pages: LabPage[] }>(result: T, maxResponseBytes: number): T {
@@ -193,20 +302,20 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
   }
 
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
-  const requestConfig = mock
-    ? { model: 'mock-document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING], output_formats: ['html'] }
-    : { model: process.env.UPSTAGE_DOCUMENT_PARSE_MODEL ?? 'document-parse', ocr: 'force', mode: 'enhanced', base64_encoding: [...DOCUMENT_PARSE_BASE64_ENCODING], output_formats: ['html'] };
+  const settings = dependencies.profile?.settings ?? defaultDocumentParseSettings;
+  const requestConfig = requestConfigFor(dependencies.profile, settings);
   const apiKey = process.env.UPSTAGE_API_KEY;
   if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
 
   const limits = dependencies.limits ?? DOCUMENT_LAB_LIMITS;
+  const renderOptions = renderOptionsFor(settings);
   const pages: DocumentLabPageInput[] = [];
   const pageStream: AsyncIterable<RenderedPage | StreamedPage | DocumentLabPageInput> = mimeType === 'application/pdf'
     ? dependencies.streamPdfPages
-      ? dependencies.streamPdfPages(bytes)
+      ? dependencies.streamPdfPages(bytes, renderOptions)
       : dependencies.renderPdfPages
-        ? legacyPages(dependencies.renderPdfPages(bytes))
-        : streamPdfPages(bytes, { timeoutMs: Number(process.env.PROVIDER_TIMEOUT_MS || 120_000) })
+        ? legacyPages(dependencies.renderPdfPages(bytes, renderOptions))
+        : streamPdfPages(bytes, renderOptions)
     : legacyPages(Promise.resolve([imagePage(file, bytes, mimeType)] as RenderedPage[]));
   let renderedBytes = 0;
   for await (const page of pageStream) {
@@ -222,15 +331,32 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
       dataUrl: 'dataUrl' in page ? page.dataUrl : `data:${page.mimeType};base64,${Buffer.from(page.bytes).toString('base64')}`,
     });
   }
-  if (mock) return labResult({ pages: pages.map(mockPage), requestConfig, mock: true }, limits.maxResponseBytes);
+  if (mock) {
+    return labResult({
+      pages: pages.map((page) => mockPage(page, requestConfig)),
+      requestConfig,
+      mock: true,
+    }, limits.maxResponseBytes);
+  }
 
-  const parser = dependencies.parser ?? new UpstageDocumentParser({
+  const parserOptions: UpstageDocumentParserOptions = {
     apiKey: apiKey!,
-    model: requestConfig.model,
+    model: settings.model,
     baseUrl: process.env.UPSTAGE_BASE_URL,
-  });
-  const parsedPages: LabPage[] = [];
-  for (const page of pages) {
+    mode: settings.mode,
+    ocr: settings.ocr,
+    base64Encoding: settings.base64Encoding,
+    outputFormats: outputFormatsFor(settings.outputFormat),
+    timeoutMs: settings.requestTimeoutMs,
+  };
+  const parser = dependencies.parser
+    ?? (dependencies.createParser ?? ((options) => new UpstageDocumentParser(options)))(
+      parserOptions,
+    );
+  const parsedPages = await mapConcurrentInOrder(
+    pages,
+    settings.pageConcurrency,
+    async (page): Promise<LabPage> => {
     let parsed: ParsedPage;
     try {
       parsed = await parser.parse(page.bytes, page.filename, { mimeType: page.mimeType, pageNumber: page.pageNumber });
@@ -244,7 +370,8 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
         { cause: error },
       );
     }
-    parsedPages.push(toLabPage(page, parsed));
-  }
+      return toLabPage(page, parsed);
+    },
+  );
   return labResult({ pages: parsedPages, requestConfig, mock: false }, limits.maxResponseBytes);
 }

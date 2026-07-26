@@ -33,6 +33,17 @@ export class OpenAICompatibleProvider implements ModelProvider {
         messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.prompt }],
         max_tokens: request.maxOutputTokens, temperature: request.temperature,
         stop: request.stopSequences,
+        top_p: request.topP,
+        presence_penalty: request.presencePenalty,
+        frequency_penalty: request.frequencyPenalty,
+        seed: request.seed,
+        ...(this.key === 'exaone' && request.enableThinking != null
+          ? {
+            chat_template_kwargs: {
+              enable_thinking:request.enableThinking,
+            },
+          }
+          : {}),
       }),
     }));
     await assertProviderResponse(response, this.apiKey);

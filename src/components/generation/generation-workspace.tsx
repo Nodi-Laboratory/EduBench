@@ -1,9 +1,12 @@
 'use client';
 
-import { useEffect, useState, type FormEvent } from 'react';
-import { BookOpen, Check, ChevronDown, RefreshCw, Search, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { BookOpen, Check, ChevronDown, RefreshCw, RotateCcw, Search, Sparkles } from 'lucide-react';
+import { JsonBlock } from '@/components/ui/json-block';
 import { GENERATION_STAGES } from '@/domain/generation';
 import { buildQuestionGenerationInstructions } from '@/domain/question-prompt';
+import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
+import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
 
 type TocEntry = { id: string; source_file_id: string; title: string; level: number; printed_page: number | null };
 type GenerationSource = { id: string; original_name: string; subject: string | null; grade: string | null; tocEntries: TocEntry[] };
@@ -13,11 +16,36 @@ type GenerationBatch = {
 };
 type ActivityEvent = { id: string; event_type: string; payload: Record<string, unknown>; created_at: string };
 type GeneratedQuestion = { public_id: string; status: string; question_text: string; answer_text: string; design_summary: string | null; evidence_summary: string | null };
+type GenerationItem = {
+  id: string;
+  ordinal: number;
+  state: string;
+  attempts: number;
+  retryable: boolean;
+  direction: Record<string, unknown> | null;
+  error: { code: string | null; message: string | null; retryable: boolean } | null;
+  latestRetrieval: {
+    id: string;
+    attempt: number;
+    queryText: string;
+    candidateScope: Record<string, unknown>;
+    selectedChunks: unknown[];
+    createdAt: string;
+  } | null;
+  questionId: string | null;
+  questionPublicId: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string;
+};
 type Activity = {
   batch: GenerationBatch;
   job: { state: string; attempts: number; max_attempts: number; last_error_code: string | null; last_error_message: string | null } | null;
   events: ActivityEvent[];
   questions: GeneratedQuestion[];
+  items: GenerationItem[];
+  canResume: boolean;
+  eventCursor: string;
 };
 
 const eventLabels: Record<string, string> = {
@@ -27,7 +55,14 @@ const eventLabels: Record<string, string> = {
   QUESTION_RETRIEVAL_STARTED: '단일 문항 전용 벡터 검색 시작', QUESTION_RETRIEVAL_COMPLETED: '단일 문항 전용 벡터 검색 완료',
   QUESTION_GENERATION_STARTED: '단일 문항 생성 시작', QUESTION_GENERATION_COMPLETED: '단일 문항 생성 완료',
   QUESTION_GENERATION_FAILED: '단일 문항 생성 실패', GENERATION_COMPLETED: '전체 문항 생성 완료', GENERATION_FAILED: '생성 배치 실패',
+  GENERATION_RESUMED: '미완료 문항 생성 재개',
 };
+const connectionLabels = {
+  idle: '연결 대기',
+  connecting: '연결 중',
+  live: '실시간 연결',
+  reconnecting: '재연결 중',
+} as const;
 
 function failureMessage(activity: Activity | null) {
   return activity?.batch.progress?.error || activity?.job?.last_error_message || null;
@@ -47,32 +82,75 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     requestedCount: 10, crossUnit: false,
   });
 
-  useEffect(() => {
-    let active = true;
-    async function refresh() {
-      try {
-        const response = await fetch('/api/generation', { cache: 'no-store' });
-        if (response.ok && active) setLiveBatches((await response.json()).items);
-      } catch { /* 다음 폴링에서 다시 시도 */ }
-    }
-    void refresh();
-    const timer = window.setInterval(refresh, 1_500);
-    return () => { active = false; window.clearInterval(timer); };
+  const fetchActivity = useCallback(async (
+    batchId: string,
+    includeHistory: boolean,
+    signal?: AbortSignal,
+  ): Promise<Activity | Omit<Activity, 'events'> | null> => {
+    const suffix = includeHistory ? '' : '?history=0';
+    const response = await fetch(`/api/generation/${batchId}/activity${suffix}`, {
+      cache: 'no-store',
+      signal,
+    });
+    if (!response.ok) return null;
+    const snapshot = await response.json() as Partial<Activity>;
+    return snapshot.batch?.id === batchId
+      ? snapshot as Activity | Omit<Activity, 'events'>
+      : null;
   }, []);
 
   useEffect(() => {
-    if (!selectedBatchId) { setActivity(null); return; }
-    let active = true;
-    async function refresh() {
-      try {
-        const response = await fetch(`/api/generation/${selectedBatchId}/activity`, { cache: 'no-store' });
-        if (response.ok && active) setActivity(await response.json());
-      } catch { /* 다음 폴링에서 다시 시도 */ }
+    if (!selectedBatchId) return;
+    const abort = new AbortController();
+    void fetchActivity(selectedBatchId, true, abort.signal).then((snapshot) => {
+      if (!abort.signal.aborted && snapshot && 'events' in snapshot) {
+        setActivity(snapshot as Activity);
+      }
+    }).catch(() => undefined);
+    return () => abort.abort();
+  }, [fetchActivity, selectedBatchId]);
+
+  const refreshSelectedSnapshot = useCallback(async () => {
+    if (!selectedBatchId) return;
+    const [snapshot, batchesResponse] = await Promise.all([
+      fetchActivity(selectedBatchId, false),
+      fetch('/api/generation', { cache: 'no-store' }),
+    ]);
+    if (snapshot) {
+      setActivity((current) => current?.batch.id === selectedBatchId
+        ? { ...snapshot, eventCursor: current.eventCursor, events: current.events } as Activity
+        : current);
     }
-    void refresh();
-    const timer = window.setInterval(refresh, 1_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [selectedBatchId]);
+    if (batchesResponse.ok) setLiveBatches((await batchesResponse.json()).items);
+  }, [fetchActivity, selectedBatchId]);
+  const coalescedRefresh = useCoalescedRefresh(refreshSelectedSnapshot);
+  const stream = useCursorEventStream({
+    aggregate: 'generation',
+    id: selectedBatchId,
+    initialCursor: activity?.eventCursor,
+    enabled: Boolean(
+      selectedBatchId
+      && activity
+      && activity.batch?.id === selectedBatchId
+      && activity.eventCursor != null,
+    ),
+    onEvent(event) {
+      setActivity((current) => {
+        if (!current || current.batch.id !== event.aggregateId) return current;
+        if (current.events.some((entry) => entry.id === event.id)) return current;
+        return {
+          ...current,
+          events: [...current.events, {
+            id: event.id,
+            event_type: event.eventType,
+            payload: event.payload,
+            created_at: event.createdAt,
+          }].slice(-200),
+        };
+      });
+      coalescedRefresh();
+    },
+  });
 
   function toggleSource(source: GenerationSource, checked: boolean) {
     setSelectedSourceIds((current) => checked ? [...new Set([...current, source.id])] : current.filter((id) => id !== source.id));
@@ -116,9 +194,21 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     const body = await response.json();
     if (response.ok) {
       setNotice(`생성 배치 ${body.id.slice(0, 8)}를 예약했습니다.`);
+      setActivity(null);
       setSelectedBatchId(body.id);
       setLiveBatches((current) => [{ id: body.id, state: body.state, requested_count: Number(form.get('requestedCount')), created_at: new Date().toISOString(), progress: body.progress }, ...current]);
     } else setNotice(body.message ?? '생성 배치를 만들지 못했습니다.');
+  }
+  async function resumeGeneration() {
+    if (!selectedBatchId) return;
+    const response = await fetch(`/api/generation/${selectedBatchId}/resume`, { method: 'POST' });
+    const body = await response.json();
+    if (!response.ok) {
+      setNotice(body.message ?? '생성 작업을 재개하지 못했습니다.');
+      return;
+    }
+    setNotice(`미완료 문항 생성을 재개했습니다. 재개 순번 ${body.resumeSequence}`);
+    await refreshSelectedSnapshot();
   }
 
   const error = failureMessage(activity);
@@ -168,16 +258,27 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
         <section className="panel batch-panel"><div className="panel-heading compact"><div><span className="section-index mono">03</span><h2>최근 생성 배치</h2></div><RefreshCw size={13} className="live-refresh-icon" /></div>{liveBatches.length === 0 ? <div className="small-empty">생성 배치가 없습니다.</div> : liveBatches.map((batch) => {
           const completed = batch.progress?.completedQuestions ?? 0;
           const percent = Math.min(100, Math.round((completed / batch.requested_count) * 100));
-          return <button type="button" className={`batch-row ${selectedBatchId === batch.id ? 'selected' : ''}`} key={batch.id} onClick={() => setSelectedBatchId(batch.id)}><span className="mono">{batch.id.slice(0, 8)}</span><strong>{completed}/{batch.requested_count}문항</strong><span className={`state-label state-${batch.state.toLowerCase()}`}>{batch.state}</span><span className="batch-progress"><i style={{ width: `${percent}%` }} /></span></button>;
+          return <button type="button" className={`batch-row ${selectedBatchId === batch.id ? 'selected' : ''}`} key={batch.id} onClick={() => { setActivity(null); setSelectedBatchId(batch.id); }}><span className="mono">{batch.id.slice(0, 8)}</span><strong>{completed}/{batch.requested_count}문항</strong><span className={`state-label state-${batch.state.toLowerCase()}`}>{batch.state}</span><span className="batch-progress"><i style={{ width: `${percent}%` }} /></span></button>;
         })}</section>
-        <section className="panel generation-activity"><div className="panel-heading compact"><div><span className="section-index mono">04</span><h2>실시간 생성 기록</h2></div>{activity && <span className="state-label">{activity.job?.attempts ?? 0}/{activity.job?.max_attempts ?? 0}회</span>}</div>
+        <section className="panel generation-activity"><div className="panel-heading compact"><div><span className="section-index mono">04</span><h2>실시간 생성 기록</h2></div>{activity && <><span className="state-label">{activity.job?.attempts ?? 0}/{activity.job?.max_attempts ?? 0}회</span><span className="state-label">{connectionLabels[stream.status]}</span></>}</div>
           {!selectedBatchId ? <div className="small-empty">확인할 배치를 선택하세요.</div> : !activity ? <div className="small-empty">기록을 불러오는 중입니다.</div> : <div className="activity-body">
             <div className="activity-summary"><span><b>{activity.batch.progress?.completedQuestions ?? 0}</b> 완료</span><span><b>{activity.batch.progress?.failedQuestions ?? 0}</b> 실패</span><span><b>{activity.batch.conditions?.executionMode === 'parallel' ? '병렬' : '순차'}</b> 방식</span></div>
             {error && <div className="generation-failure" role="alert"><strong>실패 원인</strong><p>{error}</p>{activity.job?.last_error_code && <code>{activity.job.last_error_code}</code>}</div>}
+            {activity.canResume && <button type="button" className="button secondary" onClick={resumeGeneration}><RotateCcw size={14} /> 미완료 문항 생성 재개</button>}
+            {activity.items.length > 0 && <div className="generation-item-list"><h3>문항별 실행 기록</h3>{activity.items.map((item) => <details key={item.id} open={item.state === 'FAILED'}>
+              <summary><strong>{item.ordinal}번 문항</strong><span className={`state-label state-${item.state.toLowerCase()}`}>{item.state}</span><small className="mono">시도 {item.attempts}회</small></summary>
+              <div className="event-payload">
+                {item.questionPublicId && <p><strong>저장 문항</strong> <span className="mono">{item.questionPublicId}</span></p>}
+                {item.error && <p className="event-error"><strong>{item.error.code ?? 'GENERATION_ITEM_FAILED'} · {item.error.retryable ? '재시도 가능' : '입력·범위 수정 필요'}</strong><br />{item.error.message ?? '문항 생성에 실패했습니다.'}</p>}
+                <details><summary>방향성</summary><JsonBlock value={item.direction} /></details>
+                <details><summary>최근 검색 시도</summary><JsonBlock value={item.latestRetrieval} /></details>
+                <small>최근 변경 {new Date(item.updatedAt).toLocaleString('ko-KR')}</small>
+              </div>
+            </details>)}</div>}
             <div className="generation-event-list">{activity.events.length === 0 ? <p className="empty-events">아직 기록이 없습니다.</p> : [...activity.events].reverse().map((event) => <details key={event.id} open={event.event_type.includes('FAILED')}><summary><span className={`event-dot ${event.event_type.includes('FAILED') ? 'failed' : ''}`} /><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></summary><div className="event-payload">
               {event.event_type === 'QUESTION_GENERATION_COMPLETED' && <><h4>{String(event.payload.ordinal)}번 문항</h4><p>{String(event.payload.questionText ?? '')}</p><strong>답안</strong><p>{String(event.payload.answerText ?? '')}</p></>}
               {event.event_type.includes('FAILED') && <p className="event-error">{String(event.payload.message ?? event.payload.code ?? '실패 원인이 기록되지 않았습니다.')}</p>}
-              <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+              <JsonBlock value={event.payload} />
             </div></details>)}</div>
             {activity.questions.length > 0 && <div className="persisted-questions"><h3>저장된 문항 {activity.questions.length}개</h3>{activity.questions.map((question) => <details key={question.public_id}><summary><strong>{question.public_id}</strong><span>{question.status}</span></summary><div><p>{question.question_text}</p><strong>모범 답안</strong><p>{question.answer_text}</p></div></details>)}</div>}
           </div>}

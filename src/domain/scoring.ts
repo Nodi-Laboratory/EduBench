@@ -27,9 +27,7 @@ export function judgeMetricBatches(metrics: string[]): string[][] {
 }
 
 export function selectJudgeScore<T extends { metricKey: string }>(metric: string, scores: T[]): (T & { metricKey: string }) | null {
-  const exact = scores.find((score) => score.metricKey === metric);
-  if (exact) return exact;
-  return scores.length === 1 ? { ...scores[0]!, metricKey: metric } : null;
+  return scores.find((score) => score.metricKey === metric) ?? null;
 }
 
 export function normalizeJudgeScoreValue(value: unknown): unknown {

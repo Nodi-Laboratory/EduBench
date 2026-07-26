@@ -8,11 +8,13 @@ export type ScoreProfileAuditData = {
   version: string;
   title: string;
   metrics: string[];
+  weights?: Record<string, number>;
   rubric_prompt: string | null;
   judge_provider: string | null;
   judge_model: string | null;
   content_hash: string;
   created_at: string;
+  provenance_unresolved?: boolean;
   run_count?: number;
   recent_runs?: ScoreProfileRun[];
 };
@@ -22,14 +24,20 @@ const methodLabel = { deterministic: '결정론적 검사', judge: 'Judge 모델
 export function ScoreProfileAudit({ profile }: { profile: ScoreProfileAuditData }) {
   const definitions = describeScoreMetrics(['exact_match', 'response_present', ...profile.metrics, ...prerequisiteScoreMetrics]);
   const recentRuns = Array.isArray(profile.recent_runs) ? profile.recent_runs : [];
+  const effectiveWeight = (metric: string) =>
+    Object.prototype.hasOwnProperty.call(profile.weights ?? {}, metric)
+      ? profile.weights![metric]
+      : metric === 'response_present' ? 0 : 1;
   return <details className="score-profile-audit">
     <summary>
       <strong className="mono">{profile.version}</strong>
       <span>{profile.title}</span>
       <small>{profile.judge_provider ? `${profile.judge_provider} · ${profile.judge_model ?? '모델 미지정'}` : '결정론적 채점'}</small>
+      {profile.provenance_unresolved && <em>폐기됨 · Judge 출처 미확정</em>}
       <b>{profile.run_count ?? 0}회 사용</b>
     </summary>
     <div className="score-profile-audit-body">
+      {profile.provenance_unresolved && <p className="result-warning">이 프로필은 레거시 기본값 또는 불완전한 Judge 쌍 때문에 재현 가능한 출처가 없습니다. 정확한 제공자와 모델을 지정한 새 채점 프로필 버전을 만들어야 하며 새 실행에는 선택할 수 없습니다.</p>}
       <div className="profile-manifest">
         <div><small>프로필 버전</small><strong className="mono">{profile.version}</strong></div>
         <div><small>Judge 제공자</small><strong>{profile.judge_provider ?? '사용하지 않음'}</strong></div>
@@ -61,6 +69,7 @@ export function ScoreProfileAudit({ profile }: { profile: ScoreProfileAuditData 
           <p><strong>정의</strong>{metric.definition}</p>
           <p><strong>평가 대상</strong>{metric.evaluates}</p>
           <p><strong>점수 해석</strong>{metric.interpretation}</p>
+          <p><strong>종합 가중치</strong>{effectiveWeight(metric.key)}{effectiveWeight(metric.key) === 0 ? ' · 종합점수 제외' : ''}</p>
           <div className="metric-rubric"><strong>상세 루브릭</strong><span>{metric.rubric}</span></div>
         </article>)}</div>
       </section>

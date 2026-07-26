@@ -17,6 +17,9 @@ describe('run state machine', () => {
 
   test('moves a running benchmark through scoring before completion', () => {
     expect(transitionRun('RUNNING', 'BEGIN_SCORING')).toBe('SCORING');
+    expect(transitionRun('SCORING', 'PAUSE')).toBe('PAUSING');
+    expect(transitionRun('SCORING', 'STOP')).toBe('STOPPING');
+    expect(transitionRun('SCORING', 'CANCEL')).toBe('CANCELLING');
     expect(transitionRun('SCORING', 'COMPLETE')).toBe('COMPLETED');
   });
 });

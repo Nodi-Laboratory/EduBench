@@ -1,8 +1,28 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { DomainError } from '@/domain/errors';
+import {
+  hasJudgeMetrics,
+  isJudgeProvenanceResolved,
+  isRunScoreProfileUsable,
+  scoreProfileReplacementRequiredMessage,
+  type ScoreProfileSnapshot,
+} from '@/domain/score-profile';
+import { requiredMetricsForQuestion } from '@/domain/scoring';
+import {
+  isCurrentScoringEngineSnapshot,
+  scoringEngineReplacementRequiredMessage,
+} from '@/domain/scoring-engine';
+import {
+  benchmarkGenerationParameters,
+  hashResearchConfigDefinition,
+  parseResearchConfigDefinition,
+  type BenchmarkResearchModel,
+} from '@/domain/research-config';
 import { transitionRun, type RunCommand, type RunState } from '@/domain/status';
 import { withTransaction } from '@/server/db/transaction';
+import { createProviderForModel, isSupportedProviderKey } from '@/server/providers/registry';
+import { generationParametersSchema } from '@/server/providers/types';
 
 export type RunModelInput = {
   providerKey: string;
@@ -67,10 +87,154 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
     if (dataset.rows[0]?.status !== 'PUBLISHED') {
       throw new DomainError('DATASET_NOT_PUBLISHED', '게시된 데이터셋 버전만 실행할 수 있습니다.');
     }
+    const activeModelProfile = await client.query<{
+      id:string;
+      definition:unknown;
+      content_hash:string;
+    }>(
+      `select profile.id,profile.definition,profile.content_hash
+       from research_config_active_profiles active
+       join research_config_profiles profile
+         on profile.id=active.profile_id and profile.kind=active.kind
+       where active.kind='benchmark_models'
+       for share of active,profile`,
+    );
+    const modelProfile = activeModelProfile.rows[0];
+    if (!modelProfile) {
+      throw new DomainError(
+        'RESEARCH_CONFIG_ACTIVE_PROFILE_MISSING',
+        '활성 벤치마크 모델 연구 설정이 필요합니다.',
+      );
+    }
+    const modelProfileDefinition = parseResearchConfigDefinition(
+      modelProfile.definition,
+    );
+    if (
+      modelProfileDefinition.kind !== 'benchmark_models'
+      || hashResearchConfigDefinition(modelProfileDefinition)
+           !== modelProfile.content_hash
+    ) {
+      throw new DomainError(
+        'RESEARCH_CONFIG_PROFILE_INTEGRITY_ERROR',
+        '활성 벤치마크 모델 설정 정의와 해시가 일치하지 않습니다.',
+      );
+    }
+    const profileModelByProvider = new Map(
+      modelProfileDefinition.settings.models.map((model) => [
+        model.providerKey,
+        model,
+      ]),
+    );
+    const mockProviders =
+      process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
+    const resolveExecutionModels = () => input.models.map((requested): RunModelInput => {
+      const configured = profileModelByProvider.get(
+        requested.providerKey as BenchmarkResearchModel['providerKey'],
+      ) as BenchmarkResearchModel | undefined;
+      if (mockProviders) return requested;
+      if (!configured || !configured.enabled) {
+        throw new DomainError(
+          'RUN_MODEL_NOT_IN_ACTIVE_PROFILE',
+          `${requested.providerKey} 모델은 활성 벤치마크 모델 설정에 없습니다.`,
+        );
+      }
+      const requestedParameters = generationParametersSchema.safeParse(
+        requested.parameters ?? {},
+      );
+      const configuredParameters = generationParametersSchema.parse(
+        benchmarkGenerationParameters(configured),
+      );
+      if (
+        !requestedParameters.success
+        ||
+        requested.modelId !== configured.modelId
+        || requested.protocol !== configured.protocol
+        || requested.concurrency !== configured.concurrency
+        || requested.requestIntervalMs !== configured.requestIntervalMs
+        || JSON.stringify(requestedParameters.data)
+             !== JSON.stringify(configuredParameters)
+      ) {
+        throw new DomainError(
+          'RUN_MODEL_PROFILE_MISMATCH',
+          `${requested.providerKey} 실행값이 활성 벤치마크 모델 프로필과 일치하지 않습니다.`,
+        );
+      }
+      if (
+        !createProviderForModel(
+          configured.providerKey,
+          configured.modelId,
+        )
+      ) {
+        throw new DomainError(
+          'RUN_MODEL_NOT_CONFIGURED',
+          `${configured.providerKey} / ${configured.modelId} API 환경변수가 필요합니다.`,
+        );
+      }
+      return {
+        providerKey:configured.providerKey,
+        displayName:configured.displayName,
+        modelId:configured.modelId,
+        protocol:configured.protocol,
+        parameters:benchmarkGenerationParameters(configured),
+        concurrency:configured.concurrency,
+        requestIntervalMs:configured.requestIntervalMs,
+      };
+    });
 
-    const questions = await client.query<{ question_id: string; question_revision: number }>(
-      `select dq.question_id, dq.question_revision
+    const profileResult = await client.query<{
+      id:string;
+      version:string;
+      title:string;
+      metrics:unknown;
+      weights:unknown;
+      rubric_prompt:string | null;
+      judge_provider:string | null;
+      judge_model:string | null;
+      content_hash:string;
+    }>(
+      `select id,version,title,metrics,weights,rubric_prompt,judge_provider,judge_model,content_hash
+       from score_profiles where id=$1 for share`,
+      [input.scoreProfileId],
+    );
+    const profile = profileResult.rows[0];
+    if (!profile) throw new DomainError('SCORE_PROFILE_NOT_FOUND', '채점 프로필을 찾을 수 없습니다.');
+    const profileMetrics = Array.isArray(profile.metrics) ? profile.metrics.map(String) : [];
+    const profileWeights = profile.weights && typeof profile.weights === 'object' && !Array.isArray(profile.weights)
+      ? profile.weights as Record<string, number>
+      : {};
+    const scoreProfileSnapshot: ScoreProfileSnapshot = {
+      id:profile.id,
+      version:profile.version,
+      title:profile.title,
+      metrics:profileMetrics,
+      weights:profileWeights,
+      rubricPrompt:profile.rubric_prompt,
+      judgeProvider:profile.judge_provider,
+      judgeModel:profile.judge_model,
+      contentHash:profile.content_hash,
+    };
+    if (!isJudgeProvenanceResolved(profile.judge_provider, profile.judge_model)) {
+      throw new DomainError(
+        'SCORE_PROFILE_REPLACEMENT_REQUIRED',
+        scoreProfileReplacementRequiredMessage,
+      );
+    }
+    if (profile.judge_provider && !isSupportedProviderKey(profile.judge_provider)) {
+      throw new DomainError(
+        'SCORING_JUDGE_PROVIDER_UNSUPPORTED',
+        `${profile.judge_provider} Judge 제공자는 지원되지 않습니다. 새 채점 프로필 버전을 만드십시오.`,
+      );
+    }
+
+    const questions = await client.query<{
+      question_id:string;
+      question_revision:number;
+      quality_scores:unknown;
+    }>(
+      `select dq.question_id, dq.question_revision, qr.quality_scores
        from dataset_questions dq
+       join question_revisions qr
+         on qr.question_id=dq.question_id and qr.revision=dq.question_revision
        where dq.dataset_version_id = $1
          and ($2::uuid[] is null or dq.question_id = any($2::uuid[]))
        order by dq.ordinal
@@ -78,24 +242,44 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
       [input.datasetVersionId, input.questionIds?.length ? input.questionIds : null, input.questionLimit ?? 1000000],
     );
     if (!questions.rowCount) throw new DomainError('RUN_QUESTIONS_REQUIRED', '실행할 문항이 없습니다.');
+    const needsJudge = questions.rows.some((question) =>
+      hasJudgeMetrics(requiredMetricsForQuestion(profileMetrics, question.quality_scores)),
+    );
+    if (needsJudge && (!profile.judge_provider || !profile.judge_model)) {
+      throw new DomainError(
+        'SCORING_JUDGE_NOT_CONFIGURED',
+        'Judge 지표가 있는 실행에는 Judge 제공자와 정확한 모델이 모두 지정된 채점 프로필이 필요합니다.',
+      );
+    }
+    if (
+      profile.judge_provider
+      && profile.judge_model
+      && !createProviderForModel(profile.judge_provider, profile.judge_model)
+    ) {
+      throw new DomainError(
+        'SCORING_JUDGE_NOT_CONFIGURED',
+        `${profile.judge_provider} / ${profile.judge_model} Judge를 구성할 환경변수가 필요합니다. 새 실행을 만들기 전에 API 키와 Base URL을 설정하십시오.`,
+      );
+    }
+    const executionModels = resolveExecutionModels();
 
     const runId = randomUUID();
     const publicId = `RUN-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${runId.slice(0, 6).toUpperCase()}`;
-    const totalItems = questions.rows.length * input.models.length;
+    const totalItems = questions.rows.length * executionModels.length;
     await client.query(
       `insert into benchmark_runs(
          id, public_id, title, dataset_version_id, score_profile_id,
-         price_profile_version, system_prompt, parameters, total_items
-       ) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+         score_profile_snapshot, price_profile_version, system_prompt, parameters, total_items
+       ) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10)`,
       [runId, publicId, input.title, input.datasetVersionId, input.scoreProfileId,
-        input.priceProfileVersion, input.systemPrompt, JSON.stringify({
+        JSON.stringify(scoreProfileSnapshot), input.priceProfileVersion, input.systemPrompt, JSON.stringify({
           ...(input.parameters ?? {}),
           sample_data: Boolean(dataset.rows[0]?.distribution?.sample_data),
           mock_providers: process.env.MOCK_PROVIDERS?.toLowerCase() === 'true',
         }), totalItems],
     );
 
-    for (const [modelIndex, model] of input.models.entries()) {
+    for (const [modelIndex, model] of executionModels.entries()) {
       const modelId = randomUUID();
       await client.query(
         `insert into run_models(
@@ -117,7 +301,12 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
         );
       }
     }
-    await appendRunEvent(client, runId, 'RUN_CREATED', { totalItems, models: input.models.length });
+    await appendRunEvent(client, runId, 'RUN_CREATED', {
+      totalItems,
+      models:executionModels.length,
+      benchmarkModelsProfileId:modelProfile.id,
+      benchmarkModelsProfileHash:modelProfile.content_hash,
+    });
     return { id: runId, publicId, state: 'DRAFT', totalItems };
   });
 }
@@ -131,12 +320,41 @@ const eventForCommand: Record<RunCommand, string> = {
 
 export async function commandRun(runId: string, command: RunCommand): Promise<{ state: RunState }> {
   return withTransaction(async (client) => {
-    const locked = await client.query<{ state: RunState }>(
-      'select state from benchmark_runs where id = $1 for update', [runId],
+    const locked = await client.query<{
+      state: RunState;
+      parameters: Record<string, unknown>;
+      scoring_engine_version_id: string | null;
+      scoring_engine_snapshot: unknown;
+      scoring_engine_snapshot_provenance: string;
+    }>(
+      `select state,parameters,scoring_engine_version_id,scoring_engine_snapshot,
+         scoring_engine_snapshot_provenance
+       from benchmark_runs where id=$1 for update`,
+      [runId],
     );
-    const current = locked.rows[0]?.state;
+    const storedRun = locked.rows[0];
+    const current = storedRun?.state;
     if (!current) throw new DomainError('RUN_NOT_FOUND', '실행을 찾을 수 없습니다.');
-    const state = transitionRun(current, command);
+    if (
+      ['QUEUE', 'START', 'RESUME', 'BEGIN_SCORING'].includes(command)
+      && !isCurrentScoringEngineSnapshot({
+        scoringEngineVersionId: storedRun.scoring_engine_version_id,
+        scoringEngineSnapshot: storedRun.scoring_engine_snapshot,
+        provenance: storedRun.scoring_engine_snapshot_provenance,
+      })
+    ) {
+      throw new DomainError(
+        'SCORING_ENGINE_REPLACEMENT_REQUIRED',
+        scoringEngineReplacementRequiredMessage,
+      );
+    }
+    const transitionedState = transitionRun(current, command);
+    const resumesScoring = command === 'RESUME'
+      && ['PAUSED', 'STOPPED'].includes(current)
+      && storedRun.parameters?.scoringControlOrigin === true;
+    const state: RunState = resumesScoring ? 'SCORING' : transitionedState;
+    const marksScoringControl = current === 'SCORING'
+      && ['PAUSE', 'STOP'].includes(command);
     await client.query(
       `update benchmark_runs set state = $2,
          pause_requested_at = case when $3 = 'PAUSE' then now() when $3 = 'RESUME' then null else pause_requested_at end,
@@ -144,11 +362,20 @@ export async function commandRun(runId: string, command: RunCommand): Promise<{ 
          cancel_requested_at = case when $3 = 'CANCEL' then now() else cancel_requested_at end,
          started_at = case when $3 = 'START' then coalesce(started_at, now()) else started_at end,
          completed_at = case when $3 in ('COMPLETE','FINISH_CANCEL') then now() else completed_at end,
+         parameters = case
+           when $4::boolean then jsonb_set(parameters,'{scoringControlOrigin}','true'::jsonb,true)
+           when $3 = 'RESUME' then jsonb_set(parameters,'{scoringControlOrigin}','false'::jsonb,true)
+           else parameters
+         end,
          updated_at = now()
        where id = $1`,
-      [runId, state, command],
+      [runId, state, command, marksScoringControl],
     );
-    await appendRunEvent(client, runId, eventForCommand[command], { previousState: current, state });
+    await appendRunEvent(client, runId, eventForCommand[command], {
+      previousState: current,
+      state,
+      scoringPhase:marksScoringControl || resumesScoring,
+    });
     return { state };
   });
 }
@@ -278,10 +505,43 @@ export async function retryFailedRunItems(runId: string): Promise<number> {
 
 export async function retryScoringRun(runId: string): Promise<{ state: 'SCORING' }> {
   return withTransaction(async (client) => {
-    const run = await client.query<{ state: RunState; last_scoring_error: unknown }>(
-      'select state,last_scoring_error from benchmark_runs where id=$1 for update', [runId],
+    const run = await client.query<{
+      state:RunState;
+      last_scoring_error:unknown;
+      score_profile_snapshot:{ metrics?:unknown; judgeProvider?:string | null; judgeModel?:string | null };
+      score_profile_snapshot_provenance:string;
+      scoring_engine_version_id:string | null;
+      scoring_engine_snapshot:unknown;
+      scoring_engine_snapshot_provenance:string;
+    }>(
+      `select state,last_scoring_error,score_profile_snapshot,
+         score_profile_snapshot_provenance,scoring_engine_version_id,
+         scoring_engine_snapshot,scoring_engine_snapshot_provenance
+       from benchmark_runs where id=$1 for update`,
+      [runId],
     );
     if (!run.rows[0]) throw new DomainError('RUN_NOT_FOUND', '실행을 찾을 수 없습니다.');
+    if (!isCurrentScoringEngineSnapshot({
+      scoringEngineVersionId:run.rows[0].scoring_engine_version_id,
+      scoringEngineSnapshot:run.rows[0].scoring_engine_snapshot,
+      provenance:run.rows[0].scoring_engine_snapshot_provenance,
+    })) {
+      throw new DomainError(
+        'SCORING_ENGINE_REPLACEMENT_REQUIRED',
+        scoringEngineReplacementRequiredMessage,
+      );
+    }
+    if (!isRunScoreProfileUsable({
+      judgeProvider:run.rows[0].score_profile_snapshot?.judgeProvider,
+      judgeModel:run.rows[0].score_profile_snapshot?.judgeModel,
+      metrics:run.rows[0].score_profile_snapshot?.metrics,
+      snapshotProvenance:run.rows[0].score_profile_snapshot_provenance,
+    })) {
+      throw new DomainError(
+        'SCORE_PROFILE_REPLACEMENT_REQUIRED',
+        scoreProfileReplacementRequiredMessage,
+      );
+    }
     if (run.rows[0].state !== 'FAILED' || !run.rows[0].last_scoring_error) {
       throw new DomainError('SCORING_RETRY_NOT_AVAILABLE', '채점 실패 상태에서만 채점을 재개할 수 있습니다.');
     }
@@ -318,17 +578,6 @@ export function finishStopWhenDrained(runId: string): Promise<boolean> {
   return finishControlWhenDrained(runId, 'STOPPING', 'STOPPED', 'RUN_STOPPED');
 }
 
-export async function getRunEventsAfter(runId: string, afterId = 0, limit = 200) {
-  const { db } = await import('@/server/db/pool');
-  const result = await db.query<{ id: string; event_type: string; payload: Record<string, unknown>; created_at: Date }>(
-    `select id::text, event_type, payload, created_at from job_events
-     where aggregate_type = 'benchmark_run' and aggregate_id = $1 and id > $2
-     order by id limit $3`,
-    [runId, afterId, limit],
-  );
-  return result.rows;
-}
-
 export async function recoverExpiredRunItemLeases(): Promise<number> {
   return withTransaction(async (client) => {
     const recovered = await client.query<{ benchmark_run_id: string; terminal: boolean }>(
@@ -353,16 +602,115 @@ export async function recoverExpiredRunItemLeases(): Promise<number> {
 }
 
 export async function beginScoringWhenExecutionFinished(runId: string): Promise<boolean> {
-  return withTransaction(async (client) => {
-    const result = await client.query<{ total_items: number; completed_items: number; failed_items: number; state: RunState }>(
-      'select total_items, completed_items, failed_items, state from benchmark_runs where id = $1 for update', [runId],
+  const outcome = await withTransaction(async (client) => {
+    const result = await client.query<{
+      total_items:number;
+      completed_items:number;
+      failed_items:number;
+      state:RunState;
+      score_profile_snapshot:{ metrics?:unknown; judgeProvider?:string | null; judgeModel?:string | null };
+      score_profile_snapshot_provenance:string;
+      scoring_engine_version_id:string | null;
+      scoring_engine_snapshot:unknown;
+      scoring_engine_snapshot_provenance:string;
+    }>(
+      `select total_items,completed_items,failed_items,state,
+         score_profile_snapshot,score_profile_snapshot_provenance,
+         scoring_engine_version_id,scoring_engine_snapshot,
+         scoring_engine_snapshot_provenance
+       from benchmark_runs where id=$1 for update`,
+      [runId],
     );
     const run = result.rows[0];
     if (!run || run.state !== 'RUNNING' || run.completed_items + run.failed_items < run.total_items) return false;
+    if (!isCurrentScoringEngineSnapshot({
+      scoringEngineVersionId:run.scoring_engine_version_id,
+      scoringEngineSnapshot:run.scoring_engine_snapshot,
+      provenance:run.scoring_engine_snapshot_provenance,
+    })) {
+      await client.query(
+        `update benchmark_runs
+            set state='FAILED',
+                last_scoring_error=$2::jsonb,
+                updated_at=now()
+          where id=$1`,
+        [runId, JSON.stringify({
+          code:'SCORING_ENGINE_REPLACEMENT_REQUIRED',
+          message:scoringEngineReplacementRequiredMessage,
+          attempts:0,
+          replacementRequired:true,
+          snapshotProvenance:run.scoring_engine_snapshot_provenance,
+          at:new Date().toISOString(),
+        })],
+      );
+      await appendRunEvent(
+        client,
+        runId,
+        'RUN_SCORING_ENGINE_REPLACEMENT_REQUIRED',
+        {
+          previousState:run.state,
+          state:'FAILED',
+          snapshotProvenance:run.scoring_engine_snapshot_provenance,
+          replacementRequired:true,
+        },
+      );
+      return 'ENGINE_BLOCKED' as const;
+    }
+    if (!isRunScoreProfileUsable({
+      judgeProvider:run.score_profile_snapshot?.judgeProvider,
+      judgeModel:run.score_profile_snapshot?.judgeModel,
+      metrics:run.score_profile_snapshot?.metrics,
+      snapshotProvenance:run.score_profile_snapshot_provenance,
+    })) {
+      await client.query(
+        `update benchmark_runs
+         set state='FAILED',
+           last_scoring_error=$2::jsonb,
+           updated_at=now()
+         where id=$1`,
+        [runId, JSON.stringify({
+          code:'SCORE_PROFILE_REPLACEMENT_REQUIRED',
+          message:scoreProfileReplacementRequiredMessage,
+          attempts:0,
+          replacementRequired:true,
+          snapshotProvenance:run.score_profile_snapshot_provenance,
+          at:new Date().toISOString(),
+        })],
+      );
+      const event = await client.query(
+        `select 1 from job_events
+         where aggregate_type='benchmark_run' and aggregate_id=$1
+           and event_type='RUN_SCORE_PROFILE_REPLACEMENT_REQUIRED'
+         limit 1`,
+        [runId],
+      );
+      if (!event.rowCount) {
+        await appendRunEvent(client, runId, 'RUN_SCORE_PROFILE_REPLACEMENT_REQUIRED', {
+          previousState:run.state,
+          state:'FAILED',
+          snapshotProvenance:run.score_profile_snapshot_provenance,
+          replacementRequired:true,
+        });
+      }
+      return 'BLOCKED' as const;
+    }
     await client.query("update benchmark_runs set state = 'SCORING', updated_at = now() where id = $1", [runId]);
     await appendRunEvent(client, runId, 'RUN_SCORING_STARTED', { completedItems: run.completed_items, failedItems: run.failed_items });
     return true;
   });
+  if (outcome === 'BLOCKED') {
+    throw new DomainError(
+      'SCORE_PROFILE_REPLACEMENT_REQUIRED',
+      scoreProfileReplacementRequiredMessage,
+    );
+  }
+  if (outcome === 'ENGINE_BLOCKED') {
+    throw new DomainError(
+      'SCORING_ENGINE_REPLACEMENT_REQUIRED',
+      scoringEngineReplacementRequiredMessage,
+    );
+  }
+  return outcome;
 }
 
 export async function finishCancellationWhenDrained(runId: string): Promise<boolean> {

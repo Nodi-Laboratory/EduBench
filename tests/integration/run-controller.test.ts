@@ -130,3 +130,27 @@ test('a bounded scoring failure can be explicitly resumed', async () => {
   const stored = await db.query<{ state: string; last_scoring_error: unknown }>('select state,last_scoring_error from benchmark_runs where id=$1', [run.id]);
   expect(stored.rows[0]).toEqual({ state:'SCORING', last_scoring_error:null });
 });
+
+test('a scoring pause preserves the scoring phase and resumes from its durable checkpoints', async () => {
+  const run = await createRun({
+    title: `채점 일시정지 ${randomUUID().slice(0, 8)}`, datasetVersionId,
+    scoreProfileId: '20000000-0000-0000-0000-000000000001', priceProfileVersion: 'test-price-v1',
+    systemPrompt: '답하라.', questionLimit: 1,
+    models: [{ providerKey:'gemini', displayName:'Gemini', modelId:'gemini-test', protocol:'gemini' }],
+  });
+  await db.query("update benchmark_runs set state='SCORING' where id=$1", [run.id]);
+
+  expect((await commandRun(run.id, 'PAUSE')).state).toBe('PAUSING');
+  expect(await finishPauseWhenDrained(run.id)).toBe(true);
+  expect((await commandRun(run.id, 'RESUME')).state).toBe('SCORING');
+
+  const stored = await db.query<{ state:string; scoring_control_origin:string | null }>(
+    `select state,parameters->>'scoringControlOrigin' scoring_control_origin
+     from benchmark_runs where id=$1`,
+    [run.id],
+  );
+  expect(stored.rows[0]).toEqual({
+    state:'SCORING',
+    scoring_control_origin:'false',
+  });
+});

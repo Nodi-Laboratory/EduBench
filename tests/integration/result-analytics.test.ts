@@ -32,7 +32,7 @@ test('reads model, metric, purpose, prerequisite, and question analytics from a 
   await commandRun(run.id, 'QUEUE');
   await commandRun(run.id, 'START');
   const [item] = await claimRunItems(run.id, 'analytics-worker', 1, 30_000);
-  await executeRunItem(item!, 'analytics-worker', new MockProvider('gemini'));
+  await executeRunItem(item!, 'analytics-worker', new MockProvider('gemini', 'gemini-test'));
   expect(await beginScoringWhenExecutionFinished(run.id)).toBe(true);
   await scoreRun(run.id);
 
