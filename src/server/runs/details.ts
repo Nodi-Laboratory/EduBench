@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import { prerequisiteScoreMetrics } from '@/domain/prerequisite-benchmark';
 import { isVerifiedScoringEngineSnapshot } from '@/domain/scoring-engine';
+import { requiredMetricsForQuestion } from '@/domain/scoring';
 import {
   readActivityEventCursor,
   readActivityEventHistory,
@@ -110,6 +111,7 @@ async function readRunDetails(
   const itemResult = await client.query(`select ri.id,ri.state,ri.attempts,ri.max_attempts,ri.error_code,ri.error_message,
       ri.request_snapshot,ri.started_at,ri.completed_at,br.system_prompt,q.public_id question_public_id,
       q.purpose,q.difficulty,q.evidence_mode,qr.question_text,qr.answer_options,
+      qr.quality_scores,
       rm.provider_key,rm.display_name,rm.model_id,rm.blind_id,
       coalesce((select jsonb_agg(jsonb_build_object('content',sc.content,'quote',qe.quote_text,'pageStart',sc.page_start) order by qe.ordinal)
         from question_evidence qe join source_chunks sc on sc.id=qe.source_chunk_id
@@ -208,6 +210,10 @@ async function readRunDetails(
       verified:verifiedScoringEngine,
     },
     items: itemResult.rows.map((item) => {
+      const requiredMetricKeys = requiredMetricsForQuestion(
+        Array.isArray(row.score_metrics) ? row.score_metrics.map(String) : [],
+        item.quality_scores,
+      );
       const evidenceRows = Array.isArray(item.question_evidence) ? item.question_evidence as Array<{ content?: string; quote?: string | null; pageStart?: number | null }> : [];
       const evidence = evidenceRows.map((entry, index) => `[근거 ${index + 1}${entry.pageStart ? ` · p.${entry.pageStart}` : ''}]\n${entry.quote ?? entry.content ?? ''}`);
       const options = Array.isArray(item.answer_options) && item.answer_options.length
@@ -229,6 +235,7 @@ async function readRunDetails(
       evidenceMode: item.evidence_mode, providerKey: item.provider_key,
       displayName: item.display_name, modelId: item.model_id, blindId: item.blind_id,
       request,
+      requiredMetricKeys,
       response: item.response_id ? {
         id: item.response_id, text: item.response_text, raw: item.raw_response,
         requestId: item.provider_request_id, finishReason: item.finish_reason,

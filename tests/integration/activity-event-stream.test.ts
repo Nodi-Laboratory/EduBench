@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import { db } from '@/server/db/pool';
 import { migrate } from '@/server/db/migrate';
-import { readActivityEvents } from '@/server/activity/event-stream';
+import {
+  readActivityEventHistory,
+  readActivityEvents,
+} from '@/server/activity/event-stream';
 
 beforeAll(async () => {
   await migrate();
@@ -74,6 +77,73 @@ test.each([
       100,
     );
     expect(exclusive.map((event) => event.id)).toEqual([lifecycle.rows[0]!.id]);
+  } finally {
+    await client.query('rollback');
+    client.release();
+  }
+});
+
+test('redacts legacy generation retrieval bodies from live and initial-history readers', async () => {
+  const client = await db.connect();
+  const batchId = randomUUID();
+  try {
+    await client.query('begin');
+    await client.query(
+      `insert into job_events(aggregate_type,aggregate_id,event_type,payload)
+       values(
+         'generation',
+         $1,
+         'QUESTION_RETRIEVAL_COMPLETED',
+         $2::jsonb
+       )`,
+      [
+        batchId,
+        JSON.stringify({
+          ordinal: 2,
+          attempt: 1,
+          queryText: '관성 선수관계',
+          chunkCount: 1,
+          selectedChunks: [{
+            chunkId: 'legacy-chunk-1',
+            content: 'LEGACY_SELECTED_CHUNK_SECRET',
+          }],
+          chunks: [{
+            chunkId: 'legacy-chunk-1',
+            rank: 1,
+            page: 7,
+            unit: '운동',
+            content: 'LEGACY_CHUNK_CONTENT_SECRET',
+            source: 'semantic',
+            similarity: 0.91,
+          }],
+        }),
+      ],
+    );
+
+    const [live, history] = await Promise.all([
+      readActivityEvents(client, 'generation', batchId, '0', 100),
+      readActivityEventHistory(client, 'generation', batchId, 100),
+    ]);
+    for (const events of [live, history]) {
+      expect(events).toHaveLength(1);
+      expect(events[0]!.payload).toEqual({
+        ordinal: 2,
+        attempt: 1,
+        queryText: '관성 선수관계',
+        chunkCount: 1,
+        selectedChunkIds: ['legacy-chunk-1'],
+        chunks: [{
+          chunkId: 'legacy-chunk-1',
+          rank: 1,
+          page: 7,
+          unit: '운동',
+          source: 'semantic',
+          similarity: 0.91,
+        }],
+      });
+      expect(JSON.stringify(events)).not.toContain('LEGACY_SELECTED_CHUNK_SECRET');
+      expect(JSON.stringify(events)).not.toContain('LEGACY_CHUNK_CONTENT_SECRET');
+    }
   } finally {
     await client.query('rollback');
     client.release();

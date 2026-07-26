@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { DomainError } from '@/domain/errors';
 import {
@@ -17,6 +17,11 @@ import {
 } from '@/server/jobs/queue';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 import { createProviderForModel } from '@/server/providers/registry';
+import type {
+  GenerationRequest,
+  ModelProvider,
+  NormalizedGeneration,
+} from '@/server/providers/types';
 import {
   buildQuestionDirectionInstructions,
   parseQuestionDirectionResponse,
@@ -34,6 +39,13 @@ import {
   validateGeneratedQuestionForType,
   type GeneratedQuestion,
 } from '@/server/questions/response';
+import {
+  abandonSupersededGenerationProviderInvocations,
+  beginGenerationProviderInvocation,
+  completeGenerationProviderInvocation,
+  failGenerationProviderInvocation,
+  type GenerationProviderStage,
+} from '@/server/questions/provider-invocations';
 import { resolveGenerationExecutionPins } from '@/server/settings/execution-pins';
 
 type Batch = {
@@ -58,6 +70,20 @@ type RetrievedChunk = {
   source_file_id: string;
   source_revision_id: string;
   ordinal: number;
+  retrieval_source: 'semantic' | 'neighbor' | 'scope_order';
+  similarity: number | null;
+  semantic_rank: number;
+  anchor_chunk_id: string;
+};
+
+type QueryVectorAudit = {
+  model: string;
+  vectorSpaceId: string;
+  taskType: string;
+  prefixStrategy: string;
+  dimensions: number;
+  norm: number;
+  sha256: string;
 };
 
 type GenerationItemHookContext = {
@@ -87,6 +113,41 @@ function providerRequestSignal(
 ): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
   return parent ? AbortSignal.any([parent, timeout]) : timeout;
+}
+
+async function auditedGeneration(input: {
+  batchId: string;
+  item: ClaimedGenerationItem;
+  stage: GenerationProviderStage;
+  provider: ModelProvider;
+  request: GenerationRequest;
+  signal: AbortSignal;
+}): Promise<NormalizedGeneration> {
+  const invocationId = await beginGenerationProviderInvocation({
+    batchId: input.batchId,
+    itemId: input.item.id,
+    itemAttempt: input.item.attempts,
+    stage: input.stage,
+    provider: input.provider.key,
+    modelId: input.provider.modelId,
+    request: input.request,
+  });
+  try {
+    const response = await input.provider.generate(input.request, input.signal);
+    await completeGenerationProviderInvocation(invocationId, response);
+    return response;
+  } catch (error) {
+    try {
+      await failGenerationProviderInvocation(invocationId, error);
+    } catch (auditError) {
+      console.error(
+        'GENERATION_INVOCATION_FAILURE_AUDIT_FAILED',
+        invocationId,
+        auditError,
+      );
+    }
+    throw error;
+  }
 }
 
 async function assertLease(lease: JobLease) {
@@ -235,6 +296,10 @@ async function claimGenerationItems(
         returning item.id,item.ordinal,item.attempts`,
       [batch.id, lease.jobId, lease.attempt],
     );
+    await abandonSupersededGenerationProviderInvocations(client, {
+      batchId: batch.id,
+      itemIds: claimed.rows.map((item) => item.id),
+    });
     const summary = await updateLockedBatchWithSummary(client, batch.id, 'RUNNING', 1);
     return {
       items: claimed.rows.sort((left, right) => left.ordinal - right.ordinal),
@@ -317,6 +382,10 @@ async function persistRetrieval(
     chunks: RetrievedChunk[];
     sourceRevisionIds: string[];
     tocEntryIds: string[];
+    queryVectorAudit: QueryVectorAudit | null;
+    retrievalTopK: number;
+    neighborWindow: number;
+    similarityMetric: string;
   },
 ) {
   await withTransaction(async (client) => {
@@ -342,12 +411,28 @@ async function persistRetrieval(
           sourceRevisionIds: input.sourceRevisionIds,
           tocEntryIds: input.tocEntryIds,
           units: input.batch.conditions.units ?? [],
+          queryVector: input.queryVectorAudit,
+          retrievalConfig: {
+            topK: input.retrievalTopK,
+            neighborWindow: input.neighborWindow,
+            similarityMetric: input.similarityMetric,
+          },
         }),
         JSON.stringify(input.chunks.map((chunk, index) => ({
           chunkId: chunk.id,
           rank: index + 1,
           page: chunk.page_start,
           unit: chunk.unit,
+          content: chunk.content,
+          source: chunk.retrieval_source,
+          similarity: chunk.similarity,
+          semanticRank: chunk.semantic_rank,
+          anchorChunkId: chunk.anchor_chunk_id,
+          selectionReason: chunk.retrieval_source === 'neighbor'
+            ? `${chunk.anchor_chunk_id} 청크 주변의 선수 맥락으로 확장됨`
+            : chunk.retrieval_source === 'semantic'
+              ? `질의 벡터와의 코사인 유사도 순위 ${chunk.semantic_rank}`
+              : `임베딩이 없는 MOCK 실행에서 고정된 청크 순서 ${chunk.semantic_rank}`,
         }))),
       ],
     );
@@ -361,12 +446,23 @@ async function persistRetrieval(
         attempt: input.item.attempts,
         queryText: input.questionDirection.searchQuery,
         chunkCount: input.chunks.length,
+        selectedChunkIds: input.chunks.map((chunk) => chunk.id),
         chunks: input.chunks.map((chunk, index) => ({
           chunkId: chunk.id,
           rank: index + 1,
           page: chunk.page_start,
           unit: chunk.unit,
+          source: chunk.retrieval_source,
+          similarity: chunk.similarity,
+          semanticRank: chunk.semantic_rank,
+          anchorChunkId: chunk.anchor_chunk_id,
         })),
+        queryVector: input.queryVectorAudit,
+        retrievalConfig: {
+          topK: input.retrievalTopK,
+          neighborWindow: input.neighborWindow,
+          similarityMetric: input.similarityMetric,
+        },
       },
     );
   });
@@ -873,7 +969,7 @@ export async function generateQuestions(
             ordinal: item.ordinal,
             total: batch.requested_count,
           });
-          const directionResponse = await provider.generate({
+          const directionRequest: GenerationRequest = {
             system: directionInstructions.system,
             prompt: directionInstructions.prompt,
             maxOutputTokens:generationSettings.directionMaxOutputTokens,
@@ -882,10 +978,18 @@ export async function generateQuestions(
               responseJsonSchema:questionDirectionJsonSchema,
             } : {}),
             thinkingLevel:generationSettings.thinkingLevel,
-          }, providerRequestSignal(
-            options.signal,
-            generationSettings.requestTimeoutMs,
-          ));
+          };
+          const directionResponse = await auditedGeneration({
+            batchId,
+            item,
+            stage: 'DIRECTION',
+            provider,
+            request: directionRequest,
+            signal: providerRequestSignal(
+              options.signal,
+              generationSettings.requestTimeoutMs,
+            ),
+          });
           if (directionResponse.finishReason && directionResponse.finishReason !== 'STOP') {
             throw new DomainError(
               'DIRECTION_INCOMPLETE_RESPONSE',
@@ -902,6 +1006,7 @@ export async function generateQuestions(
           queryText: questionDirection.searchQuery,
         });
         let queryVector: string | null = null;
+        let queryVectorAudit: QueryVectorAudit | null = null;
         if (embedder) {
           const [vector] = await embedder.embed(
             [
@@ -915,8 +1020,22 @@ export async function generateQuestions(
             ),
             embeddingSettings.queryTaskType,
           );
-          queryVector = `[${vector!.join(',')}]`;
+          const values = vector!;
+          queryVector = `[${values.join(',')}]`;
+          queryVectorAudit = {
+            model: embeddingModel!,
+            vectorSpaceId: embeddingSettings.vectorSpaceId,
+            taskType: embeddingSettings.queryTaskType,
+            prefixStrategy: embeddingSettings.prefixStrategy,
+            dimensions: values.length,
+            norm: Math.sqrt(values.reduce((sum, value) => sum + value * value, 0)),
+            sha256: createHash('sha256').update(JSON.stringify(values)).digest('hex'),
+          };
         }
+        const retrievalTopK = Math.min(
+          Number(batch.conditions.chunkCount ?? embeddingSettings.retrievalTopK),
+          embeddingSettings.retrievalTopK,
+        );
         const chunks = await db.query<RetrievedChunk>(
           `with scoped_chunks as materialized(
              select distinct chunk.id,chunk.content,chunk.page_start,chunk.unit,
@@ -944,6 +1063,9 @@ export async function generateQuestions(
            ),
            semantic as(
              select scoped.*,
+                    case when $3::vector is null then null
+                         else (1-(scoped.embedding <=>$3::vector))::double precision
+                    end as similarity,
                     row_number() over(
                       order by case when $3::vector is null then null else scoped.embedding <=>$3::vector end nulls last,
                                scoped.source_file_id,scoped.ordinal
@@ -956,11 +1078,16 @@ export async function generateQuestions(
            expanded as(
              select semantic.id,semantic.content,semantic.page_start,semantic.unit,
                     semantic.source_file_id,semantic.source_revision_id,semantic.ordinal,
+                    case when $3::vector is null then 'scope_order' else 'semantic' end
+                      as retrieval_source,
+                    semantic.similarity,semantic.semantic_rank,semantic.id as anchor_chunk_id,
                     semantic.semantic_rank*1000 as selection_order
                from semantic
              union all
              select prior.id,prior.content,prior.page_start,prior.unit,
                     prior.source_file_id,prior.source_revision_id,prior.ordinal,
+                    'neighbor' as retrieval_source,
+                    semantic.similarity,semantic.semantic_rank,semantic.id as anchor_chunk_id,
                     semantic.semantic_rank*1000-(semantic.ordinal-prior.ordinal) as selection_order
                from semantic
                 join scoped_chunks prior
@@ -968,19 +1095,28 @@ export async function generateQuestions(
                  and prior.ordinal between
                      greatest(1,semantic.ordinal-$5)
                      and semantic.ordinal-1
+           ),
+           ranked as(
+             select expanded.*,
+                    row_number() over(
+                      partition by expanded.id
+                      order by
+                        case when expanded.retrieval_source='neighbor' then 1 else 0 end,
+                        expanded.selection_order,
+                        expanded.anchor_chunk_id
+                    ) as dedupe_rank
+               from expanded
            )
-           select id,content,page_start,unit,source_file_id,source_revision_id,ordinal
-             from expanded
-            group by id,content,page_start,unit,source_file_id,source_revision_id,ordinal
-            order by min(selection_order),source_file_id,ordinal`,
+           select id,content,page_start,unit,source_file_id,source_revision_id,ordinal,
+                  retrieval_source,similarity,semantic_rank,anchor_chunk_id
+             from ranked
+            where dedupe_rank=1
+            order by selection_order,source_file_id,ordinal`,
           [
             sourceRevisionIds,
             tocEntryIds,
             queryVector,
-            Math.min(
-              Number(batch.conditions.chunkCount ?? embeddingSettings.retrievalTopK),
-              embeddingSettings.retrievalTopK,
-            ),
+            retrievalTopK,
             embeddingSettings.neighborWindow,
             executionPins.embeddingRag.contentHash,
             embeddingSettings.vectorSpaceId,
@@ -1008,6 +1144,10 @@ export async function generateQuestions(
           chunks: chunks.rows,
           sourceRevisionIds,
           tocEntryIds,
+          queryVectorAudit,
+          retrievalTopK,
+          neighborWindow: embeddingSettings.neighborWindow,
+          similarityMetric: embeddingSettings.similarityMetric,
         });
         await options.testHooks?.afterRetrievalPersisted?.(hookContext);
 
@@ -1066,7 +1206,7 @@ export async function generateQuestions(
             total: batch.requested_count,
             evidence,
           });
-          const response = await provider.generate({
+          const generationRequest: GenerationRequest = {
             system: instructions.system,
             prompt: instructions.prompt,
             maxOutputTokens:generationSettings.questionMaxOutputTokens,
@@ -1075,10 +1215,18 @@ export async function generateQuestions(
               responseJsonSchema:generatedQuestionResponseJsonSchema,
             } : {}),
             thinkingLevel:generationSettings.thinkingLevel,
-          }, providerRequestSignal(
-            options.signal,
-            generationSettings.requestTimeoutMs,
-          ));
+          };
+          const response = await auditedGeneration({
+            batchId,
+            item,
+            stage: 'QUESTION',
+            provider,
+            request: generationRequest,
+            signal: providerRequestSignal(
+              options.signal,
+              generationSettings.requestTimeoutMs,
+            ),
+          });
           if (response.finishReason && response.finishReason !== 'STOP') {
             throw new DomainError(
               'GENERATION_INCOMPLETE_RESPONSE',

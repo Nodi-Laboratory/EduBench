@@ -9,12 +9,21 @@ import {
   type DocumentParseOptions,
   type UpstageDocumentParserOptions,
 } from '@/server/providers/upstage-document';
+import { upstageDocumentParseDistributedGate } from '@/server/providers/postgres-concurrency-gate';
 import { ProviderError, type ProviderErrorKind } from '@/server/providers/types';
+import {
+  withProviderRetry,
+  type RetryOptions as ProviderRetryOptions,
+} from '@/server/providers/retry';
 import {
   defaultResearchConfigDefinitions,
   documentParseResearchConfigSchema,
   type DocumentParseResearchConfig,
 } from '@/domain/research-config';
+import {
+  effectiveDocumentParseConcurrency,
+  DEFAULT_DOCUMENT_PARSE_PROVIDER_MAX_ATTEMPTS,
+} from '@/domain/document-parse-config';
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 
@@ -63,6 +72,11 @@ export type DocumentLabDependencies = {
   parser?: PageParser;
   createParser?: (options: UpstageDocumentParserOptions) => PageParser;
   limits?: DocumentLabLimits;
+  signal?: AbortSignal;
+  providerRetry?: Pick<
+    ProviderRetryOptions,
+    'maxAttempts' | 'baseDelayMs' | 'maxDelayMs' | 'sleep' | 'random'
+  >;
 };
 
 export type DocumentLabProfileConfig = {
@@ -93,6 +107,7 @@ function renderOptionsFor(
       ? { jpegQuality: settings.rasterization.jpegQuality }
       : {}),
     timeoutMs: settings.requestTimeoutMs,
+    pagesPerBatch: settings.pagesPerBatch,
   };
 }
 
@@ -291,6 +306,7 @@ function labResult<T extends { pages: LabPage[] }>(result: T, maxResponseBytes: 
 }
 
 export async function parseDocumentLabFile(file: File, dependencies: DocumentLabDependencies = {}) {
+  dependencies.signal?.throwIfAborted();
   if (file.size > MAX_FILE_BYTES) throw new DocumentLabError('FILE_TOO_LARGE', 400, 'Document files must be 100MB or smaller.');
 
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -308,7 +324,10 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
   if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
 
   const limits = dependencies.limits ?? DOCUMENT_LAB_LIMITS;
-  const renderOptions = renderOptionsFor(settings);
+  const renderOptions = {
+    ...renderOptionsFor(settings),
+    ...(dependencies.signal ? { signal:dependencies.signal } : {}),
+  };
   const pages: DocumentLabPageInput[] = [];
   const pageStream: AsyncIterable<RenderedPage | StreamedPage | DocumentLabPageInput> = mimeType === 'application/pdf'
     ? dependencies.streamPdfPages
@@ -319,6 +338,7 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
     : legacyPages(Promise.resolve([imagePage(file, bytes, mimeType)] as RenderedPage[]));
   let renderedBytes = 0;
   for await (const page of pageStream) {
+    dependencies.signal?.throwIfAborted();
     if (pages.length >= limits.maxPages) {
       throw new DocumentLabError('LAB_PAGE_LIMIT_EXCEEDED', 413, `Document Lab accepts at most ${limits.maxPages} pages.`);
     }
@@ -348,6 +368,7 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
     base64Encoding: settings.base64Encoding,
     outputFormats: outputFormatsFor(settings.outputFormat),
     timeoutMs: settings.requestTimeoutMs,
+    requestGate: upstageDocumentParseDistributedGate,
   };
   const parser = dependencies.parser
     ?? (dependencies.createParser ?? ((options) => new UpstageDocumentParser(options)))(
@@ -355,12 +376,31 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
     );
   const parsedPages = await mapConcurrentInOrder(
     pages,
-    settings.pageConcurrency,
+    effectiveDocumentParseConcurrency(settings.pageConcurrency),
     async (page): Promise<LabPage> => {
     let parsed: ParsedPage;
     try {
-      parsed = await parser.parse(page.bytes, page.filename, { mimeType: page.mimeType, pageNumber: page.pageNumber });
+      parsed = await withProviderRetry(
+        () => parser.parse(
+          page.bytes,
+          page.filename,
+          {
+            mimeType:page.mimeType,
+            pageNumber:page.pageNumber,
+            signal:dependencies.signal,
+          },
+        ),
+        {
+          ...(dependencies.providerRetry ?? {
+            maxAttempts:DEFAULT_DOCUMENT_PARSE_PROVIDER_MAX_ATTEMPTS,
+            baseDelayMs:2_000,
+            maxDelayMs:60_000,
+          }),
+          signal:dependencies.signal,
+        },
+      );
     } catch (error) {
+      if (dependencies.signal?.aborted) throw dependencies.signal.reason;
       const providerError = error instanceof ProviderError ? error : null;
       throw new DocumentPageParseError(
         page.pageNumber,

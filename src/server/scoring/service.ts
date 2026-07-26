@@ -779,12 +779,15 @@ async function scoreClaimedRun(
 
 export async function scoreRun(
   runId: string,
+  parentSignal?:AbortSignal,
 ): Promise<{ scoredResponses:number; claimed:boolean }> {
   const lockName = `edubench:score-run:${runId}`;
+  throwIfAborted(parentSignal);
   const lockClient = await db.connect();
   let acquired = false;
   let releaseError: Error | undefined;
   try {
+    throwIfAborted(parentSignal);
     const lock = await lockClient.query<{ acquired:boolean }>(
       'select pg_try_advisory_lock(hashtextextended($1, 0)) acquired',
       [lockName],
@@ -836,9 +839,15 @@ export async function scoreRun(
     }
     const control = startScoringControlMonitor(runId);
     try {
-      const result = await scoreClaimedRun(runId, control.signal);
+      const signal = parentSignal
+        ? AbortSignal.any([control.signal, parentSignal])
+        : control.signal;
+      const result = await scoreClaimedRun(runId, signal);
       return { ...result, claimed:true };
     } catch (error) {
+      if (parentSignal?.aborted) {
+        return { scoredResponses:0, claimed:true };
+      }
       if (
         !(error instanceof DomainError)
         || error.code !== 'RUN_SCORING_CONTROL_REQUESTED'

@@ -1,9 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
-import { BookOpen, Check, ChevronDown, RefreshCw, RotateCcw, Search, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { BookOpen, ChevronDown, RefreshCw, RotateCcw, Sparkles } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
-import { GENERATION_STAGES } from '@/domain/generation';
 import { buildQuestionGenerationInstructions } from '@/domain/question-prompt';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
@@ -16,6 +15,41 @@ type GenerationBatch = {
 };
 type ActivityEvent = { id: string; event_type: string; payload: Record<string, unknown>; created_at: string };
 type GeneratedQuestion = { public_id: string; status: string; question_text: string; answer_text: string; design_summary: string | null; evidence_summary: string | null };
+type GenerationProviderInvocation = {
+  id: string;
+  itemAttempt: number;
+  stage: 'DIRECTION' | 'QUESTION';
+  state: string;
+  provider: string;
+  modelId: string;
+  requestSnapshot: Record<string, unknown>;
+  responseSnapshot: Record<string, unknown> | null;
+  rawResponse: unknown;
+  requestId: string | null;
+  modelSnapshot: string | null;
+  finishReason: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  latencyMs: number | null;
+  error: Record<string, unknown> | null;
+  startedAt: string;
+  completedAt: string | null;
+};
+type GenerationRetrievalAudit = {
+  id: string;
+  attempt: number;
+  queryText: string;
+  candidateScope: Record<string, unknown>;
+  selectedChunks: unknown[];
+  createdAt: string;
+};
+type GenerationProviderInvocationSummary = {
+  total: number;
+  requested: number;
+  completed: number;
+  failed: number;
+  abandoned: number;
+};
 type GenerationItem = {
   id: string;
   ordinal: number;
@@ -28,15 +62,36 @@ type GenerationItem = {
     id: string;
     attempt: number;
     queryText: string;
-    candidateScope: Record<string, unknown>;
-    selectedChunks: unknown[];
+    selectedChunkCount: number;
     createdAt: string;
   } | null;
+  providerInvocationSummary: GenerationProviderInvocationSummary;
   questionId: string | null;
   questionPublicId: string | null;
   startedAt: string | null;
   completedAt: string | null;
   updatedAt: string;
+};
+type GenerationItemAuditPage = {
+  batchId: string;
+  itemId: string;
+  latestRetrieval: GenerationRetrievalAudit | null;
+  providerInvocations: GenerationProviderInvocation[];
+  pagination: {
+    limit: number;
+    offset: number;
+    total: number;
+    nextOffset: number | null;
+  };
+};
+type GenerationItemAuditState = {
+  batchId: string;
+  loaded: boolean;
+  loading: boolean;
+  error: string | null;
+  latestRetrieval: GenerationRetrievalAudit | null;
+  providerInvocations: GenerationProviderInvocation[];
+  pagination: GenerationItemAuditPage['pagination'] | null;
 };
 type Activity = {
   batch: GenerationBatch;
@@ -48,8 +103,10 @@ type Activity = {
   eventCursor: string;
 };
 
+const ITEM_AUDIT_PAGE_SIZE = 20;
+
 const eventLabels: Record<string, string> = {
-  JOB_ENQUEUED: '작업 대기열 등록', JOB_CLAIMED: '작업 실행 시작', JOB_LEASED: '작업 실행 시작', JOB_RETRY_SCHEDULED: '작업 재시도 예약', JOB_FAILED: '작업 최종 실패', JOB_TERMINAL_FAILED: '작업 최종 실패',
+  JOB_ENQUEUED: '작업 대기열 등록', JOB_CLAIMED: '작업 실행 시작', JOB_LEASED: '작업 실행 시작', JOB_RETRY_SCHEDULED: '작업 재시도 예약', JOB_RELEASED_ON_SHUTDOWN: '워커 종료 · 안전 재개 대기', JOB_FAILED: '작업 최종 실패', JOB_TERMINAL_FAILED: '작업 최종 실패',
   GENERATION_STARTED: '생성 배치 시작', RETRIEVAL_STARTED: '교과서 근거 검색 시작', RETRIEVAL_COMPLETED: '교과서 근거 검색 완료',
   QUESTION_DIRECTION_STARTED: '단일 문항 방향성 설계 시작', QUESTION_DIRECTION_COMPLETED: '단일 문항 방향성 설계 완료',
   QUESTION_RETRIEVAL_STARTED: '단일 문항 전용 벡터 검색 시작', QUESTION_RETRIEVAL_COMPLETED: '단일 문항 전용 벡터 검색 완료',
@@ -64,8 +121,226 @@ const connectionLabels = {
   reconnecting: '재연결 중',
 } as const;
 
+type ObservableStageKey = 'direction' | 'retrieval' | 'generation';
+const observableStages: readonly {
+  key: ObservableStageKey;
+  label: string;
+  description: string;
+  startedEvent: string;
+  completedEvent: string;
+  failedEvent: string;
+}[] = [
+  {
+    key: 'direction',
+    label: '방향성 설계',
+    description: '문항마다 독립적인 측정 방향과 검색 질의를 설계합니다.',
+    startedEvent: 'QUESTION_DIRECTION_STARTED',
+    completedEvent: 'QUESTION_DIRECTION_COMPLETED',
+    failedEvent: 'QUESTION_DIRECTION_FAILED',
+  },
+  {
+    key: 'retrieval',
+    label: '문항별 근거 검색',
+    description: '해당 문항 전용 질의로 교과서 청크를 검색합니다.',
+    startedEvent: 'QUESTION_RETRIEVAL_STARTED',
+    completedEvent: 'QUESTION_RETRIEVAL_COMPLETED',
+    failedEvent: 'QUESTION_RETRIEVAL_FAILED',
+  },
+  {
+    key: 'generation',
+    label: '질문·답안 생성',
+    description: '검색된 근거로 질문과 모범 답안을 생성해 저장합니다.',
+    startedEvent: 'QUESTION_GENERATION_STARTED',
+    completedEvent: 'QUESTION_GENERATION_COMPLETED',
+    failedEvent: 'QUESTION_GENERATION_FAILED',
+  },
+];
+
 function failureMessage(activity: Activity | null) {
   return activity?.batch.progress?.error || activity?.job?.last_error_message || null;
+}
+
+function eventOrdinal(event: ActivityEvent) {
+  const ordinal = Number(event.payload.ordinal);
+  return Number.isInteger(ordinal) && ordinal > 0 ? ordinal : null;
+}
+
+function observedStageProgress(
+  activity: Activity | null,
+  stage: typeof observableStages[number],
+) {
+  if (!activity) return { label: '배치 기록 없음', state: 'unknown' };
+  const total = activity.batch.requested_count;
+  const completed = new Set<number>();
+  const started = new Set<number>();
+  const failed = new Set<number>();
+
+  for (const item of activity.items ?? []) {
+    if (stage.key === 'direction' && item.direction) completed.add(item.ordinal);
+    if (stage.key === 'retrieval' && item.latestRetrieval) completed.add(item.ordinal);
+    if (stage.key === 'generation' && (item.questionId || item.questionPublicId)) completed.add(item.ordinal);
+  }
+  for (const event of activity.events ?? []) {
+    const ordinal = eventOrdinal(event);
+    if (ordinal == null) continue;
+    if (event.event_type === stage.completedEvent) completed.add(ordinal);
+    if (event.event_type === stage.startedEvent) started.add(ordinal);
+    if (event.event_type === stage.failedEvent) failed.add(ordinal);
+  }
+  for (const ordinal of completed) {
+    started.delete(ordinal);
+    failed.delete(ordinal);
+  }
+  for (const ordinal of failed) started.delete(ordinal);
+
+  const completedCount = Math.min(total, completed.size);
+  const runningCount = Math.min(Math.max(0, total - completedCount), started.size);
+  const failedCount = Math.min(Math.max(0, total - completedCount - runningCount), failed.size);
+  if (completedCount === 0 && runningCount === 0 && failedCount === 0) {
+    return ['QUEUED', 'PENDING'].includes(activity.batch.state)
+      ? { label: '대기', state: 'pending' }
+      : { label: '기록 없음 · legacy partial', state: 'unknown' };
+  }
+  const parts = [`${completedCount}/${total} 완료`];
+  if (runningCount) parts.push(`${runningCount} 진행`);
+  if (failedCount) parts.push(`${failedCount} 실패`);
+  return {
+    label: parts.join(' · '),
+    state: completedCount >= total
+      ? 'complete'
+      : failedCount > 0
+        ? 'failed'
+        : runningCount > 0
+          ? 'running'
+          : 'pending',
+  };
+}
+
+const directionLabels: Record<string, string> = {
+  directionSummary: '방향 요약',
+  targetConceptQuery: '목표 개념 질의',
+  prerequisiteQuery: '선수 개념 질의',
+  searchQuery: '통합 검색 질의',
+};
+
+function readableValue(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value) && value.every((entry) => ['string', 'number', 'boolean'].includes(typeof entry))) {
+    return value.map(String).join(', ');
+  }
+  return null;
+}
+
+function DirectionRecord({ value }: { value: Record<string, unknown> | null }) {
+  if (!value) return <p>기록 없음</p>;
+  const primary = Object.entries(value)
+    .filter(([key]) => !/(^id$|Id$|_id$)/.test(key))
+    .map(([key, entry]) => ({ key, label: directionLabels[key] ?? key, value: readableValue(entry) }))
+    .filter((entry): entry is { key: string; label: string; value: string } => entry.value != null);
+  return <>
+    {primary.length ? <dl className="lab-request-info">{primary.map((entry) => <div key={entry.key}>
+      <dt>{entry.label}</dt><dd>{entry.value}</dd>
+    </div>)}</dl> : <p>사람이 읽을 수 있는 방향성 필드가 없습니다.</p>}
+    <details><summary>원본 방향성 기록</summary><JsonBlock value={value} /></details>
+  </>;
+}
+
+function RetrievalSummary({ value }: { value: GenerationItem['latestRetrieval'] }) {
+  if (!value) return <p>검색 기록 없음</p>;
+  return <div>
+    <h4>검색 질의</h4>
+    <p>{value.queryText || '기록 없음'}</p>
+    <p><strong>선택 근거 {value.selectedChunkCount ?? 0}개</strong></p>
+  </div>;
+}
+
+function RetrievalRecord({ value }: { value: GenerationRetrievalAudit | null }) {
+  if (!value) return <p>기록 없음</p>;
+  const chunks = (value.selectedChunks ?? [])
+    .filter((chunk): chunk is Record<string, unknown> => typeof chunk === 'object' && chunk !== null);
+  return <div>
+    <h4>검색 질의</h4>
+    <p>{value.queryText || '기록 없음'}</p>
+    <h4>선택 근거 {chunks.length}개</h4>
+    {chunks.length ? chunks.map((chunk, index) => {
+      const page = chunk.page == null ? null : String(chunk.page);
+      const rank = chunk.rank == null ? index + 1 : Number(chunk.rank);
+      const content = readableValue(chunk.content);
+      const unit = readableValue(chunk.unit);
+      const source = readableValue(chunk.source);
+      const selectionReason = readableValue(chunk.selectionReason);
+      const similarity = typeof chunk.similarity === 'number' ? chunk.similarity.toFixed(4) : null;
+      const chunkId = readableValue(chunk.chunkId);
+      return <article key={chunkId ?? `${value.id}-${index}`}>
+        {content ? <p>{content}</p> : <p>본문 기록 없음</p>}
+        <strong>{Number.isFinite(rank) ? `${rank}위` : `${index + 1}위`}</strong>
+        <span>{unit ?? '단원 기록 없음'}</span>
+        {page && <span className="mono">p.{page}</span>}
+        {(source || similarity || selectionReason) && <p>{[source, similarity && `유사도 ${similarity}`, selectionReason].filter(Boolean).join(' · ')}</p>}
+        {chunkId && <small className="mono">chunk <code>{chunkId}</code></small>}
+      </article>;
+    }) : <p>선택 청크 기록 없음</p>}
+    <details><summary>검색 감사 원본</summary><JsonBlock value={value} /></details>
+  </div>;
+}
+
+function ProviderInvocationRecord({ invocation }: { invocation: GenerationProviderInvocation }) {
+  const title = invocation.stage === 'DIRECTION'
+    ? '실제 방향성 프롬프트'
+    : '실제 질문 생성 프롬프트';
+  const system = readableValue(invocation.requestSnapshot.system);
+  const prompt = readableValue(invocation.requestSnapshot.prompt);
+  const responseText = readableValue(invocation.responseSnapshot?.text);
+  return <details className="source-event provider-invocation-record">
+    <summary>
+      <strong>{title}</strong>
+      <span className={`state-label state-${invocation.state.toLowerCase()}`}>{invocation.state}</span>
+      <small className="mono">{invocation.provider} / {invocation.modelId}</small>
+    </summary>
+    <div className="event-payload">
+      <p className="run-meta mono">
+        시도 {invocation.itemAttempt} · request {invocation.requestId ?? '기록 없음'} · model snapshot {invocation.modelSnapshot ?? '기록 없음'}
+      </p>
+      <section>
+        <h4>요청</h4>
+        <strong>System</strong>
+        <pre>{system ?? '기록 없음'}</pre>
+        <strong>User</strong>
+        <pre>{prompt ?? '기록 없음'}</pre>
+        <p className="run-meta mono">
+          maxOutputTokens {readableValue(invocation.requestSnapshot.maxOutputTokens) ?? '기록 없음'}
+        </p>
+        <details><summary>전체 요청 스냅샷</summary><JsonBlock value={invocation.requestSnapshot} /></details>
+      </section>
+      <section>
+        <h4>Provider 응답</h4>
+        <pre>{responseText ?? '응답 텍스트 기록 없음'}</pre>
+        <p className="run-meta mono">
+          finish {invocation.finishReason ?? '기록 없음'} · token {invocation.inputTokens ?? '—'} / {invocation.outputTokens ?? '—'} · {invocation.latencyMs ?? '—'} ms
+        </p>
+        {invocation.error && <div className="event-error"><strong>호출 실패</strong><JsonBlock value={invocation.error} /></div>}
+        <details><summary>Provider 원시 응답</summary><JsonBlock value={invocation.rawResponse ?? '기록 없음'} /></details>
+      </section>
+      <small className="mono">시작 {invocation.startedAt} · 완료 {invocation.completedAt ?? '기록 없음'} · invocation {invocation.id}</small>
+    </div>
+  </details>;
+}
+
+function mergeBatchSnapshot(
+  batches: GenerationBatch[],
+  snapshot: GenerationBatch,
+): GenerationBatch[] {
+  const found = batches.some((batch) => batch.id === snapshot.id);
+  const merge = (batch: GenerationBatch) => ({
+    ...batch,
+    ...snapshot,
+    conditions: { ...batch.conditions, ...snapshot.conditions },
+    progress: { ...batch.progress, ...snapshot.progress },
+  });
+  return found
+    ? batches.map((batch) => batch.id === snapshot.id ? merge(batch) : batch)
+    : [snapshot, ...batches];
 }
 
 export function GenerationWorkspace({ sources, batches }: { sources: GenerationSource[]; batches: GenerationBatch[] }) {
@@ -75,6 +350,10 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
   const [liveBatches, setLiveBatches] = useState(batches);
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(batches[0]?.id ?? null);
   const [activity, setActivity] = useState<Activity | null>(null);
+  const [itemAudits, setItemAudits] = useState<Record<string, GenerationItemAuditState>>({});
+  const auditBatchRef = useRef<string | null>(selectedBatchId);
+  const auditGenerationRef = useRef(0);
+  const auditRequestsRef = useRef(new Set<string>());
   const [promptInputs, setPromptInputs] = useState({
     subject: '과학', grade: '중학교 2학년', purpose: '핵심 개념 이해',
     questionType: '구조화 서술형', difficulty: '중',
@@ -105,6 +384,7 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     void fetchActivity(selectedBatchId, true, abort.signal).then((snapshot) => {
       if (!abort.signal.aborted && snapshot && 'events' in snapshot) {
         setActivity(snapshot as Activity);
+        setLiveBatches((current) => mergeBatchSnapshot(current, snapshot.batch));
       }
     }).catch(() => undefined);
     return () => abort.abort();
@@ -121,7 +401,12 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
         ? { ...snapshot, eventCursor: current.eventCursor, events: current.events } as Activity
         : current);
     }
-    if (batchesResponse.ok) setLiveBatches((await batchesResponse.json()).items);
+    if (batchesResponse.ok) {
+      const fetched = (await batchesResponse.json()).items as GenerationBatch[];
+      setLiveBatches(snapshot ? mergeBatchSnapshot(fetched, snapshot.batch) : fetched);
+    } else if (snapshot) {
+      setLiveBatches((current) => mergeBatchSnapshot(current, snapshot.batch));
+    }
   }, [fetchActivity, selectedBatchId]);
   const coalescedRefresh = useCoalescedRefresh(refreshSelectedSnapshot);
   const stream = useCursorEventStream({
@@ -151,6 +436,108 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
       coalescedRefresh();
     },
   });
+
+  function selectGenerationBatch(batchId: string) {
+    if (auditBatchRef.current !== batchId) {
+      auditBatchRef.current = batchId;
+      auditGenerationRef.current += 1;
+      auditRequestsRef.current.clear();
+      setItemAudits({});
+    }
+    setActivity(null);
+    setSelectedBatchId(batchId);
+  }
+
+  async function loadItemAudit(itemId: string, offset = 0, force = false) {
+    const batchId = selectedBatchId;
+    if (!batchId) return;
+    const auditGeneration = auditGenerationRef.current;
+    const cached = itemAudits[itemId];
+    if (
+      !force
+      && offset === 0
+      && cached?.batchId === batchId
+      && (cached.loaded || cached.loading)
+    ) return;
+
+    const requestKey = `${batchId}:${itemId}:${offset}`;
+    if (auditRequestsRef.current.has(requestKey)) return;
+    auditRequestsRef.current.add(requestKey);
+    setItemAudits((current) => {
+      const previous = current[itemId]?.batchId === batchId ? current[itemId] : null;
+      return {
+        ...current,
+        [itemId]: {
+          batchId,
+          loaded: previous?.loaded ?? false,
+          loading: true,
+          error: null,
+          latestRetrieval: previous?.latestRetrieval ?? null,
+          providerInvocations: previous?.providerInvocations ?? [],
+          pagination: previous?.pagination ?? null,
+        },
+      };
+    });
+
+    try {
+      const response = await fetch(
+        `/api/generation/${batchId}/items/${itemId}/audit?limit=${ITEM_AUDIT_PAGE_SIZE}&offset=${offset}`,
+        { cache: 'no-store' },
+      );
+      if (!response.ok) throw new Error('상세 감사 기록을 불러오지 못했습니다.');
+      const page = await response.json() as GenerationItemAuditPage;
+      if (
+        auditBatchRef.current !== batchId
+        || auditGenerationRef.current !== auditGeneration
+        || page.batchId !== batchId
+        || page.itemId !== itemId
+      ) return;
+      setItemAudits((current) => {
+        if (auditGenerationRef.current !== auditGeneration) return current;
+        const previous = current[itemId]?.batchId === batchId ? current[itemId] : null;
+        const invocations = offset === 0
+          ? page.providerInvocations
+          : [...(previous?.providerInvocations ?? []), ...page.providerInvocations];
+        return {
+          ...current,
+          [itemId]: {
+            batchId,
+            loaded: true,
+            loading: false,
+            error: null,
+            latestRetrieval: page.latestRetrieval,
+            providerInvocations: [...new Map(
+              invocations.map((invocation) => [invocation.id, invocation]),
+            ).values()],
+            pagination: page.pagination,
+          },
+        };
+      });
+    } catch (error) {
+      if (
+        auditBatchRef.current !== batchId
+        || auditGenerationRef.current !== auditGeneration
+      ) return;
+      setItemAudits((current) => {
+        if (auditGenerationRef.current !== auditGeneration) return current;
+        const previous = current[itemId]?.batchId === batchId ? current[itemId] : null;
+        return {
+          ...current,
+          [itemId]: {
+            batchId,
+            loaded: previous?.loaded ?? false,
+            loading: false,
+            error: error instanceof Error ? error.message : '상세 감사 기록을 불러오지 못했습니다.',
+            latestRetrieval: previous?.latestRetrieval ?? null,
+            providerInvocations: previous?.providerInvocations ?? [],
+            pagination: previous?.pagination ?? null,
+          },
+        };
+      });
+    } finally {
+      auditRequestsRef.current.delete(requestKey);
+    }
+  }
 
   function toggleSource(source: GenerationSource, checked: boolean) {
     setSelectedSourceIds((current) => checked ? [...new Set([...current, source.id])] : current.filter((id) => id !== source.id));
@@ -194,8 +581,7 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     const body = await response.json();
     if (response.ok) {
       setNotice(`생성 배치 ${body.id.slice(0, 8)}를 예약했습니다.`);
-      setActivity(null);
-      setSelectedBatchId(body.id);
+      selectGenerationBatch(body.id);
       setLiveBatches((current) => [{ id: body.id, state: body.state, requested_count: Number(form.get('requestedCount')), created_at: new Date().toISOString(), progress: body.progress }, ...current]);
     } else setNotice(body.message ?? '생성 배치를 만들지 못했습니다.');
   }
@@ -254,27 +640,89 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
         {sources.length === 0 && <p className="form-warning">준비 완료된 교과서가 필요합니다.</p>}{notice && <p className="inline-notice" role="status">{notice}</p>}
       </form></section>
       <div className="generation-side">
-        <section className="panel pipeline-panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>9단계 생성 파이프라인</h2></div></div><ol>{GENERATION_STAGES.map((stage, index) => <li key={stage}><span className="pipeline-index mono">{String(index + 1).padStart(2, '0')}</span><span>{stage}</span>{index === 0 ? <Search size={14} /> : <Check size={14} />}</li>)}</ol></section>
+        <section className="panel pipeline-panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>실제 생성 단계</h2><p>배치·문항·이벤트에 저장된 단계만 표시하며, 없는 레거시 기록은 추정하지 않습니다.</p></div></div><ol>{observableStages.map((stage, index) => {
+          const progress = observedStageProgress(activity, stage);
+          return <li key={stage.key} aria-label={`${stage.label} 단계`} className={`stage-${progress.state}`}>
+            <span className="pipeline-index mono">{String(index + 1).padStart(2, '0')}</span>
+            <span><strong>{stage.label}</strong><small>{stage.description}</small></span>
+            <span className={`state-label state-${progress.state}`}>{progress.label}</span>
+          </li>;
+        })}</ol></section>
         <section className="panel batch-panel"><div className="panel-heading compact"><div><span className="section-index mono">03</span><h2>최근 생성 배치</h2></div><RefreshCw size={13} className="live-refresh-icon" /></div>{liveBatches.length === 0 ? <div className="small-empty">생성 배치가 없습니다.</div> : liveBatches.map((batch) => {
           const completed = batch.progress?.completedQuestions ?? 0;
           const percent = Math.min(100, Math.round((completed / batch.requested_count) * 100));
-          return <button type="button" className={`batch-row ${selectedBatchId === batch.id ? 'selected' : ''}`} key={batch.id} onClick={() => { setActivity(null); setSelectedBatchId(batch.id); }}><span className="mono">{batch.id.slice(0, 8)}</span><strong>{completed}/{batch.requested_count}문항</strong><span className={`state-label state-${batch.state.toLowerCase()}`}>{batch.state}</span><span className="batch-progress"><i style={{ width: `${percent}%` }} /></span></button>;
+          return <button type="button" className={`batch-row ${selectedBatchId === batch.id ? 'selected' : ''}`} key={batch.id} onClick={() => selectGenerationBatch(batch.id)}><span className="mono">{batch.id.slice(0, 8)}</span><strong>{completed}/{batch.requested_count}문항</strong><span className={`state-label state-${batch.state.toLowerCase()}`}>{batch.state}</span><span className="batch-progress"><i style={{ width: `${percent}%` }} /></span></button>;
         })}</section>
         <section className="panel generation-activity"><div className="panel-heading compact"><div><span className="section-index mono">04</span><h2>실시간 생성 기록</h2></div>{activity && <><span className="state-label">{activity.job?.attempts ?? 0}/{activity.job?.max_attempts ?? 0}회</span><span className="state-label">{connectionLabels[stream.status]}</span></>}</div>
           {!selectedBatchId ? <div className="small-empty">확인할 배치를 선택하세요.</div> : !activity ? <div className="small-empty">기록을 불러오는 중입니다.</div> : <div className="activity-body">
             <div className="activity-summary"><span><b>{activity.batch.progress?.completedQuestions ?? 0}</b> 완료</span><span><b>{activity.batch.progress?.failedQuestions ?? 0}</b> 실패</span><span><b>{activity.batch.conditions?.executionMode === 'parallel' ? '병렬' : '순차'}</b> 방식</span></div>
             {error && <div className="generation-failure" role="alert"><strong>실패 원인</strong><p>{error}</p>{activity.job?.last_error_code && <code>{activity.job.last_error_code}</code>}</div>}
             {activity.canResume && <button type="button" className="button secondary" onClick={resumeGeneration}><RotateCcw size={14} /> 미완료 문항 생성 재개</button>}
-            {activity.items.length > 0 && <div className="generation-item-list"><h3>문항별 실행 기록</h3>{activity.items.map((item) => <details key={item.id} open={item.state === 'FAILED'}>
-              <summary><strong>{item.ordinal}번 문항</strong><span className={`state-label state-${item.state.toLowerCase()}`}>{item.state}</span><small className="mono">시도 {item.attempts}회</small></summary>
-              <div className="event-payload">
-                {item.questionPublicId && <p><strong>저장 문항</strong> <span className="mono">{item.questionPublicId}</span></p>}
-                {item.error && <p className="event-error"><strong>{item.error.code ?? 'GENERATION_ITEM_FAILED'} · {item.error.retryable ? '재시도 가능' : '입력·범위 수정 필요'}</strong><br />{item.error.message ?? '문항 생성에 실패했습니다.'}</p>}
-                <details><summary>방향성</summary><JsonBlock value={item.direction} /></details>
-                <details><summary>최근 검색 시도</summary><JsonBlock value={item.latestRetrieval} /></details>
-                <small>최근 변경 {new Date(item.updatedAt).toLocaleString('ko-KR')}</small>
-              </div>
-            </details>)}</div>}
+            {activity.items.length > 0 && <div className="generation-item-list"><h3>문항별 실행 기록</h3>{activity.items.map((item) => {
+              const audit = itemAudits[item.id]?.batchId === selectedBatchId
+                ? itemAudits[item.id]
+                : null;
+              const invocationSummary = item.providerInvocationSummary ?? {
+                total: 0,
+                requested: 0,
+                completed: 0,
+                failed: 0,
+                abandoned: 0,
+              };
+              return <details
+                key={item.id}
+                open={item.state === 'FAILED' ? true : undefined}
+                onToggle={(event) => {
+                  if (event.currentTarget.open) void loadItemAudit(item.id);
+                }}
+              >
+                <summary><strong>{item.ordinal}번 문항</strong><span className={`state-label state-${item.state.toLowerCase()}`}>{item.state}</span><small className="mono">시도 {item.attempts}회</small></summary>
+                <div className="event-payload">
+                  {item.questionPublicId && <p><strong>저장 문항</strong> <span className="mono">{item.questionPublicId}</span></p>}
+                  {item.error && <p className="event-error"><strong>{item.error.code ?? 'GENERATION_ITEM_FAILED'} · {item.error.retryable ? '재시도 가능' : '입력·범위 수정 필요'}</strong><br />{item.error.message ?? '문항 생성에 실패했습니다.'}</p>}
+                  <details><summary>방향성</summary><DirectionRecord value={item.direction} /></details>
+                  <details><summary>최근 검색 요약</summary><RetrievalSummary value={item.latestRetrieval} /></details>
+                  <section aria-label={`${item.ordinal}번 문항 모델 호출 요약`}>
+                    <h4>실제 모델 호출 {invocationSummary.total}건</h4>
+                    <p className="run-meta mono">
+                      요청 중 {invocationSummary.requested} · 완료 {invocationSummary.completed} · 실패 {invocationSummary.failed}
+                      {' '}· 중단 {invocationSummary.abandoned ?? 0}
+                    </p>
+                  </section>
+                  <button
+                    type="button"
+                    className="button secondary"
+                    disabled={audit?.loading}
+                    onClick={() => void loadItemAudit(item.id, 0, true)}
+                  >
+                    {audit?.loading && !audit.loaded
+                      ? '상세 감사 기록 불러오는 중'
+                      : audit?.loaded
+                        ? '상세 감사 기록 새로고침'
+                        : '상세 감사 기록 불러오기'}
+                  </button>
+                  {audit?.error && <p className="event-error" role="alert">{audit.error}</p>}
+                  {audit?.loaded && <section aria-label={`${item.ordinal}번 문항 상세 감사 기록`}>
+                    <details><summary>검색 감사 상세</summary><RetrievalRecord value={audit.latestRetrieval} /></details>
+                    <h4>
+                      불러온 모델 호출 {audit.providerInvocations.length}/{audit.pagination?.total ?? audit.providerInvocations.length}건
+                    </h4>
+                    {audit.providerInvocations.length
+                      ? audit.providerInvocations.map((invocation) => <ProviderInvocationRecord key={invocation.id} invocation={invocation} />)
+                      : <p>저장된 Provider 호출 기록이 없습니다. legacy partial 기록은 추정하지 않습니다.</p>}
+                    {audit.pagination?.nextOffset != null && <button
+                      type="button"
+                      className="button secondary"
+                      disabled={audit.loading}
+                      onClick={() => void loadItemAudit(item.id, audit.pagination!.nextOffset!)}
+                    >
+                      {audit.loading ? '모델 호출 불러오는 중' : '모델 호출 더 보기'}
+                    </button>}
+                  </section>}
+                  <small>최근 변경 {new Date(item.updatedAt).toLocaleString('ko-KR')}</small>
+                </div>
+              </details>;
+            })}</div>}
             <div className="generation-event-list">{activity.events.length === 0 ? <p className="empty-events">아직 기록이 없습니다.</p> : [...activity.events].reverse().map((event) => <details key={event.id} open={event.event_type.includes('FAILED')}><summary><span className={`event-dot ${event.event_type.includes('FAILED') ? 'failed' : ''}`} /><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></summary><div className="event-payload">
               {event.event_type === 'QUESTION_GENERATION_COMPLETED' && <><h4>{String(event.payload.ordinal)}번 문항</h4><p>{String(event.payload.questionText ?? '')}</p><strong>답안</strong><p>{String(event.payload.answerText ?? '')}</p></>}
               {event.event_type.includes('FAILED') && <p className="event-error">{String(event.payload.message ?? event.payload.code ?? '실패 원인이 기록되지 않았습니다.')}</p>}

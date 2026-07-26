@@ -6,7 +6,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { GenerationWorkspace } from '@/components/generation/generation-workspace';
 import { ReviewWorkspace } from '@/components/review/review-workspace';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
-import { SourcesWorkspace } from '@/components/sources/sources-workspace';
+import { SourcesWorkspace, sourceStageState } from '@/components/sources/sources-workspace';
 import { DocumentLabWorkspace } from '@/components/document-lab/document-lab-workspace';
 import { RunController } from '@/components/runs/run-controller';
 import { SettingsWorkspace } from '@/components/settings/settings-workspace';
@@ -18,14 +18,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test('document lab exposes its exact parser settings before upload', () => {
+test('document lab identifies the active research profile before upload without inventing settings', () => {
   render(<DocumentLabWorkspace />);
   expect(screen.getByRole('heading', { name: 'Document Lab' })).toBeInTheDocument();
   expect(screen.getByLabelText('테스트 파일')).toBeInTheDocument();
-  expect(screen.getByText('Enhanced')).toBeInTheDocument();
-  expect(screen.getByText('ocr=force')).toBeInTheDocument();
-  expect(screen.getByText('base64_encoding=["table","figure","chart","equation"]')).toBeInTheDocument();
-  expect(screen.getByText("output_formats=['html']")).toBeInTheDocument();
+  expect(screen.getByText('활성 연구 프로필 사용')).toBeInTheDocument();
+  expect(screen.queryByText('Enhanced')).not.toBeInTheDocument();
+  expect(screen.queryByText('ocr=force')).not.toBeInTheDocument();
   expect(screen.getByText('원본 페이지')).toBeInTheDocument();
   expect(screen.getByText('변환 HTML')).toBeInTheDocument();
   expect(screen.getByRole('tab', { name: '원본 JSON' })).toBeInTheDocument();
@@ -46,6 +45,7 @@ test('document lab uploads one file and switches every result pane by PDF page',
       ocr: 'force',
       base64_encoding: ['footnote'],
       output_formats: ['html'],
+      rasterization: { format: 'png', dpi: 220 },
     },
     pages: [
       {
@@ -88,6 +88,11 @@ test('document lab uploads one file and switches every result pane by PDF page',
   expect(request.body).toBeInstanceOf(FormData);
   expect((request.body as FormData).get('file')).toBe(file);
   expect(await screen.findByText('MOCK')).toBeInTheDocument();
+  expect(screen.getByText('mode=enhanced')).toBeInTheDocument();
+  expect(screen.getByText('ocr=force')).toBeInTheDocument();
+  expect(screen.getByText('base64_encoding=["footnote"]')).toBeInTheDocument();
+  expect(screen.getByText('output_formats=["html"]')).toBeInTheDocument();
+  expect(screen.getByText('format=png · dpi=220')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Page 01' })).toHaveAttribute('aria-pressed', 'true');
   expect(screen.getByAltText('원본 페이지 1')).toHaveAttribute('src', responseBody.pages[0].dataUrl);
 
@@ -153,9 +158,9 @@ test('document lab clears stale results and resets panes when a different file i
   expect(screen.getByRole('tab', { name: 'Elements' })).toHaveAttribute('aria-selected', 'true');
 });
 
-test('document lab locks file controls while parsing and shows an actionable server error', async () => {
-  let resolveFetch!: (value: { ok: boolean; json: () => Promise<{ message: string }> }) => void;
-  const fetchPromise = new Promise<{ ok: boolean; json: () => Promise<{ message: string }> }>((resolve) => {
+test('document lab locks file controls while parsing and preserves structured provider errors', async () => {
+  let resolveFetch!: (value: { ok: boolean; json: () => Promise<Record<string, unknown>> }) => void;
+  const fetchPromise = new Promise<{ ok: boolean; json: () => Promise<Record<string, unknown>> }>((resolve) => {
     resolveFetch = resolve;
   });
   vi.stubGlobal('fetch', vi.fn(() => fetchPromise));
@@ -169,9 +174,21 @@ test('document lab locks file controls while parsing and shows an actionable ser
   expect(input).toBeDisabled();
   expect(screen.getByRole('button', { name: '파싱 중…' })).toBeDisabled();
 
-  resolveFetch({ ok: false, json: async () => ({ message: 'UPSTAGE_API_KEY is required.' }) });
+  resolveFetch({ ok: false, json: async () => ({
+    code: 'DOCUMENT_PAGE_PARSE_FAILED',
+    message: 'Upstage request was rejected.',
+    page: 3,
+    requestId: 'upstage-request-123',
+    status: 429,
+    category: 'RATE_LIMIT',
+  }) });
   const alert = await screen.findByRole('alert');
-  expect(alert).toHaveTextContent('UPSTAGE_API_KEY is required.');
+  expect(alert).toHaveTextContent('Upstage request was rejected.');
+  expect(alert).toHaveTextContent('DOCUMENT_PAGE_PARSE_FAILED');
+  expect(alert).toHaveTextContent('페이지 3');
+  expect(alert).toHaveTextContent('upstage-request-123');
+  expect(alert).toHaveTextContent('HTTP 429');
+  expect(alert).toHaveTextContent('RATE_LIMIT');
   expect(alert).toHaveTextContent('파일 형식과 서버 설정을 확인한 뒤 같은 파일로 다시 시도하세요.');
   expect(input).not.toBeDisabled();
 });
@@ -184,6 +201,29 @@ test('source workspace exposes PDF upload and each processing stage', () => {
   expect(screen.getByText('HTML 검수')).toBeInTheDocument();
   expect(screen.getByText('청크')).toBeInTheDocument();
   expect(screen.getByText('임베딩')).toBeInTheDocument();
+});
+
+test('source processing stages are derived from machine status and failed-stage codes', () => {
+  const source = {
+    id: 'source-stage',
+    original_name: 'science.pdf',
+    subject: '과학',
+    grade: '중2',
+    byte_size: 10,
+    status: 'CHUNKING',
+    failed_stage: null,
+    created_at: '2026-07-20T10:00:00Z',
+    current_job_id: 'job-stage',
+    current_job_state: 'LEASED',
+  };
+
+  expect(sourceStageState(source, 'parse')).toBe('완료');
+  expect(sourceStageState(source, 'html')).toBe('완료');
+  expect(sourceStageState(source, 'chunk')).toBe('처리 중');
+  expect(sourceStageState(source, 'embedding')).toBe('대기');
+  expect(sourceStageState({ ...source, status: 'FAILED', failed_stage: 'CHUNKING' }, 'chunk')).toBe('실패');
+  expect(sourceStageState({ ...source, status: 'FAILED', failed_stage: 'EMBEDDING' }, 'embedding')).toBe('실패');
+  expect(sourceStageState({ ...source, status: 'FAILED', failed_stage: 'UNKNOWN_LEGACY_STAGE' }, 'chunk')).toBe('기록 없음');
 });
 
 test('run detail exposes exact prompts, responses, failures, scores, and the evaluation profile', () => {
@@ -200,6 +240,41 @@ test('run detail exposes exact prompts, responses, failures, scores, and the eva
   expect(screen.getByText('모델 응답')).toBeInTheDocument();
   expect(screen.getByText('점수와 판정 근거')).toBeInTheDocument();
   expect(screen.getByText(/생성 시점 스냅샷 출처가 검증되지 않았습니다/)).toBeInTheDocument();
+});
+
+test('run detail separates execution completion from scoring coverage', () => {
+  class EventSourceStub { addEventListener() {} removeEventListener() {} close() {} }
+  vi.stubGlobal('EventSource', EventSourceStub);
+  const baseItem = {
+    attempts: 1,
+    errorCode: null,
+    errorMessage: null,
+    questionText: '질문',
+    providerKey: 'gemini',
+    displayName: 'Gemini',
+    modelId: 'gemini-test',
+    blindId: 'M01',
+    request: { prompt: '질문' },
+    judgeInvocations: [],
+    requiredMetricKeys: ['accuracy'],
+  };
+  render(<RunController
+    initialRun={{ id:'run-coverage', public_id:'RUN-COVERAGE', title:'진행률 분리', state:'COMPLETED', total_items:3, completed_items:2, failed_items:1, dataset_version:'actual-v1', score_version:'score-v1', price_profile_version:'price-v1', created_at:'2026-07-22T00:00:00Z' }}
+    models={[]}
+    profile={{ version:'score-v1', title:'평가', metrics:['accuracy'], rubricPrompt:'평가', judgeProvider:'gemini', judgeModel:'gemini-test', contentHash:'hash', dynamicMetrics:[] }}
+    initialItems={[
+      { ...baseItem, id:'item-1', state:'SUCCEEDED', questionPublicId:'Q-1', response:{ text:'응답 1', raw:{}, requestId:'r1', retryHistory:[] }, scores:[{ metricKey:'accuracy', value:0.8, label:'GOOD', rationale:'근거', evidence:[] }] },
+      { ...baseItem, id:'item-2', state:'SUCCEEDED', questionPublicId:'Q-2', response:{ text:'응답 2', raw:{}, requestId:'r2', retryHistory:[] }, scores:[] },
+      { ...baseItem, id:'item-3', state:'FAILED', questionPublicId:'Q-3', response:null, scores:[] },
+    ]}
+  />);
+
+  const progress = screen.getByRole('region', { name: '실행 및 채점 진행률' });
+  expect(within(progress).getByText('실행 진행')).toBeInTheDocument();
+  expect(within(progress).getByText('3 / 3')).toBeInTheDocument();
+  expect(within(progress).getByText('채점 범위')).toBeInTheDocument();
+  expect(within(progress).getByText('1 / 2 지표')).toBeInTheDocument();
+  expect(within(progress).getByText(/필수 지표별 실제 저장률/)).toBeInTheDocument();
 });
 
 test('settings exposes the complete evaluation profile configuration', () => {
@@ -287,6 +362,7 @@ test('result analytics renders comprehensive charts and filters models', () => {
   expect(screen.getByRole('heading', { name:'성능·효율' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name:'문항별 히트맵' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name:'점수 분포' })).toBeInTheDocument();
+  expect(screen.getByText('왼쪽 위에 가까울수록 빠르면서 종합점수가 높습니다.')).toBeInTheDocument();
   const exaone = screen.getByLabelText('M02 모델 표시');
   fireEvent.click(exaone);
   expect(exaone).not.toBeChecked();
@@ -363,11 +439,12 @@ test('source activity exposes the immutable document and embedding execution pro
   expect(within(audit).getAllByText('AT_CREATION_VERIFIED')).toHaveLength(2);
 });
 
-test('question generation exposes source scope and the nine-stage pipeline', () => {
+test('question generation exposes source scope and observable generation stages', () => {
   render(<GenerationWorkspace sources={[]} batches={[]} />);
   expect(screen.getByRole('heading', { name: '질문 생성' })).toBeInTheDocument();
   expect(screen.getByRole('group', { name: '교과서와 목차 선택' })).toBeInTheDocument();
-  expect(screen.getByText('9단계 생성 파이프라인')).toBeInTheDocument();
+  expect(screen.getByText('실제 생성 단계')).toBeInTheDocument();
+  expect(screen.getByText(/배치·문항·이벤트에 저장된 단계만 표시/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '문항 생성 시작' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'AI 지시 프롬프트 미리보기' })).toBeInTheDocument();
 });
@@ -382,6 +459,243 @@ test('question prompt preview reacts to purpose, format, and high difficulty', (
   expect(preview).toHaveTextContent('수능 고난도');
   expect(preview).toHaveTextContent('대표 오개념');
   expect(preview).toHaveTextContent('5개 선택지');
+});
+
+test('question generation lazily loads full retrieval and provider audit with pagination', async () => {
+  class EventSourceStub { addEventListener() {} removeEventListener() {} close() {} }
+  vi.stubGlobal('EventSource', EventSourceStub);
+  const batchId = 'batch-observable';
+  const activity = {
+    batch: {
+      id: batchId,
+      state: 'RUNNING',
+      requested_count: 2,
+      created_at: '2026-07-26T00:00:00Z',
+      conditions: { executionMode: 'parallel' },
+      progress: { completedQuestions: 1, failedQuestions: 0 },
+    },
+    job: { state: 'LEASED', attempts: 1, max_attempts: 3, last_error_code: null, last_error_message: null },
+    events: [
+      { id:'e1', event_type:'QUESTION_DIRECTION_COMPLETED', payload:{ ordinal:1 }, created_at:'2026-07-26T00:00:01Z' },
+      { id:'e2', event_type:'QUESTION_DIRECTION_COMPLETED', payload:{ ordinal:2 }, created_at:'2026-07-26T00:00:02Z' },
+      { id:'e3', event_type:'QUESTION_RETRIEVAL_COMPLETED', payload:{ ordinal:1 }, created_at:'2026-07-26T00:00:03Z' },
+      { id:'e4', event_type:'QUESTION_RETRIEVAL_STARTED', payload:{ ordinal:2 }, created_at:'2026-07-26T00:00:04Z' },
+      { id:'e5', event_type:'QUESTION_GENERATION_COMPLETED', payload:{ ordinal:1 }, created_at:'2026-07-26T00:00:05Z' },
+    ],
+    questions: [],
+    canResume: false,
+    eventCursor: 'e5',
+    items: [
+      {
+        id:'item-1', ordinal:1, state:'COMPLETED', attempts:1, retryable:false,
+        direction:{ directionSummary:'속력 개념에서 가속도 관계를 추론' },
+        error:null,
+        latestRetrieval:{
+          id:'retrieval-1', attempt:1, queryText:'속력과 가속도의 선수 관계',
+          selectedChunkCount:1,
+          createdAt:'2026-07-26T00:00:03Z',
+        },
+        providerInvocationSummary:{ total:2, requested:0, completed:2, failed:0, abandoned:0 },
+        questionId:'question-1', questionPublicId:'Q-1',
+        startedAt:'2026-07-26T00:00:00Z', completedAt:'2026-07-26T00:00:05Z', updatedAt:'2026-07-26T00:00:05Z',
+      },
+      {
+        id:'item-2', ordinal:2, state:'RUNNING', attempts:1, retryable:true,
+        direction:{ directionSummary:'힘 개념을 이용해 운동 변화를 설명' },
+        error:null, latestRetrieval:null,
+        providerInvocationSummary:{ total:0, requested:0, completed:0, failed:0, abandoned:0 },
+        questionId:null, questionPublicId:null,
+        startedAt:'2026-07-26T00:00:00Z', completedAt:null, updatedAt:'2026-07-26T00:00:04Z',
+      },
+    ],
+  };
+  const auditPages = [{
+    batchId,
+    itemId:'item-1',
+    latestRetrieval:{
+      id:'retrieval-1', attempt:1, queryText:'속력과 가속도의 선수 관계',
+      candidateScope:{ tocEntryIds:['unit-1'] },
+      selectedChunks:[{
+        chunkId:'chunk-hidden-123', rank:1, page:12, unit:'운동과 에너지',
+        content:'속력이 변하면 가속도가 생긴다.', source:'semantic', similarity:0.91,
+      }],
+      createdAt:'2026-07-26T00:00:03Z',
+    },
+    providerInvocations:[{
+      id:'invocation-direction-1', itemAttempt:1, stage:'DIRECTION', state:'COMPLETED',
+      provider:'gemini', modelId:'gemini-test',
+      requestSnapshot:{ system:'선수관계 방향을 설계하라.', prompt:'1번 문항 검색 방향을 JSON으로 반환하라.', maxOutputTokens:2048 },
+      responseSnapshot:{ text:'{"searchQuery":"속력과 가속도"}' },
+      rawResponse:{ candidates:[{ finishReason:'STOP' }] },
+      requestId:'provider-request-1', modelSnapshot:'gemini-test-20260727',
+      finishReason:'STOP', inputTokens:120, outputTokens:30, latencyMs:456,
+      error:null, startedAt:'2026-07-26T00:00:01Z', completedAt:'2026-07-26T00:00:02Z',
+    }],
+    pagination:{ limit:20, offset:0, total:21, nextOffset:20 },
+  }, {
+    batchId,
+    itemId:'item-1',
+    latestRetrieval:{
+      id:'retrieval-1', attempt:1, queryText:'속력과 가속도의 선수 관계',
+      candidateScope:{ tocEntryIds:['unit-1'] },
+      selectedChunks:[{
+        chunkId:'chunk-hidden-123', rank:1, page:12, unit:'운동과 에너지',
+        content:'속력이 변하면 가속도가 생긴다.', source:'semantic', similarity:0.91,
+      }],
+      createdAt:'2026-07-26T00:00:03Z',
+    },
+    providerInvocations:[{
+      id:'invocation-question-1', itemAttempt:1, stage:'QUESTION', state:'COMPLETED',
+      provider:'gemini', modelId:'gemini-test',
+      requestSnapshot:{ system:'교과서 근거만 사용하라.', prompt:'실제 문항을 생성하라.', maxOutputTokens:8192 },
+      responseSnapshot:{ text:'{"questionText":"가속도를 설명하라"}' },
+      rawResponse:{ candidates:[{ finishReason:'STOP' }], page:2 },
+      requestId:'provider-request-2', modelSnapshot:'gemini-test-20260727',
+      finishReason:'STOP', inputTokens:240, outputTokens:90, latencyMs:654,
+      error:null, startedAt:'2026-07-26T00:00:03Z', completedAt:'2026-07-26T00:00:05Z',
+    }],
+    pagination:{ limit:20, offset:20, total:21, nextOffset:null },
+  }];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes(`/api/generation/${batchId}/items/item-1/audit`)) {
+      const offset = Number(new URL(url, 'http://localhost').searchParams.get('offset') ?? 0);
+      return { ok:true, json:async () => auditPages[offset === 0 ? 0 : 1] };
+    }
+    return { ok:true, json:async () => activity };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<GenerationWorkspace sources={[]} batches={[activity.batch]} />);
+
+  const direction = await screen.findByRole('listitem', { name:'방향성 설계 단계' });
+  expect(direction).toHaveTextContent('2/2 완료');
+  const retrieval = screen.getByRole('listitem', { name:'문항별 근거 검색 단계' });
+  expect(retrieval).toHaveTextContent('1/2 완료');
+  expect(retrieval).toHaveTextContent('1 진행');
+  const generation = screen.getByRole('listitem', { name:'질문·답안 생성 단계' });
+  expect(generation).toHaveTextContent('1/2 완료');
+
+  expect(screen.getByText('속력 개념에서 가속도 관계를 추론')).toBeInTheDocument();
+  expect(screen.getByText('속력과 가속도의 선수 관계')).toBeInTheDocument();
+  expect(screen.getByText('선택 근거 1개')).toBeInTheDocument();
+  expect(screen.getByText('실제 모델 호출 2건')).toBeInTheDocument();
+  expect(screen.getAllByText(/중단 0/)).toHaveLength(2);
+  expect(screen.queryByText('운동과 에너지')).not.toBeInTheDocument();
+  expect(screen.queryByText('선수관계 방향을 설계하라.')).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/audit'))).toBe(false);
+
+  const itemDetails = screen.getByText('1번 문항', { selector:'strong' }).closest('details')!;
+  itemDetails.open = true;
+  fireEvent(itemDetails, new Event('toggle'));
+
+  expect(await screen.findByText('운동과 에너지')).toBeInTheDocument();
+  expect(screen.getByText('p.12')).toBeInTheDocument();
+  expect(screen.getByText('chunk-hidden-123')).toBeInTheDocument();
+  expect(screen.getByText('실제 방향성 프롬프트')).toBeInTheDocument();
+  expect(screen.getByText('선수관계 방향을 설계하라.')).toBeInTheDocument();
+  expect(screen.getByText('1번 문항 검색 방향을 JSON으로 반환하라.')).toBeInTheDocument();
+  expect(screen.getByText('{"searchQuery":"속력과 가속도"}')).toBeInTheDocument();
+  expect(screen.getByText('Provider 원시 응답')).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith(
+    `/api/generation/${batchId}/items/item-1/audit?limit=20&offset=0`,
+    { cache:'no-store' },
+  );
+
+  fireEvent.click(screen.getByRole('button', { name:'모델 호출 더 보기' }));
+  expect(await screen.findByText('실제 문항을 생성하라.')).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith(
+    `/api/generation/${batchId}/items/item-1/audit?limit=20&offset=20`,
+    { cache:'no-store' },
+  );
+});
+
+test('question generation ignores an old audit response after switching A to B and back to A', async () => {
+  class EventSourceStub { addEventListener() {} removeEventListener() {} close() {} }
+  vi.stubGlobal('EventSource', EventSourceStub);
+  const batchA = 'batch-a-111';
+  const batchB = 'batch-b-222';
+  const activityFor = (batchId: string, direction: string) => ({
+    batch: {
+      id:batchId, state:'RUNNING', requested_count:1,
+      created_at:'2026-07-26T00:00:00Z',
+      conditions:{ executionMode:'parallel' },
+      progress:{ completedQuestions:0, failedQuestions:0 },
+    },
+    job:{ state:'LEASED', attempts:1, max_attempts:3, last_error_code:null, last_error_message:null },
+    events:[],
+    questions:[],
+    canResume:false,
+    eventCursor:'0',
+    items:[{
+      id:'shared-item', ordinal:1, state:'RUNNING', attempts:1, retryable:true,
+      direction:{ directionSummary:direction },
+      error:null, latestRetrieval:null,
+      providerInvocationSummary:{ total:1, requested:0, completed:1, failed:0, abandoned:0 },
+      questionId:null, questionPublicId:null,
+      startedAt:'2026-07-26T00:00:00Z', completedAt:null, updatedAt:'2026-07-26T00:00:01Z',
+    }],
+  });
+  const activityA = activityFor(batchA, 'A 방향');
+  const activityB = activityFor(batchB, 'B 방향');
+  let resolveOldAudit!: (value: { ok: boolean; json: () => Promise<unknown> }) => void;
+  const oldAudit = new Promise<{ ok: boolean; json: () => Promise<unknown> }>(
+    (resolve) => { resolveOldAudit = resolve; },
+  );
+  let auditACalls = 0;
+  const auditPage = (prompt: string) => ({
+    batchId:batchA,
+    itemId:'shared-item',
+    latestRetrieval:null,
+    providerInvocations:[{
+      id:`invocation-${prompt}`, itemAttempt:1, stage:'DIRECTION', state:'COMPLETED',
+      provider:'gemini', modelId:'gemini-test',
+      requestSnapshot:{ system:'system', prompt },
+      responseSnapshot:{ text:'response' }, rawResponse:{ marker:prompt },
+      requestId:null, modelSnapshot:null, finishReason:'STOP',
+      inputTokens:1, outputTokens:1, latencyMs:1, error:null,
+      startedAt:'2026-07-26T00:00:00Z', completedAt:'2026-07-26T00:00:01Z',
+    }],
+    pagination:{ limit:20, offset:0, total:1, nextOffset:null },
+  });
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes(`/api/generation/${batchA}/items/shared-item/audit`)) {
+      auditACalls += 1;
+      if (auditACalls === 1) return oldAudit;
+      return { ok:true, json:async () => auditPage('FRESH_A_PROMPT') };
+    }
+    if (url.includes(`/api/generation/${batchA}/activity`)) {
+      return { ok:true, json:async () => activityA };
+    }
+    if (url.includes(`/api/generation/${batchB}/activity`)) {
+      return { ok:true, json:async () => activityB };
+    }
+    return { ok:true, json:async () => ({ items:[activityA.batch, activityB.batch] }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<GenerationWorkspace sources={[]} batches={[activityA.batch, activityB.batch]} />);
+  await screen.findByText('A 방향');
+  const firstItem = screen.getByText('1번 문항', { selector:'strong' }).closest('details')!;
+  firstItem.open = true;
+  fireEvent(firstItem, new Event('toggle'));
+  await waitFor(() => expect(auditACalls).toBe(1));
+
+  fireEvent.click(screen.getByRole('button', { name:/batch-b-/ }));
+  await screen.findByText('B 방향');
+  fireEvent.click(screen.getByRole('button', { name:/batch-a-/ }));
+  await screen.findByText('A 방향');
+  const currentItem = screen.getByText('1번 문항', { selector:'strong' }).closest('details')!;
+  currentItem.open = true;
+  fireEvent(currentItem, new Event('toggle'));
+  expect(await screen.findByText('FRESH_A_PROMPT')).toBeInTheDocument();
+
+  resolveOldAudit({ ok:true, json:async () => auditPage('STALE_A_PROMPT') });
+  await waitFor(() => expect(auditACalls).toBe(2));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.queryByText('STALE_A_PROMPT')).not.toBeInTheDocument();
+  expect(screen.getByText('FRESH_A_PROMPT')).toBeInTheDocument();
 });
 
 test('question generation selects every textbook unit and submits parallel mode', async () => {

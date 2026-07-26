@@ -24,3 +24,37 @@ test('never retries authentication and invalid request errors', async () => {
   }, { maxAttempts: 4, sleep: async () => undefined })).rejects.toMatchObject({ kind: 'AUTH' });
   expect(attempts).toBe(1);
 });
+
+test('interrupts a provider backoff immediately when the owning job is cancelled', async () => {
+  const controller = new AbortController();
+  const reason = new Error('job cancelled');
+  let signalSleepStarted!: () => void;
+  const sleepStarted = new Promise<void>((resolve) => {
+    signalSleepStarted = resolve;
+  });
+  let releaseSleep!: () => void;
+  const sleeping = new Promise<void>((resolve) => {
+    releaseSleep = resolve;
+  });
+
+  const retried = withProviderRetry(async () => {
+    throw new ProviderError({
+      kind:'RATE_LIMIT',
+      message:'limited',
+      retryable:true,
+      status:429,
+    });
+  }, {
+    maxAttempts:3,
+    signal:controller.signal,
+    sleep:async () => {
+      signalSleepStarted();
+      await sleeping;
+    },
+  });
+
+  await sleepStarted;
+  controller.abort(reason);
+  await expect(retried).rejects.toBe(reason);
+  releaseSleep();
+});

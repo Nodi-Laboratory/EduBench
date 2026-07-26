@@ -78,6 +78,7 @@ export async function executeRunItem(
   item: RunItemRecord,
   workerId: string,
   provider: ModelProvider,
+  executionOptions: { signal?:AbortSignal } = {},
 ): Promise<void> {
   const { context, evidence } = await loadContext(item.id);
   if (context.state !== 'LEASED' || context.lease_owner !== workerId) {
@@ -148,6 +149,7 @@ export async function executeRunItem(
     leaseAbort.signal,
     controlAbort.signal,
     AbortSignal.timeout(requestTimeoutMs),
+    ...(executionOptions.signal ? [executionOptions.signal] : []),
   ]);
   const heartbeat = setInterval(() => { renewRunItemLease(item.id, workerId, leaseMs).then((renewed) => { if (!renewed) leaseAbort.abort(new Error('RUN_ITEM_LEASE_LOST')); }).catch(() => leaseAbort.abort(new Error('RUN_ITEM_LEASE_RENEWAL_FAILED'))); }, 30_000);
   const controlPoll = setInterval(() => {
@@ -157,14 +159,29 @@ export async function executeRunItem(
   }, 500);
   let generated;
   try {
+    signal.throwIfAborted();
     generated = await withProviderRetry(() => provider.generate(request, signal), {
       maxAttempts: 3,
       baseDelayMs: provider.key === 'exaone'
         ? Number(process.env.EXAONE_RETRY_BASE_DELAY_MS ?? 15_000)
         : 500,
-      onRetry: ({ attempt, delayMs, error }) => retryHistory.push({ attempt, delayMs, kind: error.kind, status: error.status, requestId: error.requestId }),
+      signal,
+      onRetry: ({ attempt, delayMs, error }) => {
+        retryHistory.push({
+          attempt,
+          delayMs,
+          kind:error.kind,
+          status:error.status,
+          requestId:error.requestId,
+        });
+      },
     });
+    signal.throwIfAborted();
   } catch (error) {
+    if (executionOptions.signal?.aborted) {
+      await interruptRunItem(item.id, workerId);
+      return;
+    }
     const state = await db.query<{ state: string }>('select state from benchmark_runs where id=$1', [context.benchmark_run_id]);
     if (state.rows[0]?.state === 'STOPPING') {
       await interruptRunItem(item.id, workerId);

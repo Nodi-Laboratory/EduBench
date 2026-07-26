@@ -278,10 +278,13 @@ export async function renewJobLease(lease: JobLease, leaseMs: number): Promise<b
 
 export async function withJobLeaseHeartbeat<T>(
   lease: JobLease,
-  options: { leaseMs: number; heartbeatMs?: number },
+  options: { leaseMs: number; heartbeatMs?: number; signal?:AbortSignal },
   operation: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abortFromParent();
+  else options.signal?.addEventListener('abort', abortFromParent, { once:true });
   const heartbeatMs = options.heartbeatMs ?? Math.min(60_000, Math.max(1, Math.floor(options.leaseMs / 3)));
   let renewal = Promise.resolve();
   const timer = setInterval(() => {
@@ -293,11 +296,13 @@ export async function withJobLeaseHeartbeat<T>(
   }, heartbeatMs);
 
   try {
+    controller.signal.throwIfAborted();
     const result = await operation(controller.signal);
     controller.signal.throwIfAborted();
     return result;
   } finally {
     clearInterval(timer);
+    options.signal?.removeEventListener('abort', abortFromParent);
     await renewal;
   }
 }
@@ -327,7 +332,53 @@ export async function completeJob(
   });
 }
 
-type JobFailure = { code: string; message: string; retryDelayMs: number; retryable?: boolean };
+export async function releaseJobForShutdown(lease: JobLease): Promise<void> {
+  await withTransaction(async (client) => {
+    const released = await client.query<{
+      attempts:number;
+      max_attempts:number;
+    }>(
+      `update jobs
+          set state='RETRY_WAIT',
+              max_attempts=max_attempts+1,
+              available_at=now(),
+              lease_owner=null,
+              lease_expires_at=null,
+              completed_at=null,
+              last_error_code='WORKER_SHUTDOWN',
+              last_error_message='작업자 종료 신호로 실행을 중단했으며 다음 작업자가 이어서 처리합니다.',
+              updated_at=now()
+        where id=$1
+          and state='LEASED'
+          and lease_owner=$2
+          and attempts=$3
+          and lease_expires_at>now()
+        returning attempts,max_attempts`,
+      [lease.jobId, lease.workerId, lease.attempt],
+    );
+    if (!released.rows[0]) {
+      throw new DomainError(
+        'JOB_LEASE_MISMATCH',
+        '종료 작업의 lease 소유자가 일치하지 않습니다.',
+        lease,
+      );
+    }
+    await appendEvent(client, lease.jobId, 'JOB_RELEASED_ON_SHUTDOWN', {
+      workerId:lease.workerId,
+      interruptedAttempt:lease.attempt,
+      preservedAttempts:released.rows[0].attempts,
+      extendedMaxAttempts:released.rows[0].max_attempts,
+    });
+  });
+}
+
+type JobFailure = {
+  code: string;
+  message: string;
+  retryDelayMs: number;
+  retryable?: boolean;
+  details?: Record<string, unknown>;
+};
 
 export async function failJob(lease: JobLease, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
 export async function failJob(jobId: string, workerId: string, error: JobFailure): Promise<'RETRY_WAIT' | 'TERMINAL_FAILED'>;
@@ -368,6 +419,7 @@ export async function failJob(
       code: error.code,
       retryable: error.retryable ?? true,
       retryDelayMs: error.retryDelayMs,
+      details:error.details ?? null,
     });
     return state;
   });

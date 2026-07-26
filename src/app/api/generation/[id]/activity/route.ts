@@ -54,8 +54,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     retrieval_id: string | null;
     retrieval_attempt: number | null;
     retrieval_query_text: string | null;
-    retrieval_candidate_scope: Record<string, unknown> | null;
-    retrieval_selected_chunks: unknown[] | null;
+    retrieval_selected_chunk_count: number | null;
     retrieval_created_at: string | null;
     question_id: string | null;
     question_public_id: string | null;
@@ -65,13 +64,12 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
             item.started_at,item.completed_at,item.created_at,item.updated_at,
             retrieval.id as retrieval_id,retrieval.attempt as retrieval_attempt,
             retrieval.query_text as retrieval_query_text,
-            retrieval.candidate_scope as retrieval_candidate_scope,
-            retrieval.selected_chunks as retrieval_selected_chunks,
+            jsonb_array_length(retrieval.selected_chunks) as retrieval_selected_chunk_count,
             retrieval.created_at as retrieval_created_at,
             question.id as question_id,question.public_id as question_public_id
        from generation_items item
        left join lateral (
-         select id,attempt,query_text,candidate_scope,selected_chunks,created_at
+         select id,attempt,query_text,selected_chunks,created_at
            from generation_retrievals
           where generation_item_id=item.id
           order by attempt desc,created_at desc
@@ -83,6 +81,34 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       where item.generation_batch_id=$1
       order by item.ordinal`,
     [id],
+  );
+  const invocationRows = await client.query<{
+    generation_item_id: string;
+    total: number;
+    requested: number;
+    completed: number;
+    failed: number;
+    abandoned: number;
+  }>(
+    `select generation_item_id,
+            count(*)::int as total,
+            count(*) filter (where state='REQUESTED')::int as requested,
+            count(*) filter (where state='COMPLETED')::int as completed,
+            count(*) filter (where state='FAILED')::int as failed,
+            count(*) filter (where state='ABANDONED')::int as abandoned
+       from generation_provider_invocations
+      where generation_batch_id=$1
+      group by generation_item_id`,
+    [id],
+  );
+  const invocationsByItem = new Map(
+    invocationRows.rows.map((invocation) => [invocation.generation_item_id, {
+      total: invocation.total,
+      requested: invocation.requested,
+      completed: invocation.completed,
+      failed: invocation.failed,
+      abandoned: invocation.abandoned,
+    }]),
   );
   const activeJob = await client.query<{ active: boolean }>(
     `select exists(
@@ -113,10 +139,16 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       id: item.retrieval_id,
       attempt: item.retrieval_attempt,
       queryText: item.retrieval_query_text,
-      candidateScope: item.retrieval_candidate_scope,
-      selectedChunks: item.retrieval_selected_chunks,
+      selectedChunkCount: item.retrieval_selected_chunk_count ?? 0,
       createdAt: item.retrieval_created_at,
     } : null,
+    providerInvocationSummary: invocationsByItem.get(item.id) ?? {
+      total: 0,
+      requested: 0,
+      completed: 0,
+      failed: 0,
+      abandoned: 0,
+    },
     questionId: item.question_id,
     questionPublicId: item.question_public_id,
     startedAt: item.started_at,

@@ -46,6 +46,59 @@ test('writes one activity envelope with an exact bigint SSE id and closes on req
   );
 });
 
+test('redacts full retrieval content from generation SSE envelopes', async () => {
+  const abort = new AbortController();
+  const readEvents = vi.fn(async () => {
+    setTimeout(() => abort.abort(), 0);
+    return [{
+      id: parseEventCursor('41')!,
+      eventType: 'QUESTION_RETRIEVAL_COMPLETED',
+      payload: {
+        ordinal: 1,
+        attempt: 1,
+        queryText: '힘과 운동',
+        chunkCount: 1,
+        selectedChunks: [{
+          chunkId: 'chunk-secret-1',
+          content: 'SSE_SELECTED_CHUNK_CONTENT_SECRET',
+          rank: 1,
+          page: 12,
+          unit: '역학',
+          source: 'semantic',
+        }],
+        chunks: [{
+          chunkId: 'chunk-secret-1',
+          content: 'SSE_CHUNK_CONTENT_SECRET',
+          rank: 1,
+          page: 12,
+          unit: '역학',
+          source: 'semantic',
+        }],
+      },
+      createdAt: new Date('2026-07-26T00:00:00.000Z'),
+    }];
+  });
+  const response = createActivityEventResponse(
+    new Request('http://localhost/api/events/generation/batch-secret?after=0', {
+      signal: abort.signal,
+    }),
+    {
+      aggregate: 'generation',
+      aggregateId: 'batch-secret',
+      readEvents,
+      pollIntervalMs: 1,
+    },
+  );
+  const body = await response.text();
+
+  expect(body).not.toContain('SSE_SELECTED_CHUNK_CONTENT_SECRET');
+  expect(body).not.toContain('SSE_CHUNK_CONTENT_SECRET');
+  expect(body).not.toContain('selectedChunks');
+  expect(body).toContain('"selectedChunkIds":["chunk-secret-1"]');
+  expect(body).toContain('"chunkCount":1');
+  expect(body).toContain('"page":12');
+});
+
 test('uses the greater valid Last-Event-ID and query cursor and emits heartbeats', async () => {
   const abort = new AbortController();
   let reads = 0;

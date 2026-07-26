@@ -9,6 +9,7 @@ import {
   parseDocumentLabFile,
   type DocumentLabProfileConfig,
 } from '@/server/documents/lab';
+import { ProviderError } from '@/server/providers/types';
 
 const originalMockProviders = process.env.MOCK_PROVIDERS;
 const originalUpstageApiKey = process.env.UPSTAGE_API_KEY;
@@ -310,7 +311,7 @@ test('rejects an oversized serialized Lab response with a typed 4xx error', asyn
 test('returns safe page and request provenance while redacting provider bodies and credentials', async () => {
   delete process.env.MOCK_PROVIDERS;
   process.env.UPSTAGE_API_KEY = 'super-secret-key';
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(
     JSON.stringify({ error: 'Authorization Bearer super-secret-key', image: 'data:image/png;base64,AAAA' }),
     { status: 503, headers: { 'x-request-id': 'provider-request-7' } },
   )));
@@ -319,6 +320,16 @@ test('returns safe page and request provenance while redacting provider bodies a
 
   const response = await createDocumentLabPostHandler({
     loadActiveProfile: async () => documentParseProfile,
+    parseFile: (file, dependencies) => parseDocumentLabFile(file, {
+      ...dependencies,
+      providerRetry:{
+        maxAttempts:2,
+        baseDelayMs:1,
+        maxDelayMs:1,
+        random:() => 0.5,
+        sleep:async () => undefined,
+      },
+    }),
   })(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
   const body = await response.json();
 
@@ -346,6 +357,93 @@ test('extracts original PNG dimensions for the page-coordinate signature', async
   const result = await parseDocumentLabFile(new File([png], 'page.png', { type: 'image/png' }));
 
   expect(result.pages[0]).toMatchObject({ width: 640, height: 480 });
+});
+
+test('retries a rate-limited Document Lab page without rerendering the file', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const png = new File([
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  ], 'page.png', { type:'image/png' });
+  let attempts = 0;
+  const delays: number[] = [];
+
+  const result = await parseDocumentLabFile(png, {
+    parser:{
+      parse:async () => {
+        attempts += 1;
+        if (attempts < 3) {
+          throw new ProviderError({
+            kind:'RATE_LIMIT',
+            message:'limited',
+            retryable:true,
+            status:429,
+          });
+        }
+        return {
+          html:'<p>page</p>',
+          elements:[],
+          raw:{},
+          requestId:'request-1',
+          model:'document-parse',
+          requestConfig:{},
+        };
+      },
+    },
+    providerRetry:{
+      maxAttempts:3,
+      baseDelayMs:1_000,
+      maxDelayMs:60_000,
+      random:() => 0.5,
+      sleep:async (delayMs) => {
+        delays.push(delayMs);
+      },
+    },
+  });
+
+  expect(attempts).toBe(3);
+  expect(delays).toEqual([1_000, 2_000]);
+  expect(result.pages[0]?.html).toBe('<p>page</p>');
+});
+
+test('stops a Document Lab retry backoff when the browser request is cancelled', async () => {
+  delete process.env.MOCK_PROVIDERS;
+  process.env.UPSTAGE_API_KEY = 'server-only-key';
+  const png = new File([
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  ], 'page.png', { type:'image/png' });
+  const controller = new AbortController();
+  const reason = new Error('browser request cancelled');
+  let sleepStarted!: () => void;
+  const sleeping = new Promise<void>((resolve) => {
+    sleepStarted = resolve;
+  });
+  const neverFinishes = new Promise<void>(() => undefined);
+
+  const parsing = parseDocumentLabFile(png, {
+    signal:controller.signal,
+    parser:{
+      parse:async () => {
+        throw new ProviderError({
+          kind:'RATE_LIMIT',
+          message:'limited',
+          retryable:true,
+          status:429,
+        });
+      },
+    },
+    providerRetry:{
+      maxAttempts:3,
+      sleep:async () => {
+        sleepStarted();
+        await neverFinishes;
+      },
+    },
+  });
+
+  await sleeping;
+  controller.abort(reason);
+  await expect(parsing).rejects.toBe(reason);
 });
 
 test('applies the explicit active profile to rasterization and concurrent parsing while preserving page order', async () => {
@@ -413,6 +511,7 @@ test('applies the explicit active profile to rasterization and concurrent parsin
     format: 'jpeg',
     dpi: 300,
     jpegQuality: 92,
+    pagesPerBatch: 8,
     timeoutMs: 45_000,
   });
   expect(parserOptions).toMatchObject({

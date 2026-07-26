@@ -54,7 +54,7 @@ type JudgeInvocation = {
   updatedAt:string;
 };
 type Score = { metricKey: string; value: number | null; label: string | null; rationale: string | null; evidence: unknown; judgeProvider?: string | null; judgeModel?: string | null; judgeRequestId?:string | null; judgeInvocationId?:string | null; provenance?:string | null };
-type RunItem = { id: string; state: string; attempts: number; maxAttempts?: number; errorCode: string | null; errorMessage: string | null; questionPublicId: string; questionText: string; providerKey: string; displayName: string; modelId: string; blindId: string; request: Record<string, unknown> | null; response: { text: string; raw: unknown; requestId: string | null; finishReason?: string | null; inputTokens?: number | null; outputTokens?: number | null; latencyMs?: number | null; retryHistory: unknown } | null; scores: Score[]; judgeInvocations?:JudgeInvocation[] };
+type RunItem = { id: string; state: string; attempts: number; maxAttempts?: number; errorCode: string | null; errorMessage: string | null; questionPublicId: string; questionText: string; providerKey: string; displayName: string; modelId: string; blindId: string; request: Record<string, unknown> | null; response: { text: string; raw: unknown; requestId: string | null; finishReason?: string | null; inputTokens?: number | null; outputTokens?: number | null; latencyMs?: number | null; retryHistory: unknown } | null; requiredMetricKeys?:string[]; scores: Score[]; judgeInvocations?:JudgeInvocation[] };
 type EventRecord = { id: string; type: string; data: Record<string, unknown> };
 type SnapshotEvent = {
   id: string;
@@ -179,7 +179,25 @@ export function RunController({
     (modelFilter === 'ALL' || item.providerKey === modelFilter) && (stateFilter === 'ALL' || item.state === stateFilter),
   ), [items, modelFilter, stateFilter]);
   const states = [...new Set(items.map((item) => item.state))];
-  const percent = run.total_items ? Math.round(((run.completed_items + run.failed_items) / run.total_items) * 100) : 0;
+  const executedItems = run.completed_items + run.failed_items;
+  const executionPercent = run.total_items ? Math.round((executedItems / run.total_items) * 100) : 0;
+  const scoreEligibleItems = items.filter((item) => item.response != null);
+  const requiredScorePairs = scoreEligibleItems.reduce(
+    (total, item) => total + (item.requiredMetricKeys?.length ?? 0),
+    0,
+  );
+  const scoredPairs = scoreEligibleItems.reduce((total, item) => {
+    const stored = new Set(item.scores.map((score) => score.metricKey));
+    return total + (item.requiredMetricKeys ?? [])
+      .filter((metric) => stored.has(metric)).length;
+  }, 0);
+  const scoringPercent = requiredScorePairs
+    ? Math.round((scoredPairs / requiredScorePairs) * 100)
+    : 0;
+  const scoringCoverage = requiredScorePairs
+    ? `${scoredPairs} / ${requiredScorePairs} 지표`
+    : '기록 없음';
+  const legacyPartial = items.length < executedItems;
 
   return <div className="workflow-page">
     <header className="page-heading"><div><Link className="text-link" href="/runs"><ArrowLeft size={13}/> 실행 목록</Link><span className="eyebrow mono">{run.public_id}</span><h1>{run.title}</h1><p>{run.dataset_version} · {run.score_version} · {run.price_profile_version}</p></div><div className="heading-actions">
@@ -192,7 +210,13 @@ export function RunController({
     </div></header>
     {notice && <p className="inline-notice" role="status">{notice}</p>}
     {run.last_scoring_error && <div className="result-warning"><strong>{run.last_scoring_error.code ?? 'SCORING_FAILED'}</strong> {run.last_scoring_error.message} · 시도 {run.last_scoring_error.attempts ?? 1}회{run.last_scoring_error.retryAt ? ` · 다음 자동 재시도 ${new Date(run.last_scoring_error.retryAt).toLocaleString('ko-KR')}` : ''}</div>}
-    <section className="run-control-strip panel"><div><span>STATE</span><strong className="mono">{run.state}</strong></div><div><span>PROGRESS</span><strong className="mono">{run.completed_items + run.failed_items} / {run.total_items}</strong><div className="progress-track"><i style={{width:`${percent}%`}}/></div></div><div><span>SUCCEEDED / FAILED</span><strong className="mono">{run.completed_items} / {run.failed_items}</strong></div><div><span>LIVE EVENT</span><strong><RefreshCcw size={13}/> {connectionLabels[stream.status]}</strong></div></section>
+    <section className="run-control-strip panel" role="region" aria-label="실행 및 채점 진행률">
+      <div><span>STATE</span><strong className="mono">{run.state}</strong></div>
+      <div><span>실행 진행</span><strong className="mono">{executedItems} / {run.total_items}</strong><div className="progress-track"><i style={{width:`${executionPercent}%`}}/></div><small>완료와 실패를 합친 모델 실행 처리량</small></div>
+      <div><span>채점 범위</span><strong className="mono">{scoringCoverage}</strong><div className="progress-track"><i style={{width:`${scoringPercent}%`}}/></div><small>평가 가능한 저장 응답의 필수 지표별 실제 저장률{legacyPartial ? ' · legacy partial' : ''}</small></div>
+      <div><span>SUCCEEDED / FAILED</span><strong className="mono">{run.completed_items} / {run.failed_items}</strong></div>
+      <div><span>LIVE EVENT</span><strong><RefreshCcw size={13}/> {connectionLabels[stream.status]}</strong></div>
+    </section>
 
     <section className="panel run-profile-panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>평가 프로필</h2></div><span className="count-label mono">불변 스냅샷 · {profile.version}</span></div>{profile.snapshotProvenance === 'LEGACY_BACKFILL_UNVERIFIED' && <p className="result-warning">이 실행은 생성 시점 스냅샷 출처가 검증되지 않았습니다. 공식 근거로 사용하지 말고 새 프로필과 새 실행을 생성하십시오.</p>}<details open><summary><strong>{profile.title}</strong> · exact Judge {profile.judgeProvider ?? '결정론적'} / {profile.judgeModel ?? '—'}</summary><div className="profile-detail"><p>{profile.rubricPrompt}</p><div className="metric-chip-list">{profile.metrics.map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : metric === 'response_present' ? 0 : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div>{profile.dynamicMetrics.length > 0 && <><h3>선수관계 문항 추가 지표</h3><div className="metric-chip-list">{profile.dynamicMetrics.map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div></>}<small className="mono">스냅샷 provenance {profile.snapshotProvenance ?? '—'} · 내용 해시 {profile.contentHash}</small></div></details></section>
 

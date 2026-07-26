@@ -6,6 +6,8 @@ import { withTransaction } from '@/server/db/transaction';
 import { generateQuestions } from '@/server/questions/generator';
 import { backfillMissingSourceTocEntries, replaceSourceTocEntries } from '@/server/sources/toc';
 import { GET as getGenerationActivity } from '@/app/api/generation/[id]/activity/route';
+import { GET as getGenerationItemAudit } from '@/app/api/generation/[id]/items/[itemId]/audit/route';
+import { beginGenerationProviderInvocation } from '@/server/questions/provider-invocations';
 import {
   claimJobs,
   enqueueJob,
@@ -155,8 +157,12 @@ test('runs direction, retrieval, and generation independently for every question
   expect(new Set(retrievals.rows.map((row) => row.query_text)).size).toBe(2);
   expect(retrievals.rows.every((row) => row.query_text === row.candidate_scope.questionDirection.searchQuery)).toBe(true);
 
-  const events = await db.query<{ event_type: string; ordinal: string }>(
-    `select event_type,payload->>'ordinal' ordinal from job_events
+  const events = await db.query<{
+    event_type: string;
+    ordinal: string;
+    payload: Record<string, unknown>;
+  }>(
+    `select event_type,payload->>'ordinal' ordinal,payload from job_events
      where aggregate_type='generation' and aggregate_id=$1 and payload ? 'ordinal'`,
     [batchId],
   );
@@ -164,6 +170,19 @@ test('runs direction, retrieval, and generation independently for every question
     expect(events.rows.filter((event) => event.ordinal === ordinal).map((event) => event.event_type)).toEqual(expect.arrayContaining([
       'QUESTION_DIRECTION_COMPLETED', 'QUESTION_RETRIEVAL_COMPLETED', 'QUESTION_GENERATION_COMPLETED',
     ]));
+  }
+  const retrievalEvents = events.rows.filter(
+    (event) => event.event_type === 'QUESTION_RETRIEVAL_COMPLETED',
+  );
+  expect(retrievalEvents).toHaveLength(2);
+  for (const event of retrievalEvents) {
+    expect(event.payload).toMatchObject({
+      chunkCount: 2,
+      selectedChunkIds: expect.any(Array),
+      chunks: expect.any(Array),
+    });
+    expect(JSON.stringify(event.payload)).not.toContain('"content"');
+    expect(event.payload).not.toHaveProperty('selectedChunks');
   }
 });
 
@@ -260,7 +279,20 @@ test('persists successful ordinals, retries only failed items, and keeps replay 
     state: 'FAILED',
     attempts: 1,
     error: { code: 'TEST_ORDINAL_FAILURE', message: 'TEST_ORDINAL_FAILURE: 두 번째 문항만 실패' },
-    latestRetrieval: { attempt: 1 },
+    latestRetrieval: { attempt: 1, selectedChunkCount: expect.any(Number) },
+  });
+  expect(activity.items[1].latestRetrieval).not.toHaveProperty('selectedChunks');
+  const failedItemAuditResponse = await getGenerationItemAudit(
+    new Request(`http://localhost/api/generation/${batchId}/items/${activity.items[1].id}/audit`),
+    { params: Promise.resolve({ id: batchId, itemId: activity.items[1].id }) },
+  );
+  expect(failedItemAuditResponse.status).toBe(200);
+  const failedItemAudit = await failedItemAuditResponse.json();
+  expect(failedItemAudit.latestRetrieval.selectedChunks[0]).toMatchObject({
+    rank: 1,
+    content: expect.stringContaining('관성'),
+    source: expect.stringMatching(/semantic|scope_order/),
+    selectionReason: expect.any(String),
   });
 
   await failJob(firstLease, {
@@ -473,6 +505,7 @@ test('keeps a committed question idempotent when the process crashes immediately
 test('rejects a stale worker after lease recovery and lets only the reclaimed attempt persist', async () => {
   const { batchId } = await createBasicGenerationBatch({ requestedCount: 1 });
   const staleLease = await claimGenerationLease(batchId, `worker-stale-${batchId}`);
+  let staleItem!: { itemId: string; attempt: number };
   let releaseStale!: () => void;
   let markHookReached!: () => void;
   const hookReached = new Promise<void>((resolve) => { markHookReached = resolve; });
@@ -480,19 +513,52 @@ test('rejects a stale worker after lease recovery and lets only the reclaimed at
   const staleRun = generateQuestions(batchId, {
     lease: staleLease,
     testHooks: {
-      beforeItemAttempt: async () => {
+      beforeItemAttempt: async (context) => {
+        staleItem = context;
         markHookReached();
         await holdStale;
       },
     },
   });
   await hookReached;
+  const abandonedInvocationId = await beginGenerationProviderInvocation({
+    batchId,
+    itemId: staleItem.itemId,
+    itemAttempt: staleItem.attempt,
+    stage: 'DIRECTION',
+    provider: 'gemini',
+    modelId: 'crashed-worker-model',
+    request: {
+      system: 'CRASHED_REQUEST_SYSTEM',
+      prompt: 'CRASHED_REQUEST_PROMPT',
+      maxOutputTokens: 128,
+    },
+  });
 
   await db.query(
     `update jobs set lease_expires_at=now()-interval '1 second' where id=$1`,
     [staleLease.jobId],
   );
-  expect(await recoverExpiredLeases()).toBe(1);
+  await recoverExpiredLeases();
+  const recoveredLease = await db.query<{
+    state: string;
+    attempts: number;
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    last_error_code: string | null;
+  }>(
+    `select state,attempts,lease_owner,lease_expires_at,last_error_code
+       from jobs
+      where id=$1`,
+    [staleLease.jobId],
+  );
+  expect(recoveredLease.rows[0]).toEqual({
+    state: 'RETRY_WAIT',
+    attempts: staleLease.attempt,
+    lease_owner: null,
+    lease_expires_at: null,
+    last_error_code: 'LEASE_EXPIRED',
+  });
   const preservedForAutomaticRetry = await db.query<{
     state: string;
     claimed_job_attempt: number;
@@ -511,6 +577,24 @@ test('rejects a stale worker after lease recovery and lets only the reclaimed at
   const currentLease = await claimGenerationLease(batchId, `worker-current-${batchId}`);
   expect(currentLease.attempt).toBe(staleLease.attempt + 1);
   await expect(generateQuestions(batchId, { lease: currentLease })).resolves.toEqual({ questions: 1 });
+  const abandoned = await db.query<{
+    state: string;
+    error_snapshot: Record<string, unknown> | null;
+    completed_at: Date | null;
+  }>(
+    `select state,error_snapshot,completed_at
+       from generation_provider_invocations
+      where id=$1`,
+    [abandonedInvocationId],
+  );
+  expect(abandoned.rows[0]).toMatchObject({
+    state: 'ABANDONED',
+    error_snapshot: {
+      code: 'GENERATION_INVOCATION_ABANDONED_ON_ITEM_RETRY',
+      retryable: true,
+    },
+    completed_at: expect.any(Date),
+  });
   releaseStale();
   await expect(staleRun).rejects.toMatchObject({ code: 'JOB_LEASE_MISMATCH' });
 

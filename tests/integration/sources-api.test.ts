@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,7 @@ import { db } from '@/server/db/pool';
 import { migrate } from '@/server/db/migrate';
 import * as sourcesRoute from '@/app/api/sources/route';
 import { GET as GET_ACTIVITY } from '@/app/api/sources/[id]/activity/route';
+import { GET as GET_ARTIFACTS } from '@/app/api/sources/[id]/artifacts/route';
 import { POST as CANCEL } from '@/app/api/sources/[id]/cancel/route';
 import { DELETE } from '@/app/api/sources/[id]/route';
 import { processDocument } from '@/server/documents/pipeline';
@@ -292,6 +293,92 @@ test('soft deletes a source, cancels its job, and restores it when the same file
   expect((await GET().then((response) => response.json())).items).toHaveLength(1);
 });
 
+test('validates every required real provider before reading or rasterizing the source PDF', async () => {
+  const upload = await POST(uploadRequest());
+  const { id } = await upload.json() as { id: string };
+  const source = await db.query<{ storage_path: string }>(
+    'select storage_path from source_files where id=$1',
+    [id],
+  );
+  await rm(source.rows[0]!.storage_path);
+
+  const previousMock = process.env.MOCK_PROVIDERS;
+  const previousUpstage = process.env.UPSTAGE_API_KEY;
+  const previousGoogle = process.env.GOOGLE_API_KEY;
+  process.env.MOCK_PROVIDERS = 'false';
+  delete process.env.UPSTAGE_API_KEY;
+  delete process.env.GOOGLE_API_KEY;
+  try {
+    await expect(processDocument(id)).rejects.toThrow(
+      'UPSTAGE_NOT_CONFIGURED: UPSTAGE_API_KEY가 필요합니다.',
+    );
+    process.env.UPSTAGE_API_KEY = 'test-upstage-key';
+    await expect(processDocument(id)).rejects.toThrow(
+      'EMBEDDING_NOT_CONFIGURED: GOOGLE_API_KEY가 필요합니다.',
+    );
+  } finally {
+    if (previousMock == null) delete process.env.MOCK_PROVIDERS;
+    else process.env.MOCK_PROVIDERS = previousMock;
+    if (previousUpstage == null) delete process.env.UPSTAGE_API_KEY;
+    else process.env.UPSTAGE_API_KEY = previousUpstage;
+    if (previousGoogle == null) delete process.env.GOOGLE_API_KEY;
+    else process.env.GOOGLE_API_KEY = previousGoogle;
+  }
+});
+
+test('keeps the parsed revision and full page artifacts when downstream vector persistence fails', async () => {
+  const upload = await POST(uploadRequest());
+  const sourceId = (await upload.json() as { id: string }).id;
+  await db.query(`
+    create or replace function fail_test_source_chunk_insert()
+    returns trigger
+    language plpgsql
+    as $$
+    begin
+      if new.source_file_id='${sourceId}'::uuid then
+        raise exception 'TEST_DOWNSTREAM_FAILURE';
+      end if;
+      return new;
+    end;
+    $$;
+    create trigger fail_test_source_chunk_insert
+    before insert on source_chunks
+    for each row execute function fail_test_source_chunk_insert();
+  `);
+  try {
+    await expect(processDocument(sourceId)).rejects.toThrow('TEST_DOWNSTREAM_FAILURE');
+
+    const persisted = await db.query<{
+      revision: number;
+      page_count: number;
+      raw_response: unknown;
+    }>(
+      `select revision.revision,
+              count(page.id)::int page_count,
+              revision.raw_response
+         from source_revisions revision
+         left join source_revision_page_artifacts page
+           on page.source_revision_id=revision.id
+        where revision.source_file_id=$1
+        group by revision.id`,
+      [sourceId],
+    );
+    expect(persisted.rows).toEqual([{
+      revision: 1,
+      page_count: 1,
+      raw_response: {
+        pageCount: 1,
+        pages: expect.any(Array),
+      },
+    }]);
+  } finally {
+    await db.query(`
+      drop trigger if exists fail_test_source_chunk_insert on source_chunks;
+      drop function if exists fail_test_source_chunk_insert();
+    `);
+  }
+});
+
 test('persists the complete parser Markdown in a dedicated immutable revision artifact', async () => {
   const upload = await POST(uploadRequest());
   const { id } = await upload.json();
@@ -313,10 +400,222 @@ test('persists the complete parser Markdown in a dedicated immutable revision ar
     markdown_bytes: Buffer.byteLength(expectedMarkdown, 'utf8'),
   });
 
+  const pageArtifact = await db.query<{
+    page_number: number;
+    raw_markdown: string | null;
+    raw_response: unknown;
+  }>(
+    `select page_number,raw_markdown,raw_response
+       from source_revision_page_artifacts
+      where source_revision_id=(
+        select id from source_revisions where source_file_id=$1
+      )`,
+    [id],
+  );
+  expect(pageArtifact.rows).toEqual([{
+    page_number: 1,
+    raw_markdown: expectedMarkdown,
+    raw_response: { mock: true, settings: expect.any(Object) },
+  }]);
+
   await expect(db.query(
     `update source_revisions
         set raw_markdown='# 변조된 파서 출력'
       where source_file_id=$1`,
     [id],
   )).rejects.toMatchObject({ code: '55000' });
+  await expect(db.query(
+    `update source_revision_page_artifacts
+        set raw_markdown='# 변조된 페이지 출력'
+      where source_revision_id=(
+        select id from source_revisions where source_file_id=$1
+      )`,
+    [id],
+  )).rejects.toMatchObject({ code: '55000' });
+});
+
+test('exposes parsed revision, chunk content, vector metadata, and TOC as inspectable artifacts', async () => {
+  const upload = await POST(uploadRequest());
+  const { id } = await upload.json();
+  await processDocument(id);
+
+  const revisionResponse = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=revision`),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(revisionResponse.status).toBe(200);
+  const revision = await revisionResponse.json();
+  expect(revision).toMatchObject({
+    kind: 'revision',
+    completeness: 'COMPLETE',
+    artifact: {
+      revision: 1,
+      parseModel: 'mock-document-parse',
+      rawHtml: null,
+      rawMarkdown: null,
+      reviewedHtml: null,
+      contentIncluded:false,
+      contentAvailable:true,
+      contentBytes:{
+        rawHtml:expect.any(Number),
+        rawMarkdown:expect.any(Number),
+        reviewedHtml:expect.any(Number),
+      },
+      rawResponse: {
+        pageCount: 1,
+        pages: [{
+          pageNumber: 1,
+          requestId: 'mock-document-parse',
+          model: 'mock-document-parse',
+        }],
+      },
+    },
+  });
+  const revisionContentResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeContent=1`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(revisionContentResponse.status).toBe(200);
+  await expect(revisionContentResponse.json()).resolves.toMatchObject({
+    kind:'revision',
+    artifact:{
+      id:revision.artifact.id,
+      contentIncluded:true,
+      rawHtml:expect.stringContaining('로컬 파이프라인 검증'),
+      rawMarkdown:expect.stringContaining('science-2.pdf'),
+    },
+  });
+
+  const pagesResponse = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=pages&limit=1`),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(pagesResponse.status).toBe(200);
+  const pages = await pagesResponse.json();
+  expect(pages).toMatchObject({
+    kind: 'pages',
+    completeness: 'COMPLETE',
+    expectedPageCount: 1,
+    persistedPageCount: 1,
+    total: 1,
+    nextAfterPage: null,
+    items: [{
+      pageNumber: 1,
+      rawHtml: expect.stringContaining('로컬 파이프라인 검증'),
+      rawMarkdown: expect.stringContaining('science-2.pdf'),
+      rawResponse: null,
+      rawResponseIncluded:false,
+    }],
+  });
+  const pageRawResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=pages&limit=100&afterPage=0&revisionId=${pages.revision.id}&includeRaw=1`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(pageRawResponse.status).toBe(200);
+  await expect(pageRawResponse.json()).resolves.toMatchObject({
+    kind:'pages',
+    items:[{
+      pageNumber:1,
+      rawResponse:{ mock:true, settings:expect.any(Object) },
+      rawResponseIncluded:true,
+    }],
+  });
+
+  const chunksResponse = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=chunks&limit=10`),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(chunksResponse.status).toBe(200);
+  const chunks = await chunksResponse.json();
+  expect(chunks).toMatchObject({
+    kind: 'chunks',
+    total: expect.any(Number),
+    items: [
+      {
+        ordinal: 1,
+        content: expect.stringContaining('science-2.pdf'),
+        embedding: {
+          model: 'mock-embedding-3072',
+          dimensions: expect.any(Number),
+          norm: expect.any(Number),
+        },
+      },
+    ],
+  });
+  expect(chunks.items[0]).not.toHaveProperty('storagePath');
+
+  const tocResponse = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=toc`),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(tocResponse.status).toBe(200);
+  await expect(tocResponse.json()).resolves.toMatchObject({
+    kind: 'toc',
+    total: expect.any(Number),
+    mappingSummary: {
+      mapped:expect.any(Number),
+      unmapped:expect.any(Number),
+    },
+    nextAfterOrdinal: null,
+    items: expect.any(Array),
+  });
+});
+
+test('pins paginated artifacts to one revision and rejects unpinned or foreign cursors', async () => {
+  const upload = await POST(uploadRequest());
+  const { id } = await upload.json() as { id: string };
+  await processDocument(id);
+
+  const first = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=pages&limit=1`),
+    { params: Promise.resolve({ id }) },
+  ).then((response) => response.json()) as {
+    revision: { id: string; revision: number };
+  };
+  await processDocument(id);
+
+  const latest = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=pages&limit=1`),
+    { params: Promise.resolve({ id }) },
+  ).then((response) => response.json()) as {
+    revision: { id: string; revision: number };
+  };
+  expect(latest.revision).toMatchObject({ revision: 2 });
+  expect(latest.revision.id).not.toBe(first.revision.id);
+
+  const pinnedResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=pages&limit=1&revisionId=${first.revision.id}`,
+    ),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(pinnedResponse.status).toBe(200);
+  await expect(pinnedResponse.json()).resolves.toMatchObject({
+    revision: first.revision,
+    items: [{ pageNumber: 1 }],
+  });
+
+  const unpinnedCursor = await GET_ARTIFACTS(
+    new Request(`http://localhost/api/sources/${id}/artifacts?kind=pages&afterPage=1`),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(unpinnedCursor.status).toBe(400);
+  await expect(unpinnedCursor.json()).resolves.toMatchObject({
+    code: 'SOURCE_ARTIFACT_REVISION_REQUIRED',
+  });
+
+  const foreignRevision = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=pages&revisionId=${randomUUID()}`,
+    ),
+    { params: Promise.resolve({ id }) },
+  );
+  expect(foreignRevision.status).toBe(409);
+  await expect(foreignRevision.json()).resolves.toMatchObject({
+    code: 'SOURCE_ARTIFACT_REVISION_MISMATCH',
+  });
 });

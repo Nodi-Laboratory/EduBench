@@ -33,6 +33,74 @@ type ActivityEventReader = (
   limit: number,
 ) => Promise<ActivityEventRecord[]>;
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function retrievalChunkSummary(value: unknown): Record<string, unknown> | null {
+  const chunk = recordValue(value);
+  if (!chunk || typeof chunk.chunkId !== 'string') return null;
+  const allowed = [
+    'chunkId',
+    'rank',
+    'page',
+    'unit',
+    'source',
+    'similarity',
+    'semanticRank',
+    'anchorChunkId',
+  ] as const;
+  return Object.fromEntries(
+    allowed
+      .filter((key) => chunk[key] !== undefined)
+      .map((key) => [key, chunk[key]]),
+  );
+}
+
+export function sanitizeActivityEventPayload(
+  aggregate: ActivityAggregate,
+  eventType: string,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (aggregate !== 'generation' || eventType !== 'QUESTION_RETRIEVAL_COMPLETED') {
+    return payload;
+  }
+  const rawChunks = Array.isArray(payload.chunks)
+    ? payload.chunks
+    : Array.isArray(payload.selectedChunks)
+      ? payload.selectedChunks
+      : [];
+  const chunks = rawChunks
+    .map(retrievalChunkSummary)
+    .filter((chunk): chunk is Record<string, unknown> => chunk !== null);
+  const explicitIds = Array.isArray(payload.selectedChunkIds)
+    ? payload.selectedChunkIds.filter((value): value is string => typeof value === 'string')
+    : [];
+  const selectedChunkIds = [...new Set([
+    ...explicitIds,
+    ...chunks
+      .map((chunk) => chunk.chunkId)
+      .filter((value): value is string => typeof value === 'string'),
+  ])];
+  const summary = {
+    ordinal: payload.ordinal,
+    attempt: payload.attempt,
+    queryText: payload.queryText,
+    chunkCount: typeof payload.chunkCount === 'number'
+      ? payload.chunkCount
+      : selectedChunkIds.length,
+    selectedChunkIds,
+    chunks,
+    queryVector: payload.queryVector,
+    retrievalConfig: payload.retrievalConfig,
+  };
+  return Object.fromEntries(
+    Object.entries(summary).filter(([, value]) => value !== undefined),
+  );
+}
+
 function activityPredicate(aggregate: ActivityAggregate): string {
   if (aggregate === 'source') {
     return `(
@@ -79,7 +147,7 @@ export async function readActivityEvents(
   return result.rows.map((row) => ({
     id: row.id,
     eventType: row.event_type,
-    payload: row.payload,
+    payload: sanitizeActivityEventPayload(aggregate, row.event_type, row.payload),
     createdAt: row.created_at,
   }));
 }
@@ -110,7 +178,7 @@ export async function readActivityEventHistory(
   return result.rows.map((row) => ({
     id: row.id,
     eventType: row.event_type,
-    payload: row.payload,
+    payload: sanitizeActivityEventPayload(aggregate, row.event_type, row.payload),
     createdAt: row.created_at,
   }));
 }
@@ -191,7 +259,11 @@ export function createActivityEventResponse(
               aggregate: input.aggregate,
               aggregateId: input.aggregateId,
               eventType: event.eventType,
-              payload: event.payload,
+              payload: sanitizeActivityEventPayload(
+                input.aggregate,
+                event.eventType,
+                event.payload,
+              ),
               createdAt: event.createdAt.toISOString(),
             };
             controller.enqueue(encoder.encode(

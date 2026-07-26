@@ -1,6 +1,10 @@
 import { assertProviderResponse, executeFetch, requestIdFrom } from './http';
 import { ProviderError, type FetchLike } from './types';
 import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
+import {
+  upstageDocumentParseRequestGate,
+  type RequestConcurrencyGate,
+} from './concurrency-gate';
 
 export type UpstageDocumentParserOptions = {
   apiKey:string;
@@ -12,6 +16,7 @@ export type UpstageDocumentParserOptions = {
   ocr?:'auto' | 'force';
   base64Encoding?:readonly ('table' | 'figure' | 'chart' | 'equation')[];
   outputFormats?:readonly ('html' | 'markdown')[];
+  requestGate?:RequestConcurrencyGate;
 };
 
 export type DocumentParseOptions = {
@@ -60,23 +65,41 @@ export class UpstageDocumentParser {
     form.append('output_formats', JSON.stringify(requestConfig.output_formats));
     const configuredTimeout = this.options.timeoutMs ?? Number(process.env.PROVIDER_TIMEOUT_MS || 120_000);
     const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 120_000;
-    const timeoutController = new AbortController();
-    const timer = setTimeout(
-      () => timeoutController.abort(new DOMException('Document Parse request timed out.', 'TimeoutError')),
-      timeoutMs,
-    );
-    const signal = options.signal ? AbortSignal.any([options.signal, timeoutController.signal]) : timeoutController.signal;
     let response: Response;
     try {
-      response = await executeFetch(() => (this.options.fetch ?? fetch)(
-        `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/+$/, '')}/document-digitization`,
-        { method: 'POST', headers: { Authorization: `Bearer ${this.options.apiKey}` }, body: form, signal },
-      ));
+      response = await (
+        this.options.requestGate ?? upstageDocumentParseRequestGate
+      ).run(async () => {
+        const timeoutController = new AbortController();
+        const timer = setTimeout(
+          () => timeoutController.abort(
+            new DOMException(
+              'Document Parse request timed out.',
+              'TimeoutError',
+            ),
+          ),
+          timeoutMs,
+        );
+        const signal = options.signal
+          ? AbortSignal.any([options.signal, timeoutController.signal])
+          : timeoutController.signal;
+        try {
+          return await executeFetch(() => (this.options.fetch ?? fetch)(
+            `${(this.options.baseUrl ?? 'https://api.upstage.ai/v1').replace(/\/+$/, '')}/document-digitization`,
+            {
+              method:'POST',
+              headers:{ Authorization:`Bearer ${this.options.apiKey}` },
+              body:form,
+              signal,
+            },
+          ));
+        } finally {
+          clearTimeout(timer);
+        }
+      }, options.signal);
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
       throw error;
-    } finally {
-      clearTimeout(timer);
     }
     await assertProviderResponse(response, this.options.apiKey);
     const raw = await response.json() as {

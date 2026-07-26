@@ -16,6 +16,7 @@ import type {
   ModelProvider,
   NormalizedGeneration,
 } from '@/server/providers/types';
+import { ProviderError } from '@/server/providers/types';
 import { MockProvider } from '@/server/providers/mock';
 import { recordScoringFailure, scoreRun } from '@/server/scoring/service';
 import { GET as exportResult } from '@/app/api/results/[id]/export/route';
@@ -255,6 +256,67 @@ test('does not regress a completed run when a stale scorer records a failure', a
   });
 });
 
+test('returns an in-flight run item to pending when the worker shuts down', async () => {
+  const run = await createRun({
+    title:`실행 종료 복구 ${randomUUID().slice(0, 8)}`,
+    datasetVersionId,
+    scoreProfileId:'20000000-0000-0000-0000-000000000001',
+    priceProfileVersion:'test-price-v1',
+    systemPrompt:'답하라.',
+    questionLimit:1,
+    models:[{
+      providerKey:'gemini',
+      displayName:'Gemini',
+      modelId:'shutdown-candidate',
+      protocol:'gemini',
+    }],
+  });
+  await commandRun(run.id, 'QUEUE');
+  await commandRun(run.id, 'START');
+  const workerId = 'worker-execution-shutdown';
+  const [item] = await claimRunItems(run.id, workerId, 1, 30_000);
+  const controller = new AbortController();
+  let providerCalls = 0;
+  const provider:ModelProvider = {
+    key:'gemini',
+    modelId:'shutdown-candidate',
+    generate:async (_request, signal) => {
+      providerCalls += 1;
+      return new Promise<NormalizedGeneration>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new ProviderError({
+          kind:'NETWORK',
+          message:'adapter converted abort to a retryable network error',
+          retryable:true,
+          cause:signal.reason,
+        })), { once:true });
+      });
+    },
+  };
+
+  const execution = executeRunItem(
+    item!,
+    workerId,
+    provider,
+    { signal:controller.signal },
+  );
+  await vi.waitFor(async () => {
+    const snapshot = await db.query<{ request_snapshot:unknown }>(
+      'select request_snapshot from run_items where id=$1',
+      [item!.id],
+    );
+    expect(snapshot.rows[0]?.request_snapshot).not.toBeNull();
+  });
+  controller.abort(new Error('WORKER_SHUTDOWN'));
+  await expect(execution).resolves.toBeUndefined();
+  expect(providerCalls).toBe(1);
+
+  const released = await db.query<{ state:string; attempts:number }>(
+    'select state,attempts from run_items where id=$1',
+    [item!.id],
+  );
+  expect(released.rows[0]).toEqual({ state:'PENDING', attempts:0 });
+});
+
 test('records a scoring failure while the scorer still owns the run lock', async () => {
   const run = await createRun({
     title: `채점 실패 원자 기록 ${randomUUID().slice(0, 8)}`,
@@ -418,6 +480,54 @@ test('aborts an in-flight Judge request on scoring pause without counting it as 
     invocation_error_code:'RUN_SCORING_CONTROL_REQUESTED',
   });
   expect((await commandRun(run.id, 'RESUME')).state).toBe('SCORING');
+});
+
+test('aborts an in-flight Judge on worker shutdown without failing the run', async () => {
+  const run = await createRun({
+    title:`채점 종료 복구 ${randomUUID().slice(0, 8)}`,
+    datasetVersionId,
+    scoreProfileId:'20000000-0000-0000-0000-000000000001',
+    priceProfileVersion:'test-price-v1',
+    systemPrompt:'답하라.',
+    questionLimit:1,
+    models:[{
+      providerKey:'gemini',
+      displayName:'Gemini',
+      modelId:'judge-shutdown-candidate',
+      protocol:'gemini',
+    }],
+  });
+  await commandRun(run.id, 'QUEUE');
+  await commandRun(run.id, 'START');
+  const [item] = await claimRunItems(run.id, 'worker-judge-shutdown', 1, 30_000);
+  await executeRunItem(
+    item!,
+    'worker-judge-shutdown',
+    new MockProvider('gemini', 'judge-shutdown-candidate'),
+  );
+  expect(await beginScoringWhenExecutionFinished(run.id)).toBe(true);
+  const controller = new AbortController();
+  const judgeSpy = vi.spyOn(MockProvider.prototype, 'generate')
+    .mockImplementationOnce(async (
+      _request:GenerationRequest,
+      signal?:AbortSignal,
+    ): Promise<NormalizedGeneration> => new Promise<NormalizedGeneration>((_, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once:true });
+    }));
+  try {
+    const scoring = scoreRun(run.id, controller.signal);
+    expect(await waitForScoringAdvisoryLock(run.id)).toBe(true);
+    controller.abort(new Error('WORKER_SHUTDOWN'));
+    await expect(scoring).resolves.toEqual({ scoredResponses:0, claimed:true });
+  } finally {
+    judgeSpy.mockRestore();
+  }
+
+  const stored = await db.query<{ state:string; last_scoring_error:unknown }>(
+    'select state,last_scoring_error from benchmark_runs where id=$1',
+    [run.id],
+  );
+  expect(stored.rows[0]).toEqual({ state:'SCORING', last_scoring_error:null });
 });
 
 test('reports a missing scoring run instead of treating it as a duplicate claimant', async () => {

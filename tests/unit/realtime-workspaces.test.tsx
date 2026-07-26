@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import { GenerationWorkspace } from '@/components/generation/generation-workspace';
 import { RunController } from '@/components/runs/run-controller';
@@ -224,6 +224,51 @@ test('a delayed source retry refresh cannot overwrite the newly selected source'
   expect(screen.getByText('B_CURRENT_EVENT')).toBeInTheDocument();
 });
 
+test('clicking the already selected source keeps its loaded activity instead of returning to an endless loader', async () => {
+  const source = {
+    id:'source-a',
+    original_name:'science.pdf',
+    subject:'과학',
+    grade:'고1',
+    byte_size:10,
+    status:'PARSING',
+    failed_stage:null,
+    created_at:'2026-07-26T00:00:00.000Z',
+    current_job_id:'job-a',
+    current_job_state:'LEASED',
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === '/api/sources/source-a/activity') {
+      return {
+        ok:true,
+        json:async () => ({
+          source:{ ...source, updated_at:source.created_at },
+          job:{ id:'job-a', state:'LEASED', attempts:1, max_attempts:4 },
+          eventCursor:'10',
+          events:[{
+            id:'10',
+            event_type:'DOCUMENT_PARSE_STARTED',
+            payload:{},
+            created_at:source.created_at,
+          }],
+        }),
+      };
+    }
+    return { ok:true, json:async () => ({ items:[source] }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  vi.stubGlobal('EventSource', EventSourceStub);
+  render(<SourcesWorkspace initialSources={[source]} />);
+
+  fireEvent.click(screen.getAllByText('science.pdf')[0]!);
+  await screen.findByText('Upstage Document Parse 시작');
+  fireEvent.click(screen.getAllByText('science.pdf')[0]!);
+
+  expect(screen.getByText('Upstage Document Parse 시작')).toBeInTheDocument();
+  expect(screen.queryByText('기록을 불러오는 중입니다.')).not.toBeInTheDocument();
+});
+
 test('a delayed source deletion cannot close a newly selected source', async () => {
   vi.stubGlobal('EventSource', EventSourceStub);
   vi.spyOn(window, 'confirm').mockReturnValue(true);
@@ -323,8 +368,130 @@ test('source replaces full-history polling with one activity stream and preserve
     current_job_id: 'job-a',
     current_job_state: 'LEASED',
   };
+  let pageInitialRequests = 0;
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.endsWith('/artifacts?kind=pages&limit=5')) {
+      pageInitialRequests += 1;
+      if (pageInitialRequests > 1) {
+        return {
+          ok: true,
+          json: async () => ({
+            kind: 'pages',
+            source: { id: source.id, original_name: source.original_name },
+            revision: { id: 'revision-2', revision: 2 },
+            completeness: 'COMPLETE',
+            expectedPageCount: 1,
+            persistedPageCount: 1,
+            total: 1,
+            nextAfterPage: null,
+            items: [{
+              id: 'revision-2-page-1',
+              pageNumber: 1,
+              filename: 'page-1.png',
+              mimeType: 'image/png',
+              rawHtml: '<p>새 revision 페이지</p>',
+              rawMarkdown: '새 revision 페이지',
+              rawResponse: { page: 1 },
+            }],
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          kind: 'pages',
+          source: { id: source.id, original_name: source.original_name },
+          revision: { id: 'revision-1', revision: 1 },
+          completeness: 'COMPLETE',
+          expectedPageCount: 3,
+          persistedPageCount: 3,
+          total: 3,
+          nextAfterPage: 1,
+          items: [{
+            id: 'page-1',
+            pageNumber: 1,
+            filename: 'page-1.png',
+            mimeType: 'image/png',
+            rawHtml: '<p>첫 페이지</p>',
+            rawMarkdown: '첫 페이지',
+            rawResponse: { page: 1 },
+          }],
+        }),
+      };
+    }
+    if (url.endsWith('/artifacts?kind=pages&limit=5&revisionId=revision-1&afterPage=1')) {
+      return {
+        ok: true,
+        json: async () => ({
+          kind: 'pages',
+          source: { id: source.id, original_name: source.original_name },
+          revision: { id: 'revision-1', revision: 1 },
+          completeness: 'COMPLETE',
+          expectedPageCount: 3,
+          persistedPageCount: 3,
+          total: 3,
+          nextAfterPage: 2,
+          items: [{
+            id: 'page-2',
+            pageNumber: 2,
+            filename: 'page-2.png',
+            mimeType: 'image/png',
+            rawHtml: '<p>둘째 페이지</p>',
+            rawMarkdown: '둘째 페이지',
+            rawResponse: { page: 2 },
+          }],
+        }),
+      };
+    }
+    if (url.endsWith('/artifacts?kind=pages&limit=5&revisionId=revision-1&afterPage=2')) {
+      return {
+        ok: true,
+        json: async () => ({
+          kind: 'pages',
+          source: { id: source.id, original_name: source.original_name },
+          revision: { id: 'revision-2', revision: 2 },
+          completeness: 'COMPLETE',
+          expectedPageCount: 1,
+          persistedPageCount: 1,
+          total: 1,
+          nextAfterPage: null,
+          items: [{
+            id: 'mismatched-page',
+            pageNumber: 1,
+            filename: 'page-1.png',
+            mimeType: 'image/png',
+            rawHtml: '<p>혼합되면 안 되는 페이지</p>',
+            rawMarkdown: '혼합되면 안 되는 페이지',
+            rawResponse: { page: 1 },
+          }],
+        }),
+      };
+    }
+    if (url.endsWith('/artifacts?kind=revision')) {
+      return {
+        ok: true,
+        json: async () => ({
+          kind: 'revision',
+          source: { id: source.id, original_name: source.original_name },
+          completeness: 'COMPLETE',
+          artifact: {
+            id: 'revision-1',
+            revision: 1,
+            parseModel: 'document-parse',
+            parseRequestId: 'parse-request-1',
+            rawHtml: '<h1>교과서 사람이 읽는 원문</h1>',
+            rawMarkdown: '# 교과서 사람이 읽는 원문',
+            rawResponse: { request_id: 'parse-request-1' },
+            reviewedHtml: '<h1>교과서 사람이 읽는 원문</h1>',
+            reviewSummary: '자동 검수',
+            contentIncluded:true,
+            contentAvailable:true,
+            createdAt: source.created_at,
+          },
+        }),
+      };
+    }
     if (url.includes('/activity?history=0')) {
       return {
         ok: true,
@@ -351,13 +518,29 @@ test('source replaces full-history polling with one activity stream and preserve
         }),
       };
     }
-    return { ok: true, json: async () => ({ items: [{ ...source, status: 'PARSED' }] }) };
+    return { ok: true, json: async () => ({ items: [source] }) };
   });
   vi.stubGlobal('fetch', fetchMock);
   render(<SourcesWorkspace initialSources={[source]} />);
 
   fireEvent.click(screen.getByText('science.pdf'));
   await screen.findByText('Upstage Document Parse 시작');
+  expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/artifacts?'))).toBe(false);
+  fireEvent.click(screen.getByRole('tab', { name: '파싱 원문' }));
+  expect(await screen.findByText('# 교과서 사람이 읽는 원문')).toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/artifacts?kind=revision'))).toHaveLength(1);
+  fireEvent.click(screen.getByRole('tab', { name: '파싱 페이지' }));
+  expect(await screen.findByText('첫 페이지')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '페이지 더 보기' }));
+  expect(await screen.findByText('둘째 페이지')).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith(
+    '/api/sources/source-a/artifacts?kind=pages&limit=5&revisionId=revision-1&afterPage=1',
+    { cache: 'no-store' },
+  );
+  fireEvent.click(screen.getByRole('button', { name: '페이지 더 보기' }));
+  expect(await screen.findByText('새 revision 페이지')).toBeInTheDocument();
+  expect(screen.queryByText('혼합되면 안 되는 페이지')).not.toBeInTheDocument();
+  expect(screen.queryByText('첫 페이지')).not.toBeInTheDocument();
   await waitFor(() => expect(EventSourceStub.instances).toHaveLength(1));
   expect(EventSourceStub.instances[0]!.url).toBe('/api/events/source/source-a?after=10');
   expect(intervalSpy.mock.calls.some(([, delay]) => delay === 1_000 || delay === 1_500)).toBe(false);
@@ -376,16 +559,28 @@ test('source replaces full-history polling with one activity stream and preserve
       aggregateId: 'source-a',
       eventType: 'SECOND_SOURCE_EVENT',
     });
+    EventSourceStub.instances[0]!.emitActivity({
+      id: '13',
+      aggregate: 'source',
+      aggregateId: 'source-a',
+      eventType: 'PIPELINE_COMPLETED',
+    });
   });
 
   expect(screen.getByText('실시간 연결')).toBeInTheDocument();
   expect(screen.getByText('UNREGISTERED_SOURCE_EVENT')).toBeInTheDocument();
   expect(screen.getByText('SECOND_SOURCE_EVENT')).toBeInTheDocument();
+  expect(screen.getByText('교과서 처리 완료')).toBeInTheDocument();
   await waitFor(() => expect(fetchMock.mock.calls.filter(
     ([url]) => String(url).includes('/activity?history=0'),
   )).toHaveLength(1));
+  expect(within(screen.getAllByText('science.pdf')[0]!.closest('tr')!).getByText('완료')).toBeInTheDocument();
   expect(screen.getByText('Upstage Document Parse 시작')).toBeInTheDocument();
   expect(screen.getByText('UNREGISTERED_SOURCE_EVENT')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('tab', { name: '파싱 원문' }));
+  await waitFor(() => expect(fetchMock.mock.calls.filter(
+    ([url]) => String(url).includes('/artifacts?kind=revision'),
+  )).toHaveLength(2));
 });
 
 test('generation uses one generic activity event and coalesces snapshot refresh without clearing history', async () => {
@@ -439,7 +634,7 @@ test('generation uses one generic activity event and coalesces snapshot refresh 
           state: 'RUNNING',
           requested_count: 2,
           created_at: '2026-07-26T00:00:00.000Z',
-          progress: { completedQuestions: 1, failedQuestions: 0 },
+          progress: { completedQuestions: 0, failedQuestions: 0 },
         }],
       }),
     };
@@ -471,6 +666,7 @@ test('generation uses one generic activity event and coalesces snapshot refresh 
   await waitFor(() => expect(fetchMock.mock.calls.some(
     ([url]) => String(url).includes('/activity?history=0'),
   )).toBe(true));
+  expect(within(screen.getByText('batch-a').closest('button')!).getByText('1/2문항')).toBeInTheDocument();
   expect(screen.getByText('생성 배치 시작')).toBeInTheDocument();
   expect(screen.getByText('UNREGISTERED_GENERATION_EVENT')).toBeInTheDocument();
 });

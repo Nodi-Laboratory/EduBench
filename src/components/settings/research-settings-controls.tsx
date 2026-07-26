@@ -384,7 +384,7 @@ function DocumentControls({
         min={1}
         max={20}
         range
-        help="동시에 처리하는 페이지 수입니다. 높이면 빨라지지만 Upstage 호출 한도에 도달할 수 있습니다."
+        help="연구자가 요청하는 페이지 동시 처리 수입니다. 현재 런타임은 낮은 요금제의 429 오류를 막기 위해 기본 최대 2개로 보호하며, UPSTAGE_DOCUMENT_PARSE_MAX_CONCURRENCY 환경변수로 상한을 조정할 수 있습니다."
         onChange={(value) => update((next) => { next.settings.pageConcurrency = value; })}
       />
       <NumberControl

@@ -12,7 +12,6 @@ import {
   LoaderCircle,
   ScrollText,
 } from 'lucide-react';
-import { DOCUMENT_PARSE_BASE64_ENCODING } from '@/domain/document-parse-config';
 
 type LabPage = {
   pageNumber: number;
@@ -34,6 +33,14 @@ type LabResponse = {
   requestConfig: unknown;
   mock: boolean;
 };
+type LabError = {
+  message: string;
+  code: string | null;
+  page: number | null;
+  requestId: string | null;
+  status: number | null;
+  category: string | null;
+};
 
 type HtmlTab = 'preview' | 'source';
 type DetailTab = 'elements' | 'raw' | 'request';
@@ -51,6 +58,27 @@ const detailTabs: readonly { id: DetailTab; label: string }[] = [
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function configValue(value: unknown) {
+  if (value == null) return '기록 없음';
+  return Array.isArray(value) ? JSON.stringify(value) : String(value);
+}
+
+function rasterizationValue(value: unknown) {
+  const rasterization = record(value);
+  const parts = [
+    rasterization.format == null ? null : `format=${String(rasterization.format)}`,
+    rasterization.dpi == null ? null : `dpi=${String(rasterization.dpi)}`,
+    rasterization.jpegQuality == null ? null : `jpegQuality=${String(rasterization.jpegQuality)}`,
+  ].filter((part): part is string => Boolean(part));
+  return parts.length ? parts.join(' · ') : '기록 없음';
 }
 
 function previewDocument(html: string) {
@@ -90,9 +118,10 @@ export function DocumentLabWorkspace() {
   const [htmlTab, setHtmlTab] = useState<HtmlTab>('preview');
   const [detailTab, setDetailTab] = useState<DetailTab>('elements');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LabError | null>(null);
 
   const page = result?.pages[selectedPage] ?? null;
+  const requestConfig = record(result?.requestConfig);
 
   function selectFile(nextFile: File | null) {
     setFile(nextFile);
@@ -114,12 +143,37 @@ export function DocumentLabWorkspace() {
     form.set('file', file);
     try {
       const response = await fetch('/api/document-lab/parse', { method: 'POST', body: form });
-      const body = await response.json() as LabResponse & { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '문서를 파싱하지 못했습니다.');
+      const body = await response.json() as LabResponse & {
+        message?: string;
+        code?: string;
+        page?: number;
+        pageNumber?: number;
+        requestId?: string;
+        status?: number;
+        category?: string;
+      };
+      if (!response.ok) {
+        setError({
+          message: body.message ?? '문서를 파싱하지 못했습니다.',
+          code: body.code ?? null,
+          page: body.pageNumber ?? body.page ?? null,
+          requestId: body.requestId ?? null,
+          status: body.status ?? null,
+          category:body.category ?? null,
+        });
+        return;
+      }
       if (!Array.isArray(body.pages) || body.pages.length === 0) throw new Error('파싱된 페이지가 없습니다.');
       setResult(body);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '문서를 파싱하지 못했습니다.');
+      setError({
+        message: caught instanceof Error ? caught.message : '문서를 파싱하지 못했습니다.',
+        code: null,
+        page: null,
+        requestId: null,
+        status: null,
+        category:null,
+      });
     } finally {
       setLoading(false);
     }
@@ -154,17 +208,32 @@ export function DocumentLabWorkspace() {
             {loading ? <><LoaderCircle className="lab-spinner" size={15} /> 파싱 중…</> : '문서 파싱'}
           </button>
         </form>
-        <div className="lab-config-values" aria-label="고정 요청 설정">
-          <div><span>MODE</span><strong>Enhanced</strong></div>
-          <div><span>OCR</span><code>ocr=force</code></div>
-          <div><span>BASE64</span><code>{`base64_encoding=${JSON.stringify(DOCUMENT_PARSE_BASE64_ENCODING)}`}</code></div>
-          <div><span>OUTPUT</span><code>{"output_formats=['html']"}</code></div>
+        <div className="lab-config-values" aria-label={result ? '실제 요청 설정' : '적용 요청 설정'}>
+          {result ? <>
+            <div><span>MODE</span><code>{`mode=${configValue(requestConfig.mode)}`}</code></div>
+            <div><span>OCR</span><code>{`ocr=${configValue(requestConfig.ocr)}`}</code></div>
+            <div><span>BASE64</span><code>{`base64_encoding=${configValue(requestConfig.base64_encoding)}`}</code></div>
+            <div><span>OUTPUT</span><code>{`output_formats=${configValue(requestConfig.output_formats)}`}</code></div>
+            <div><span>RASTER</span><code>{rasterizationValue(requestConfig.rasterization)}</code></div>
+          </> : <div><span>PROFILE</span><strong>활성 연구 프로필 사용</strong></div>}
           <div className="lab-runtime-state"><span>ENV</span><strong className={result?.mock ? 'is-mock' : ''}>{loading ? 'PARSING' : result ? (result.mock ? 'MOCK' : 'LIVE') : '실행 전'}</strong></div>
         </div>
       </section>
 
       {loading && <p className="lab-status-message" role="status"><LoaderCircle className="lab-spinner" size={16} /> 문서를 페이지별로 분석하고 있습니다.</p>}
-      {error && <div className="lab-error" role="alert"><AlertTriangle size={17} /><div><strong>{error}</strong><span>파일 형식과 서버 설정을 확인한 뒤 같은 파일로 다시 시도하세요.</span></div></div>}
+      {error && <div className="lab-error" role="alert"><AlertTriangle size={17} /><div>
+        <strong>{error.message}</strong>
+        {(error.code || error.category || error.page != null || error.requestId || error.status != null) && <span className="mono">
+          {[
+            error.code,
+            error.category,
+            error.page == null ? null : `페이지 ${error.page}`,
+            error.requestId == null ? null : `request ${error.requestId}`,
+            error.status == null ? null : `HTTP ${error.status}`,
+          ].filter(Boolean).join(' · ')}
+        </span>}
+        <span>파일 형식과 서버 설정을 확인한 뒤 같은 파일로 다시 시도하세요.</span>
+      </div></div>}
 
       <div className="document-lab-grid">
         <section className="panel lab-pane lab-original-pane" aria-labelledby="lab-original-title">

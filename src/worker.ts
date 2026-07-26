@@ -5,9 +5,18 @@ import { migrate } from '@/server/db/migrate';
 import { db } from '@/server/db/pool';
 import { createRunProviderResolver } from '@/server/providers/registry';
 import { processDocument, markDocumentFailed } from '@/server/documents/pipeline';
+import { classifyDocumentFailure } from '@/server/documents/failure';
 import { generateQuestions, markGenerationFailed } from '@/server/questions/generator';
 import { classifyGenerationFailure } from '@/server/questions/failure';
-import { claimJobs, completeJob, failJob, recoverExpiredLeases, withJobLeaseHeartbeat } from '@/server/jobs/queue';
+import {
+  claimJobs,
+  completeJob,
+  failJob,
+  recoverExpiredLeases,
+  releaseJobForShutdown,
+  withJobLeaseHeartbeat,
+} from '@/server/jobs/queue';
+import { fillTaskSlots, TaskSlotPool } from '@/server/jobs/task-slot-pool';
 import { scoreRun } from '@/server/scoring/service';
 import { executeRunItem, providerErrorDetails } from '@/server/runs/executor';
 import { DomainError } from '@/domain/errors';
@@ -19,9 +28,25 @@ import {
 const workerId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const resolveRunProvider = createRunProviderResolver();
+const persistentTaskPool = new TaskSlotPool(
+  {
+    'document.parse':2,
+    'question.generate':4,
+  },
+  (error, taskId) => {
+    console.error(`[EduBench worker] persistent task ${taskId} escaped`, error);
+  },
+);
 let stopping = false;
-process.on('SIGINT', () => { stopping = true; });
-process.on('SIGTERM', () => { stopping = true; });
+const workerShutdown = new AbortController();
+const stopWorker = (signal: string) => {
+  stopping = true;
+  if (!workerShutdown.signal.aborted) {
+    workerShutdown.abort(new Error(`WORKER_SHUTDOWN: received ${signal}`));
+  }
+};
+process.on('SIGINT', () => stopWorker('SIGINT'));
+process.on('SIGTERM', () => stopWorker('SIGTERM'));
 
 async function processBenchmarkRuns() {
   const runs = await db.query<{ id: string }>("select id from benchmark_runs where state = 'RUNNING' order by created_at limit 20");
@@ -45,7 +70,11 @@ async function processBenchmarkRuns() {
         );
         return;
       }
-      try { await executeRunItem(item, workerId, provider); }
+      try {
+        await executeRunItem(item, workerId, provider, {
+          signal:workerShutdown.signal,
+        });
+      }
       catch (error) {
         const detail = providerErrorDetails(error);
         await failRunItem(item.id, workerId, detail.code, detail.message);
@@ -57,56 +86,98 @@ async function processBenchmarkRuns() {
   return processed;
 }
 
-async function processPersistentJobs() {
-  const leaseMs = 10 * 60_000;
-  const jobs = await claimJobs(workerId, 4, leaseMs, ['document.parse', 'question.generate']);
-  await Promise.all(jobs.map(async (job) => {
-    const lease = { jobId: job.id, workerId, attempt: job.attempts };
-    try {
-      const result = await withJobLeaseHeartbeat(lease, { leaseMs, heartbeatMs: job.kind === 'document.parse' ? 1_000 : undefined }, async (signal) => {
-        if (job.kind === 'document.parse') return processDocument(String(job.payload.sourceId), { signal, jobId: job.id });
-        if (job.kind === 'question.generate') {
-          return generateQuestions(String(job.payload.batchId), {
-            signal,
-            lease,
-          });
-        }
-        throw new Error(`UNKNOWN_JOB_KIND: ${job.kind}`);
-      });
-      await completeJob(lease, result);
-    } catch (error) {
-      let leaseLost = error instanceof DomainError && error.code === 'JOB_LEASE_MISMATCH';
-      if (!leaseLost && job.kind === 'document.parse') await markDocumentFailed(String(job.payload.sourceId), error, job.id);
-      if (!leaseLost && job.kind === 'question.generate') {
-        try {
-          await markGenerationFailed(String(job.payload.batchId), error, lease);
-        } catch (reconciliationError) {
-          if (reconciliationError instanceof DomainError && reconciliationError.code === 'JOB_LEASE_MISMATCH') {
-            leaseLost = true;
-          } else {
-            console.error(`[EduBench worker] could not reconcile generation ${job.payload.batchId}`, reconciliationError);
-          }
-        }
+type ClaimedJob = Awaited<ReturnType<typeof claimJobs>>[number];
+
+async function processPersistentJob(job: ClaimedJob, leaseMs: number) {
+  const lease = { jobId: job.id, workerId, attempt: job.attempts };
+  try {
+    const result = await withJobLeaseHeartbeat(lease, {
+      leaseMs,
+      heartbeatMs: job.kind === 'document.parse' ? 1_000 : undefined,
+      signal:workerShutdown.signal,
+    }, async (signal) => {
+      if (job.kind === 'document.parse') return processDocument(String(job.payload.sourceId), { signal, jobId: job.id });
+      if (job.kind === 'question.generate') {
+        return generateQuestions(String(job.payload.batchId), {
+          signal,
+          lease,
+        });
       }
-      const message = error instanceof Error ? error.message : '알 수 없는 작업 오류';
+      throw new Error(`UNKNOWN_JOB_KIND: ${job.kind}`);
+    });
+    await completeJob(lease, result);
+  } catch (error) {
+    let leaseLost = error instanceof DomainError && error.code === 'JOB_LEASE_MISMATCH';
+    if (!leaseLost && workerShutdown.signal.aborted) {
       try {
-        if (!leaseLost) {
-          const generationFailure = job.kind === 'question.generate'
-            ? classifyGenerationFailure(error)
-            : null;
-          await failJob(lease, {
-            code: generationFailure?.code ?? (message.split(':', 1)[0] || 'JOB_FAILED'),
-            message,
-            retryDelayMs: 5_000,
-            retryable: generationFailure?.retryable,
-          });
-        }
+        await releaseJobForShutdown(lease);
       } catch (leaseError) {
-        console.error(`[EduBench worker] could not record failure for job ${job.id}`, leaseError);
+        console.error(`[EduBench worker] could not release shutdown job ${job.id}`, leaseError);
+      }
+      return;
+    }
+    if (!leaseLost && job.kind === 'document.parse') await markDocumentFailed(String(job.payload.sourceId), error, job.id);
+    if (!leaseLost && job.kind === 'question.generate') {
+      try {
+        await markGenerationFailed(String(job.payload.batchId), error, lease);
+      } catch (reconciliationError) {
+        if (reconciliationError instanceof DomainError && reconciliationError.code === 'JOB_LEASE_MISMATCH') {
+          leaseLost = true;
+        } else {
+          console.error(`[EduBench worker] could not reconcile generation ${job.payload.batchId}`, reconciliationError);
+        }
       }
     }
-  }));
-  return jobs.length;
+    const message = error instanceof Error ? error.message : '알 수 없는 작업 오류';
+    try {
+      if (!leaseLost) {
+        const generationFailure = job.kind === 'question.generate'
+          ? classifyGenerationFailure(error)
+          : null;
+        const documentFailure = job.kind === 'document.parse'
+          ? classifyDocumentFailure(error)
+          : null;
+        await failJob(lease, {
+          code: generationFailure?.code
+            ?? documentFailure?.code
+            ?? (message.split(':', 1)[0] || 'JOB_FAILED'),
+          message,
+          retryDelayMs: 5_000,
+          retryable: generationFailure?.retryable ?? documentFailure?.retryable,
+          ...(documentFailure?.provider
+            ? { details:{ provider:documentFailure.provider } }
+            : {}),
+        });
+      }
+    } catch (leaseError) {
+      console.error(`[EduBench worker] could not record failure for job ${job.id}`, leaseError);
+    }
+  }
+}
+
+async function processPersistentJobs() {
+  const leaseMs = 10 * 60_000;
+  const [documents, generations] = await Promise.all([
+    fillTaskSlots({
+      pool:persistentTaskPool,
+      kind:'document.parse',
+      claim:(limit) => claimJobs(workerId, limit, leaseMs, ['document.parse']),
+      run:(job) => processPersistentJob(job, leaseMs),
+      onClaimError:(error, kind) => {
+        console.error(`[EduBench worker] could not claim ${kind}`, error);
+      },
+    }),
+    fillTaskSlots({
+      pool:persistentTaskPool,
+      kind:'question.generate',
+      claim:(limit) => claimJobs(workerId, limit, leaseMs, ['question.generate']),
+      run:(job) => processPersistentJob(job, leaseMs),
+      onClaimError:(error, kind) => {
+        console.error(`[EduBench worker] could not claim ${kind}`, error);
+      },
+    }),
+  ]);
+  return documents + generations;
 }
 
 async function processScoringRuns() {
@@ -123,7 +194,7 @@ async function processScoringRuns() {
   );
   for (const run of runs.rows) {
     try {
-      const result = await scoreRun(run.id);
+      const result = await scoreRun(run.id, workerShutdown.signal);
       if (!result.claimed) continue;
     }
     catch (error) {
@@ -150,20 +221,47 @@ async function processRunControls() {
   return runs.rowCount ?? 0;
 }
 
-export async function main() {
-  await migrate();
+async function persistentJobLoop() {
   let lastRecovery = 0;
-  console.info(`[EduBench worker] started ${workerId}`);
   while (!stopping) {
     try {
-      if (Date.now() - lastRecovery > 30_000) { await Promise.all([recoverExpiredRunItemLeases(), recoverExpiredLeases()]); lastRecovery = Date.now(); }
-      const processed = (await processPersistentJobs()) + (await processBenchmarkRuns()) + (await processScoringRuns()) + (await processCancellations()) + (await processRunControls());
-      if (!processed) await sleep(500);
+      if (Date.now() - lastRecovery > 30_000) {
+        await recoverExpiredLeases();
+        lastRecovery = Date.now();
+      }
+      if (!await processPersistentJobs()) await sleep(250);
     } catch (error) {
-      console.error('[EduBench worker] loop recovered from error', error);
+      console.error('[EduBench worker] persistent loop recovered from error', error);
       await sleep(1_000);
     }
   }
+}
+
+async function benchmarkLoop() {
+  let lastRecovery = 0;
+  while (!stopping) {
+    try {
+      if (Date.now() - lastRecovery > 30_000) {
+        await recoverExpiredRunItemLeases();
+        lastRecovery = Date.now();
+      }
+      const processed = (await processBenchmarkRuns())
+        + (await processScoringRuns())
+        + (await processCancellations())
+        + (await processRunControls());
+      if (!processed) await sleep(500);
+    } catch (error) {
+      console.error('[EduBench worker] benchmark loop recovered from error', error);
+      await sleep(1_000);
+    }
+  }
+}
+
+export async function main() {
+  await migrate();
+  console.info(`[EduBench worker] started ${workerId}`);
+  await Promise.all([persistentJobLoop(), benchmarkLoop()]);
+  await persistentTaskPool.drain();
   await db.end();
   console.info('[EduBench worker] stopped');
 }

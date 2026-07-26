@@ -62,7 +62,7 @@ export function createDocumentLabPostHandler(
       )();
       return NextResponse.json(await (
         dependencies.parseFile ?? parseDocumentLabFile
-      )(file, { profile }));
+      )(file, { profile, signal:request.signal }));
     } catch (error) {
       if (error instanceof DocumentLabError) {
         return NextResponse.json({ code: error.code, message: error.message }, { status: error.status });

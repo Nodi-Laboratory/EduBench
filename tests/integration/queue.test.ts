@@ -6,6 +6,7 @@ import {
   completeJob,
   enqueueJob,
   failJob,
+  releaseJobForShutdown,
   recoverExpiredLeases,
   renewJobLease,
   withJobLeaseHeartbeat,
@@ -132,6 +133,57 @@ test('renews a slow job through its claim attempt until all sequential work fini
 
   expect(pages).toEqual([1, 2, 3]);
   await completeJob(lease, { pages: pages.length });
+});
+
+test('propagates a worker shutdown signal into an active leased operation', async () => {
+  await enqueueJob({ kind: 'document.parse', payload: { sourceId: 'shutdown' }, idempotencyKey: 'parse:shutdown' });
+  const [job] = await claimJobs('worker-shutdown', 1, 60_000);
+  const lease = { jobId: job!.id, workerId: 'worker-shutdown', attempt: job!.attempts };
+  const controller = new AbortController();
+  const reason = new Error('worker stopping');
+
+  const active = withJobLeaseHeartbeat(
+    lease,
+    { leaseMs: 60_000, heartbeatMs: 20, signal:controller.signal },
+    async (signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once:true });
+    }),
+  );
+  controller.abort(reason);
+
+  await expect(active).rejects.toBe(reason);
+});
+
+test('releases a shutdown job without consuming its final attempt', async () => {
+  await enqueueJob({
+    kind:'document.parse',
+    payload:{ sourceId:'shutdown-final-attempt' },
+    idempotencyKey:'parse:shutdown-final-attempt',
+    maxAttempts:1,
+  });
+  const [job] = await claimJobs('worker-shutdown-final', 1, 60_000);
+  const lease = {
+    jobId:job!.id,
+    workerId:'worker-shutdown-final',
+    attempt:job!.attempts,
+  };
+
+  await releaseJobForShutdown(lease);
+  const released = await db.query<{
+    state:string;
+    attempts:number;
+    max_attempts:number;
+    last_error_code:string;
+  }>('select state,attempts,max_attempts,last_error_code from jobs where id=$1', [job!.id]);
+  expect(released.rows[0]).toEqual({
+    state:'RETRY_WAIT',
+    attempts:1,
+    max_attempts:2,
+    last_error_code:'WORKER_SHUTDOWN',
+  });
+
+  const [resumed] = await claimJobs('replacement-worker', 1, 60_000);
+  expect(resumed).toMatchObject({ id:job!.id, attempts:2 });
 });
 
 test('rejects renewal, completion, and failure from a reclaimed attempt even with the same worker id', async () => {
