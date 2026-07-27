@@ -76,8 +76,19 @@ export type DatasetAuditVersion = {
   questions: AuditQuestion[];
 };
 
+export type QuestionSetAudit = {
+  id: string;
+  title: string;
+  description: string | null;
+  questionCount: number;
+  createdAt: string;
+  updatedAt: string;
+  questions: AuditQuestion[];
+};
+
 export type DatasetAuditData = {
   workingQuestions: AuditQuestion[];
+  questionSets: QuestionSetAudit[];
   versions: DatasetAuditVersion[];
 };
 
@@ -162,27 +173,59 @@ const questionProjection = `
   where qe.question_id=q.id and qe.question_revision=qr.revision),'[]'::jsonb) evidence`;
 
 export async function getDatasetAuditData(): Promise<DatasetAuditData> {
-  const [working, versions, pinned] = await Promise.all([
+  const [working, sets, versions, pinnedSets, pinnedVersions] = await Promise.all([
     db.query(`select ${questionProjection},null::integer ordinal from questions q
       join question_revisions qr on qr.question_id=q.id and qr.revision=q.current_revision
       left join generation_batches gb on gb.id=q.generation_batch_id
       where q.status='APPROVED' and q.deleted_at is null and coalesce(q.generator_provider,'') <> 'sample'
-      and coalesce(q.generator_model,'') not like 'mock-%' order by q.public_id`),
+      and coalesce(q.generator_model,'') not like 'mock-%'
+      and not exists (
+        select 1 from question_set_questions qsq
+        join question_sets qs on qs.id=qsq.question_set_id
+        where qsq.question_id=q.id and qs.deleted_at is null
+      )
+      order by q.public_id`),
+    db.query(`select qs.id,qs.title,qs.description,qs.created_at::text created_at,
+      qs.updated_at::text updated_at,count(qsq.question_id)::integer question_count
+      from question_sets qs
+      left join question_set_questions qsq on qsq.question_set_id=qs.id
+      where qs.deleted_at is null
+      group by qs.id order by qs.updated_at desc,qs.created_at desc`),
     db.query(`select dv.id,dv.version,dv.status,dv.title,dv.description,dv.question_count,dv.distribution,dv.content_hash,
       parent.version parent_version,dv.published_at::text published_at from dataset_versions dv
       left join dataset_versions parent on parent.id=dv.parent_version_id order by dv.published_at desc`),
+    db.query(`select ${questionProjection},qsq.ordinal,qsq.question_set_id from question_set_questions qsq
+      join question_sets qs on qs.id=qsq.question_set_id and qs.deleted_at is null
+      join questions q on q.id=qsq.question_id
+      join question_revisions qr on qr.question_id=qsq.question_id and qr.revision=qsq.question_revision
+      left join generation_batches gb on gb.id=q.generation_batch_id
+      order by qsq.question_set_id,qsq.ordinal`),
     db.query(`select ${questionProjection},dq.ordinal,dq.dataset_version_id from dataset_questions dq
       join questions q on q.id=dq.question_id
       join question_revisions qr on qr.question_id=dq.question_id and qr.revision=dq.question_revision
       left join generation_batches gb on gb.id=q.generation_batch_id order by dq.dataset_version_id,dq.ordinal`),
   ]);
+  const pinnedBySet = new Map<string, AuditQuestion[]>();
+  for (const row of pinnedSets.rows) {
+    const key = String(row.question_set_id);
+    pinnedBySet.set(key, [...(pinnedBySet.get(key) ?? []), normalizeQuestion(row)]);
+  }
   const pinnedByVersion = new Map<string, AuditQuestion[]>();
-  for (const row of pinned.rows) {
+  for (const row of pinnedVersions.rows) {
     const key = String(row.dataset_version_id);
     pinnedByVersion.set(key, [...(pinnedByVersion.get(key) ?? []), normalizeQuestion(row)]);
   }
   return {
     workingQuestions: working.rows.map(normalizeQuestion),
+    questionSets: sets.rows.map((row) => ({
+      id: String(row.id),
+      title: String(row.title),
+      description: text(row.description),
+      questionCount: Number(row.question_count),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      questions: pinnedBySet.get(String(row.id)) ?? [],
+    })),
     versions: versions.rows.map((row) => ({
       id: String(row.id), version: String(row.version), status: String(row.status), title: String(row.title),
       description: text(row.description), questionCount: Number(row.question_count), distribution: record(row.distribution),

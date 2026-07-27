@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { BookOpen, Check, Clock3, Edit3, Trash2 } from "lucide-react";
+import { BookOpen, Check, Clock3, Edit3, FolderPlus, Layers3, Trash2 } from "lucide-react";
 
 type BenchmarkDesign = {
   taskType: string;
@@ -30,12 +30,22 @@ export type ReviewQuestion = {
   quality_scores: { benchmarkDesign?: BenchmarkDesign };
 };
 
+export type ReviewQuestionSet = {
+  id: string;
+  title: string;
+  description: string | null;
+  questionCount: number;
+};
+
 export function ReviewWorkspace({
   questions,
+  questionSets = [],
 }: {
   questions: ReviewQuestion[];
+  questionSets?: ReviewQuestionSet[];
 }) {
   const [items, setItems] = useState(questions);
+  const [sets, setSets] = useState(questionSets);
   const [selectedId, setSelectedId] = useState<string | null>(
     questions[0]?.id ?? null,
   );
@@ -49,52 +59,102 @@ export function ReviewWorkspace({
   const [answerText, setAnswerText] = useState(selected?.answer_text ?? "");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [targetMode, setTargetMode] = useState<"existing" | "new">(
+    questionSets.length ? "existing" : "new",
+  );
+  const [selectedSetId, setSelectedSetId] = useState(
+    questionSets[0]?.id ?? "",
+  );
+  const [newSetTitle, setNewSetTitle] = useState("");
   function selectQuestion(question: ReviewQuestion | null) {
     setSelectedId(question?.id ?? null);
     setQuestionText(question?.question_text ?? "");
     setAnswerText(question?.answer_text ?? "");
   }
   async function review(
-    action: "APPROVE" | "EDIT_AND_APPROVE" | "HOLD" | "DELETE",
+    action: "APPROVE" | "EDIT_AND_APPROVE" | "HOLD" | "REOPEN" | "DELETE",
   ) {
     if (!selected) return;
+    const approves = action === "APPROVE" || action === "EDIT_AND_APPROVE";
+    if (
+      approves &&
+      ((targetMode === "existing" && !selectedSetId) ||
+        (targetMode === "new" && !newSetTitle.trim()))
+    ) {
+      setNotice("승인할 기존 질문 세트를 선택하거나 새 세트 이름을 입력하세요.");
+      return;
+    }
     setBusy(true);
     setNotice("");
-    const response = await fetch(`/api/questions/${selected.id}/review`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        action,
-        questionText,
-        answerText,
-        scoringCriteria: selected.scoring_criteria,
-        note:
-          action === "EDIT_AND_APPROVE" ? "검수 화면 수정 후 승인" : undefined,
-      }),
-    });
-    const body = await response.json();
-    if (!response.ok)
-      setNotice(body.message ?? "검수 작업을 저장하지 못했습니다.");
-    else if (action === "HOLD")
-      setItems((current) =>
-        current.map((item) =>
-          item.id === selected.id ? { ...item, status: "HELD" } : item,
-        ),
-      );
-    else {
-      const remaining = items.filter((item) => item.id !== selected.id);
-      setItems(remaining);
-      selectQuestion(remaining[0] ?? null);
+    try {
+      const response = await fetch(`/api/questions/${selected.id}/review`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action,
+          questionText,
+          answerText,
+          scoringCriteria: selected.scoring_criteria,
+          note:
+            action === "EDIT_AND_APPROVE"
+              ? "검수 화면 수정 후 승인"
+              : undefined,
+          targetSet: approves
+            ? targetMode === "existing"
+              ? { kind: "existing", id: selectedSetId }
+              : { kind: "new", title: newSetTitle.trim() }
+            : undefined,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok)
+        setNotice(body.message ?? "검수 작업을 저장하지 못했습니다.");
+      else if (action === "HOLD" || action === "REOPEN")
+        setItems((current) =>
+          current.map((item) =>
+            item.id === selected.id
+              ? { ...item, status: action === "HOLD" ? "HELD" : "IN_REVIEW" }
+              : item,
+          ),
+        );
+      else {
+        if (body.questionSet) {
+          setSets((current) => {
+            const existing = current.find(
+              (set) => set.id === body.questionSet.id,
+            );
+            if (existing) {
+              return current.map((set) =>
+                set.id === body.questionSet.id
+                  ? { ...set, questionCount: body.questionSet.questionCount }
+                  : set,
+              );
+            }
+            return [...current, body.questionSet];
+          });
+          setSelectedSetId(body.questionSet.id);
+          setTargetMode("existing");
+          setNewSetTitle("");
+        }
+        const remaining = items.filter((item) => item.id !== selected.id);
+        setItems(remaining);
+        selectQuestion(remaining[0] ?? null);
+      }
+      if (response.ok)
+        setNotice(
+          action === "DELETE"
+            ? "문항을 삭제했습니다."
+            : action === "HOLD"
+              ? "문항을 보류했습니다."
+              : action === "REOPEN"
+                ? "문항을 검수 대기 상태로 되돌렸습니다."
+                : "문항을 승인했습니다.",
+        );
+    } catch {
+      setNotice("검수 작업을 저장하지 못했습니다. 다시 시도하세요.");
+    } finally {
+      setBusy(false);
     }
-    if (response.ok)
-      setNotice(
-        action === "DELETE"
-          ? "문항을 삭제했습니다."
-          : action === "HOLD"
-            ? "문항을 보류했습니다."
-            : "문항을 승인했습니다.",
-      );
-    setBusy(false);
   }
   return (
     <div className="workflow-page review-page">
@@ -177,6 +237,60 @@ export function ReviewWorkspace({
                   </div>
                 ))}
               </div>
+              <section className="review-set-target" aria-label="승인 대상 질문 세트">
+                <div className="review-set-target-heading">
+                  <div>
+                    <Layers3 size={16} />
+                    <strong>승인 대상 질문 세트</strong>
+                  </div>
+                  <small>승인한 revision이 선택한 세트에 고정됩니다.</small>
+                </div>
+                <div className="segmented-control" role="group" aria-label="질문 세트 지정 방식">
+                  <button
+                    type="button"
+                    aria-pressed={targetMode === "existing"}
+                    disabled={!sets.length}
+                    onClick={() => setTargetMode("existing")}
+                  >
+                    기존 세트에 승인
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={targetMode === "new"}
+                    onClick={() => setTargetMode("new")}
+                  >
+                    새 세트에 승인
+                  </button>
+                </div>
+                {targetMode === "existing" ? (
+                  <label>
+                    승인할 질문 세트
+                    <select
+                      value={selectedSetId}
+                      onChange={(event) => setSelectedSetId(event.target.value)}
+                    >
+                      {sets.map((set) => (
+                        <option key={set.id} value={set.id}>
+                          {set.title} · {set.questionCount}문항
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <label>
+                    새 질문 세트 이름
+                    <span className="input-with-icon">
+                      <FolderPlus size={15} />
+                      <input
+                        value={newSetTitle}
+                        onChange={(event) => setNewSetTitle(event.target.value)}
+                        placeholder="예: 중학교 과학 선수관계"
+                        maxLength={200}
+                      />
+                    </span>
+                  </label>
+                )}
+              </section>
             </div>
           ) : (
             <div className="editor-content empty-editor">
@@ -189,13 +303,23 @@ export function ReviewWorkspace({
             </div>
           )}
           <div className="review-actions">
-            <button
-              className="button"
-              disabled={!selected || busy}
-              onClick={() => review("HOLD")}
-            >
-              <Clock3 size={14} /> 보류
-            </button>
+            {selected?.status === "HELD" ? (
+              <button
+                className="button"
+                disabled={busy}
+                onClick={() => review("REOPEN")}
+              >
+                <Clock3 size={14} /> 검수 재개
+              </button>
+            ) : (
+              <button
+                className="button"
+                disabled={!selected || busy}
+                onClick={() => review("HOLD")}
+              >
+                <Clock3 size={14} /> 보류
+              </button>
+            )}
             <button
               className="button danger"
               disabled={!selected || busy}
@@ -205,14 +329,24 @@ export function ReviewWorkspace({
             </button>
             <button
               className="button"
-              disabled={!selected || busy}
+              disabled={
+                !selected ||
+                selected.status === "HELD" ||
+                busy ||
+                (targetMode === "existing" ? !selectedSetId : !newSetTitle.trim())
+              }
               onClick={() => review("EDIT_AND_APPROVE")}
             >
               <Edit3 size={14} /> 수정 후 승인
             </button>
             <button
               className="button primary"
-              disabled={!selected || busy}
+              disabled={
+                !selected ||
+                selected.status === "HELD" ||
+                busy ||
+                (targetMode === "existing" ? !selectedSetId : !newSetTitle.trim())
+              }
               onClick={() => review("APPROVE")}
             >
               <Check size={14} /> 승인

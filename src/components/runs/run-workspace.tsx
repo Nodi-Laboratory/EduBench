@@ -5,7 +5,15 @@ import Link from 'next/link';
 import { Activity, ArrowRight, PlayCircle, ServerCog } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
 
-type Dataset = { id: string; version: string; title: string; question_count: number };
+type Dataset = {
+  id: string;
+  version: string;
+  title: string;
+  description?: string | null;
+  question_count: number;
+  content_hash?: string;
+  published_at?: string;
+};
 type Profile = { id: string; version: string; title: string; provenance_unresolved?: boolean };
 type Provider = {
   provider_key:string;
@@ -40,33 +48,41 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
   const [runs, setRuns] = useState(initialRuns);
   const [notice, setNotice] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [selectedDatasetId, setSelectedDatasetId] = useState(datasets[0]?.id ?? '');
+  const [questionLimit, setQuestionLimit] = useState(datasets[0]?.question_count ?? 1);
   const selectableScoreProfiles = scoreProfiles.filter((profile) => !profile.provenance_unresolved);
   const unresolvedProfileCount = scoreProfiles.length - selectableScoreProfiles.length;
+  const selectedDataset = datasets.find((dataset) => dataset.id === selectedDatasetId) ?? null;
 
   async function submit(formData: FormData) {
     setSubmitting(true); setNotice('');
     const selectedProviders = providers.filter((provider) => selected.includes(provider.provider_key));
-    const response = await fetch('/api/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      title: formData.get('title'), datasetVersionId: formData.get('datasetVersionId'), scoreProfileId: formData.get('scoreProfileId'),
-      priceProfileVersion: String(formData.get('priceProfileVersion')), systemPrompt: formData.get('systemPrompt'),
-      questionLimit: Number(formData.get('questionLimit')),
-      models: selectedProviders.map((provider) => ({
-        providerKey: provider.provider_key,
-        displayName: provider.display_name,
-        modelId: provider.modelId,
-        protocol: provider.protocol,
-        parameters:provider.parameters ?? {},
-        concurrency:provider.concurrency ?? 1,
-        requestIntervalMs: provider.requestIntervalMs,
-      })),
-    }) });
-    const body = await response.json();
-    if (!response.ok) setNotice(body.message ?? '실행을 만들지 못했습니다. 입력값을 확인하세요.');
-    else {
-      setNotice(`${body.publicId} 초안을 만들었습니다. 상세 화면에서 실행을 시작하세요.`);
-      setRuns((current) => [{ id: body.id, public_id: body.publicId, title: String(formData.get('title')), state: 'DRAFT', total_items: body.totalItems, completed_items: 0, failed_items: 0, created_at: new Date().toISOString() }, ...current]);
+    try {
+      const response = await fetch('/api/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        title: formData.get('title'), datasetVersionId: formData.get('datasetVersionId'), scoreProfileId: formData.get('scoreProfileId'),
+        priceProfileVersion: String(formData.get('priceProfileVersion')), systemPrompt: formData.get('systemPrompt'),
+        questionLimit: Number(formData.get('questionLimit')),
+        models: selectedProviders.map((provider) => ({
+          providerKey: provider.provider_key,
+          displayName: provider.display_name,
+          modelId: provider.modelId,
+          protocol: provider.protocol,
+          parameters:provider.parameters ?? {},
+          concurrency:provider.concurrency ?? 1,
+          requestIntervalMs: provider.requestIntervalMs,
+        })),
+      }) });
+      const body = await response.json();
+      if (!response.ok) setNotice(body.message ?? '실행을 만들지 못했습니다. 입력값을 확인하세요.');
+      else {
+        setNotice(`${body.publicId} 초안을 만들었습니다. 상세 화면에서 실행을 시작하세요.`);
+        setRuns((current) => [{ id: body.id, public_id: body.publicId, title: String(formData.get('title')), state: 'DRAFT', total_items: body.totalItems, completed_items: 0, failed_items: 0, created_at: new Date().toISOString() }, ...current]);
+      }
+    } catch {
+      setNotice('실행을 만들지 못했습니다. 다시 시도하세요.');
+    } finally {
+      setSubmitting(false);
     }
-    setSubmitting(false);
   }
 
   const seoulDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
@@ -77,11 +93,23 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
         <form className="dense-form" action={submit}>
           <label>실행 제목<input name="title" defaultValue={`공식 비교 실행 ${seoulDate}`} required /></label>
           {unresolvedProfileCount > 0 && <p className="result-warning">Judge 출처가 확인되지 않은 채점 프로필 {unresolvedProfileCount}개를 실행 선택에서 제외했습니다. 설정에서 정확한 Judge 제공자와 모델을 지정한 새 프로필 버전을 만드십시오.</p>}
-          <div className="form-row"><label>불변 데이터셋<select name="datasetVersionId" required>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required disabled={selectableScoreProfiles.length === 0}>{selectableScoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
-          <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input name="questionLimit" type="number" min="1" max="5000" defaultValue={datasets[0]?.question_count ?? 1} required /></label></div>
+          {datasets.length === 0 && <p className="result-warning">실행 가능한 데이터셋이 없습니다. 데이터셋 관리에서 질문 세트를 먼저 발행하세요.</p>}
+          <div className="form-row"><label>사용 데이터셋<select name="datasetVersionId" required disabled={datasets.length === 0} value={selectedDatasetId} onChange={(event) => {
+            const nextId = event.target.value;
+            const nextDataset = datasets.find((dataset) => dataset.id === nextId);
+            setSelectedDatasetId(nextId);
+            setQuestionLimit(nextDataset?.question_count ?? 1);
+          }}>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.title} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required disabled={selectableScoreProfiles.length === 0}>{selectableScoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
+          {selectedDataset && <div className="run-dataset-manifest" aria-live="polite">
+            <div><span className="eyebrow">SELECTED DATASET</span><strong className="mono">{selectedDataset.version}</strong><b>{selectedDataset.title}</b></div>
+            <p>{selectedDataset.description || '설명 없음'}</p>
+            <div><span>문항 <strong className="mono">{selectedDataset.question_count}</strong></span>{selectedDataset.published_at && <span>발행 <strong className="mono">{selectedDataset.published_at.slice(0, 16).replace('T', ' ')}</strong></span>}</div>
+            {selectedDataset.content_hash && <code>{selectedDataset.content_hash}</code>}
+          </div>}
+          <div className="form-row"><label>가격 프로필 버전<input name="priceProfileVersion" defaultValue="manual-2026-07" required /></label><label>문항 수<input aria-label="문항 수" name="questionLimit" type="number" min="1" max={selectedDataset?.question_count ?? 5000} value={questionLimit} onChange={(event) => setQuestionLimit(Number(event.target.value))} required /></label></div>
           <label>시스템 프롬프트<textarea name="systemPrompt" defaultValue="제공된 교과서 근거와 질문의 지시를 따르며, 근거가 부족하면 부족하다고 명시한다." required /></label>
           {!modelProfile && <p className="result-warning">활성 벤치마크 모델 연구 설정이 없습니다. 시스템 설정에서 프로필을 활성화하십시오.</p>}
-          <button className="button primary" disabled={submitting || selected.length === 0 || selectableScoreProfiles.length === 0 || !modelProfile}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
+          <button className="button primary" disabled={submitting || datasets.length === 0 || !selectedDatasetId || selected.length === 0 || selectableScoreProfiles.length === 0 || !modelProfile}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
           {notice && <p className="inline-notice">{notice}</p>}
         </form>
       </section>

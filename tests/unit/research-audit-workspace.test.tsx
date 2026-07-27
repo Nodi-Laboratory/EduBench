@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, expect, test } from 'vitest';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
 import { SettingsWorkspace } from '@/components/settings/settings-workspace';
-import type { AuditQuestion, DatasetAuditVersion } from '@/server/datasets/audit';
+import type { AuditQuestion, DatasetAuditVersion, QuestionSetAudit } from '@/server/datasets/audit';
 
 afterEach(cleanup);
 
@@ -43,18 +43,24 @@ test('dataset workspace exposes working and immutable question research audits',
     questionCount: 1, distribution: { capabilities: { '선수 관계 적용': 1 } }, contentHash: 'abcdef1234567890',
     parentVersion: null, publishedAt: '2026-07-22T00:00:00Z', questions: [pinned],
   }];
+  const questionSets: QuestionSetAudit[] = [{
+    id: 'set-1', title: '과학 선수관계 세트', description: '검수된 편집 세트',
+    questionCount: 1, createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+    questions: [question({ ordinal: 1 })],
+  }];
   render(<DatasetWorkspace
     approvedQuestionIds={['question-1']}
     workingDistribution={{ capabilities: { '선수 관계 적용': 1 }, responseFormats: { '구조화 서술형': 1 }, evidenceModes: { GROUNDED: 1 } }}
-    workingQuestions={[question()]}
+    workingQuestions={[]}
+    questionSets={questionSets}
     versions={versions}
   />);
 
   expect(screen.getByRole('heading', { name: '문항 연구 감사' })).toBeInTheDocument();
-  expect(screen.getByRole('tab', { name: /현재 작업 세트/ })).toBeInTheDocument();
+  expect(screen.getByRole('tab', { name: /현재 질문 세트/ })).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('문항 검색'), { target: { value: '전하' } });
-  expect(screen.getByText('Q-RESEARCH-1')).toBeInTheDocument();
-  fireEvent.click(screen.getByText('Q-RESEARCH-1'));
+  expect(screen.getByText(/Q-RESEARCH-1/)).toBeInTheDocument();
+  fireEvent.click(screen.getByText(/Q-RESEARCH-1/));
   expect(screen.getByText('선수관계 청사진')).toBeInTheDocument();
   expect(screen.getByText('필수 추론 단계')).toBeInTheDocument();
   expect(screen.getByText('교과서 근거')).toBeInTheDocument();

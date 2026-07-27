@@ -5,6 +5,7 @@ import { migrate } from '@/server/db/migrate';
 import { seedDatabase } from '../../scripts/seed';
 import { POST as reviewQuestion } from '@/app/api/questions/[id]/review/route';
 import { POST as freezeDataset } from '@/app/api/datasets/route';
+import { POST as createQuestionSet } from '@/app/api/question-sets/route';
 
 beforeAll(async () => {
   await migrate();
@@ -30,6 +31,12 @@ test('edit-and-approve creates a new revision and an audit action', async () => 
      ) values ($1, 1, '초안 질문', '초안 답안', '[{"key":"concept","maxScore":1}]')`,
     [questionId],
   );
+  const setResponse = await createQuestionSet(new Request('http://localhost/api/question-sets', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: `검수 테스트 세트 ${questionId.slice(0, 8)}` }),
+  }));
+  const questionSetId = (await setResponse.json()).item.id as string;
 
   const response = await reviewQuestion(
     new Request(`http://localhost/api/questions/${questionId}/review`, {
@@ -41,6 +48,7 @@ test('edit-and-approve creates a new revision and an audit action', async () => 
         answerText: '수정된 답안',
         scoringCriteria: [{ key: 'concept', label: '핵심 개념', maxScore: 1 }],
         note: '표현 편향 제거',
+        targetSet: { kind: 'existing', id: questionSetId },
       }),
     }),
     { params: Promise.resolve({ id: questionId }) },

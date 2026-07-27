@@ -811,11 +811,11 @@ test('review workspace keeps question, rubric, and evidence visible together', (
   expect(screen.getByText('교과서 근거')).toBeInTheDocument();
 });
 
-test('dataset workspace shows actual approved distributions and can freeze any non-empty set', () => {
+test('dataset workspace starts with explicit editable question-set management', () => {
   render(<DatasetWorkspace approvedQuestionIds={['q-1', 'q-2']} workingDistribution={{ capabilities: { '핵심 개념 이해': 1, '개념 적용·문제풀이': 1 }, responseFormats: { '구조화 서술형': 2 }, evidenceModes: { GROUNDED: 2 } }} versions={[]} />);
   expect(screen.getByRole('heading', { name: '데이터셋 관리' })).toBeInTheDocument();
-  expect(screen.getByText('핵심 개념 이해')).toBeInTheDocument();
-  expect(screen.getAllByText('1').length).toBeGreaterThan(0);
-  expect(screen.getByRole('button', { name: '새 버전 확정' })).toBeEnabled();
+  expect(screen.getByRole('heading', { name: '편집 가능한 질문 세트' })).toBeInTheDocument();
+  expect(screen.getByLabelText('새 질문 세트 이름')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '벤치마크 데이터셋 발행' })).toBeDisabled();
   expect(screen.getByRole('heading', { name: '불변 버전' })).toBeInTheDocument();
 });

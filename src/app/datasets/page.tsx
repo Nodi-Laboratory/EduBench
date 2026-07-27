@@ -7,14 +7,11 @@ export const dynamic = 'force-dynamic';
 
 export default async function DatasetsPage() {
   const audit = await getDatasetAuditData();
-  const countBy = (key: 'purpose' | 'questionType' | 'evidenceMode') => audit.workingQuestions.reduce<Record<string, number>>((result, row) => {
-    result[row[key]] = (result[row[key]] ?? 0) + 1;
-    return result;
-  }, {});
   return <DatasetWorkspace
     approvedQuestionIds={audit.workingQuestions.map((row) => row.id)}
-    workingDistribution={{ capabilities: countBy('purpose'), responseFormats: countBy('questionType'), evidenceModes: countBy('evidenceMode') }}
+    workingDistribution={{ capabilities: {}, responseFormats: {}, evidenceModes: {} }}
     workingQuestions={audit.workingQuestions}
+    questionSets={audit.questionSets}
     versions={audit.versions}
   />;
 }

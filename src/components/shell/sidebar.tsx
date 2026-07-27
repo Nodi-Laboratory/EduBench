@@ -32,6 +32,7 @@ export function Sidebar() {
                 <Link
                   className={`nav-item${active ? ' active' : ''}`}
                   href={item.href}
+                  aria-label={item.label}
                   aria-current={active ? 'page' : undefined}
                   key={item.href}
                 >

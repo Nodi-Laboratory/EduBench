@@ -16,8 +16,20 @@ const providerEnv: Record<string, string[]> = {
 export default async function RunsPage() {
   const mockMode = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   const [datasets, scoreProfiles, runs, researchProfiles] = await Promise.all([
-    db.query<{ id: string; version: string; title: string; question_count: number }>(
-      `select id, version, title, question_count from dataset_versions where status = 'PUBLISHED' order by published_at desc`,
+    db.query<{
+      id: string;
+      version: string;
+      title: string;
+      description: string | null;
+      question_count: number;
+      content_hash: string;
+      published_at: string;
+    }>(
+      `select id,version,title,description,question_count,content_hash,
+         published_at::text published_at
+       from dataset_versions
+       where status = 'PUBLISHED'
+       order by published_at desc`,
     ),
     db.query<{ id:string; version:string; title:string; provenance_unresolved:boolean }>(
       `select id,version,title,

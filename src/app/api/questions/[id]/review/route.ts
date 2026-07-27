@@ -3,6 +3,27 @@ import { z } from 'zod';
 import { transitionQuestion, type QuestionCommand, type QuestionState } from '@/domain/status';
 import { DomainError } from '@/domain/errors';
 import { withTransaction } from '@/server/db/transaction';
+import {
+  assignQuestionToTargetSet,
+  type QuestionSetTarget,
+} from '@/server/question-sets/service';
+
+const postgresUuid = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  'PostgreSQL UUID 형식이어야 합니다.',
+);
+
+const targetSetSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('existing'),
+    id: postgresUuid,
+  }),
+  z.object({
+    kind: z.literal('new'),
+    title: z.string().trim().min(2).max(200),
+    description: z.string().trim().max(2000).optional(),
+  }),
+]);
 
 const reviewSchema = z.object({
   action: z.enum(['APPROVE', 'EDIT_AND_APPROVE', 'HOLD', 'REOPEN', 'DELETE']),
@@ -14,6 +35,18 @@ const reviewSchema = z.object({
     maxScore: z.number().positive(),
   })).min(1).optional(),
   note: z.string().trim().max(1000).optional(),
+  targetSet: targetSetSchema.optional(),
+}).superRefine((input, context) => {
+  if (
+    ['APPROVE', 'EDIT_AND_APPROVE'].includes(input.action)
+    && !input.targetSet
+  ) {
+    context.addIssue({
+      code: 'custom',
+      path: ['targetSet'],
+      message: '승인할 질문 세트를 선택하거나 새로 만들어야 합니다.',
+    });
+  }
 });
 
 export async function POST(
@@ -60,12 +93,48 @@ export async function POST(
         'update questions set status = $2, current_revision = $3, updated_at = now() where id = $1',
         [id, next, revision],
       );
+      let questionSet:
+        | Awaited<ReturnType<typeof assignQuestionToTargetSet>>
+        | undefined;
+      if (['APPROVE', 'EDIT_AND_APPROVE'].includes(input.action)) {
+        if (!input.targetSet) {
+          throw new DomainError(
+            'REVIEW_TARGET_SET_REQUIRED',
+            '승인할 질문 세트를 선택하거나 새로 만들어야 합니다.',
+          );
+        }
+        questionSet = await assignQuestionToTargetSet(
+          client,
+          input.targetSet as QuestionSetTarget,
+          id,
+          revision,
+        );
+      }
+      const metadata = questionSet ? {
+        questionSetId: questionSet.item.id,
+        questionSetTitle: questionSet.item.title,
+        questionSetCreated: questionSet.created,
+      } : {};
       await client.query(
-        `insert into review_actions(question_id, action, from_status, to_status, revision, note)
-         values ($1, $2, $3, $4, $5, $6)`,
-        [id, input.action, current.status, next, revision, input.note ?? null],
+        `insert into review_actions(
+           question_id, action, from_status, to_status, revision, note, metadata
+         ) values ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [
+          id,
+          input.action,
+          current.status,
+          next,
+          revision,
+          input.note ?? null,
+          JSON.stringify(metadata),
+        ],
       );
-      return { id, status: next, revision };
+      return {
+        id,
+        status: next,
+        revision,
+        ...(questionSet ? { questionSet: questionSet.item } : {}),
+      };
     });
     return NextResponse.json(result);
   } catch (error) {
