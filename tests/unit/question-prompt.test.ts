@@ -1,5 +1,9 @@
 import { expect, test } from 'vitest';
-import { buildQuestionGenerationInstructions, thinkingLevelForDifficulty } from '@/domain/question-prompt';
+import {
+  assignedQuestionGenerationUnit,
+  buildQuestionGenerationInstructions,
+  thinkingLevelForDifficulty,
+} from '@/domain/question-prompt';
 
 test('raises Gemini thinking level with question difficulty', () => {
   expect(thinkingLevelForDifficulty('하')).toBe('LOW');
@@ -102,4 +106,61 @@ test('requires every question to measure a directed prerequisite relationship', 
   expect(prompt).toContain('선수 관계의 방향');
   expect(prompt).toContain('필수 추론 단계');
   expect(prompt).toContain('누락 진단');
+});
+
+test('assigns one deterministic selected unit to each single-unit question prompt', () => {
+  const conditions = {
+    subject:'과학', grade:'중학교 2학년', units:['물질', '전기', '생명'],
+    purpose:'핵심 개념 이해', questionType:'서술형', difficulty:'중', direction:'', crossUnit:false,
+  };
+  const prompt = buildQuestionGenerationInstructions({
+    conditions,
+    ordinal:5,
+    total:9,
+    evidence:'[]',
+  });
+
+  expect(assignedQuestionGenerationUnit(conditions, 5)).toBe('전기');
+  expect(prompt.prompt).toContain('- 선택 단원: 전기');
+  expect(prompt.prompt).not.toContain('물질 / 전기 / 생명');
+});
+
+test('assigns two adjacent units to each cross-unit question prompt without exposing every selection', () => {
+  const units = Array.from({ length:70 }, (_, index) => `단원 ${index + 1}`);
+  const conditions = {
+    subject:'과학', grade:'중학교 2학년', units,
+    purpose:'여러 단원 연결 추론', questionType:'서술형', difficulty:'중', direction:'', crossUnit:true,
+  };
+  const prompt = buildQuestionGenerationInstructions({
+    conditions,
+    ordinal:37,
+    total:70,
+    evidence:'[]',
+  });
+
+  expect(assignedQuestionGenerationUnit(conditions, 37)).toBe('단원 37 / 단원 38');
+  expect(prompt.prompt).toContain('- 선택 단원: 단원 37 / 단원 38');
+  expect(prompt.prompt).toContain('배정된 두 단원(단원 37 / 단원 38)의 개념을 실제 풀이에 사용한다');
+  expect(prompt.prompt).not.toContain('단원 36');
+  expect(prompt.prompt).not.toContain('단원 39');
+});
+
+test('states the cross-field prerequisite target invariant as a mechanical output contract', () => {
+  const instructions = buildQuestionGenerationInstructions({
+    conditions: {
+      subject: '과학',
+      grade: '고등학교 1학년',
+      units: ['역학'],
+      purpose: '선수관계 측정',
+      questionType: '구조화 서술형',
+      difficulty: '상',
+    },
+    ordinal: 1,
+    total: 1,
+    evidence: '근거',
+  });
+
+  expect(instructions.system).toContain('필드 간 불변조건');
+  expect(instructions.prompt).toContain('targetConcept 문자열을 그대로 복사');
+  expect(instructions.prompt).toContain('공백·조사·괄호·기호까지 완전히 동일');
 });

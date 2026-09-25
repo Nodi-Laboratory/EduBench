@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { benchmarkTaskForOrdinal, prerequisiteTaskLabels } from '@/domain/prerequisite-benchmark';
-import type { QuestionPromptConditions } from '@/domain/question-prompt';
+import {
+  assignedQuestionGenerationUnit,
+  type QuestionPromptConditions,
+} from '@/domain/question-prompt';
 
 export const QUESTION_GENERATION_MAX_OUTPUT_TOKENS = 16_384;
 
@@ -34,7 +37,7 @@ export function buildQuestionDirectionInstructions(input: {
   ordinal: number;
   total: number;
 }) {
-  const units = Array.isArray(input.conditions.units) ? input.conditions.units.map(String).filter(Boolean) : [];
+  const assignedUnit = assignedQuestionGenerationUnit(input.conditions, input.ordinal);
   const taskType = benchmarkTaskForOrdinal(input.ordinal);
   return {
     system: `당신은 교과서 기반 선수관계 벤치마크의 검색 설계자다.
@@ -45,7 +48,7 @@ export function buildQuestionDirectionInstructions(input: {
 [사용자 조건]
 - 과목: ${text(input.conditions.subject, '미지정')}
 - 학년: ${text(input.conditions.grade, '미지정')}
-- 단원: ${units.length ? units.join(' / ') : '선택 교과서 전체'}
+- 단원: ${assignedUnit ?? '선택 교과서 전체'}
 - 질문 목적: ${text(input.conditions.purpose, '핵심 개념 이해')}
 - 난이도: ${text(input.conditions.difficulty, '중')}
 - 추가 방향: ${text(input.conditions.direction, '없음')}

@@ -7,7 +7,10 @@ import {
 } from '@/domain/generation-items';
 import { mapConcurrentOrdered } from '@/domain/parallel';
 import { benchmarkTaskForOrdinal, prerequisiteScoringCriteria } from '@/domain/prerequisite-benchmark';
-import { buildQuestionGenerationInstructions } from '@/domain/question-prompt';
+import {
+  assignedQuestionGenerationUnit,
+  buildQuestionGenerationInstructions,
+} from '@/domain/question-prompt';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
 import { recordGenerationEventWithClient } from '@/server/generation/activity';
@@ -22,6 +25,13 @@ import type {
   ModelProvider,
   NormalizedGeneration,
 } from '@/server/providers/types';
+import { ProviderError } from '@/server/providers/types';
+import {
+  ActiveBenchmarkProviderCooldownError,
+  findActiveBenchmarkProviderCooldown,
+  registerBenchmarkProviderRateLimit,
+  type BenchmarkProviderCooldown,
+} from '@/server/runs/provider-cooldown';
 import {
   buildQuestionDirectionInstructions,
   parseQuestionDirectionResponse,
@@ -35,10 +45,9 @@ import {
 } from '@/server/questions/failure';
 import {
   generatedQuestionResponseJsonSchema,
-  parseGeneratedQuestionResponse,
-  validateGeneratedQuestionForType,
   type GeneratedQuestion,
 } from '@/server/questions/response';
+import { generateQuestionWithStructuredRepair } from '@/server/questions/structured-generation';
 import {
   abandonSupersededGenerationProviderInvocations,
   beginGenerationProviderInvocation,
@@ -52,7 +61,12 @@ type Batch = {
   id: string;
   requested_count: number;
   conditions: Record<string, unknown>;
-  source_scope: { sourceFileIds: string[]; sourceRevisionIds?: string[]; tocEntryIds?: string[] };
+  source_scope: {
+    sourceFileIds: string[];
+    sourceRevisionIds?: string[];
+    tocEntryIds?: string[];
+    resolvedChunkIds?: string[];
+  };
   generation_model:string;
 };
 
@@ -105,6 +119,68 @@ export type GenerationOptions = {
   testHooks?: GenerationTestHooks;
 };
 
+export class GenerationProviderRateLimitError extends Error {
+  constructor(
+    readonly providerError:ProviderError,
+    readonly cooldown:BenchmarkProviderCooldown,
+  ) {
+    super(providerError.message, { cause:providerError });
+    this.name = 'GenerationProviderRateLimitError';
+  }
+}
+
+type GenerationProviderCooldownDependencies = {
+  findActive:typeof findActiveBenchmarkProviderCooldown;
+  registerRateLimit:typeof registerBenchmarkProviderRateLimit;
+};
+
+const generationProviderCooldownDependencies:GenerationProviderCooldownDependencies = {
+  findActive:findActiveBenchmarkProviderCooldown,
+  registerRateLimit:registerBenchmarkProviderRateLimit,
+};
+
+export async function callGenerationProviderWithCooldown(
+  input:{ provider:ModelProvider; request:GenerationRequest; signal:AbortSignal },
+  dependencies:GenerationProviderCooldownDependencies = generationProviderCooldownDependencies,
+):Promise<NormalizedGeneration> {
+  const active = await dependencies.findActive(input.provider.key);
+  if (active) throw new ActiveBenchmarkProviderCooldownError(active);
+  try {
+    return await input.provider.generate(input.request, input.signal);
+  } catch (error) {
+    if (!(error instanceof ProviderError) || error.kind !== 'RATE_LIMIT') throw error;
+    const cooldown = await dependencies.registerRateLimit({
+      providerKey:input.provider.key,
+      error,
+      sourceRunId:null,
+      sourcePhase:'QUESTION_GENERATION',
+      sourceModelId:input.provider.modelId,
+    });
+    throw new GenerationProviderRateLimitError(error, cooldown);
+  }
+}
+
+export async function callGenerationEmbeddingWithCooldown<T>(
+  input:{ modelId:string; embed:() => Promise<T> },
+  dependencies:GenerationProviderCooldownDependencies = generationProviderCooldownDependencies,
+):Promise<T> {
+  const active = await dependencies.findActive('gemini');
+  if (active) throw new ActiveBenchmarkProviderCooldownError(active);
+  try {
+    return await input.embed();
+  } catch (error) {
+    if (!(error instanceof ProviderError) || error.kind !== 'RATE_LIMIT') throw error;
+    const cooldown = await dependencies.registerRateLimit({
+      providerKey:'gemini',
+      error,
+      sourceRunId:null,
+      sourcePhase:'QUESTION_GENERATION',
+      sourceModelId:input.modelId,
+    });
+    throw new GenerationProviderRateLimitError(error, cooldown);
+  }
+}
+
 type ItemSummary = ReturnType<typeof summarizeGenerationItems>;
 
 function providerRequestSignal(
@@ -133,7 +209,11 @@ async function auditedGeneration(input: {
     request: input.request,
   });
   try {
-    const response = await input.provider.generate(input.request, input.signal);
+    const response = await callGenerationProviderWithCooldown({
+      provider:input.provider,
+      request:input.request,
+      signal:input.signal,
+    });
     await completeGenerationProviderInvocation(invocationId, response);
     return response;
   } catch (error) {
@@ -554,7 +634,7 @@ async function persistCompletedQuestion(
       input.item.id,
       String(input.batch.conditions.subject ?? ''),
       String(input.batch.conditions.grade ?? ''),
-      Array.isArray(input.batch.conditions.units) ? input.batch.conditions.units.join(', ') : null,
+      assignedQuestionGenerationUnit(input.batch.conditions, input.item.ordinal),
       String(input.batch.conditions.purpose ?? ''),
       String(input.batch.conditions.difficulty ?? '중'),
       String(input.batch.conditions.questionType ?? '서술형'),
@@ -734,6 +814,79 @@ async function finalizeGeneration(batchId: string, lease: JobLease) {
   });
 }
 
+async function pinGenerationTocChunkScope(
+  batchId: string,
+  sourceRevisionIds: string[],
+  lease: JobLease,
+): Promise<Batch['source_scope']> {
+  return withTransaction(async (client) => {
+    await assertJobLeaseWithClient(client, lease);
+    const locked = await client.query<{ source_scope: Batch['source_scope'] }>(
+      'select source_scope from generation_batches where id=$1 for update',
+      [batchId],
+    );
+    const scope = locked.rows[0]?.source_scope;
+    if (!scope) {
+      throw new DomainError('GENERATION_BATCH_NOT_FOUND', '생성 배치를 찾을 수 없습니다.');
+    }
+    const tocEntryIds = scope.tocEntryIds ?? [];
+    if (!tocEntryIds.length || Object.prototype.hasOwnProperty.call(scope, 'resolvedChunkIds')) {
+      return scope;
+    }
+    const mappedEntries = await client.query<{ id: string; mapped_chunk_count: number }>(
+      `select entry.id,count(distinct chunk.id)::int as mapped_chunk_count
+         from source_toc_entries entry
+         left join source_chunk_toc_entries mapping
+           on mapping.source_toc_entry_id=entry.id
+          and mapping.source_revision_id=entry.source_revision_id
+         left join source_chunks chunk
+           on chunk.id=mapping.source_chunk_id
+          and chunk.source_revision_id=mapping.source_revision_id
+          and chunk.source_revision_id=any($2::uuid[])
+        where entry.id=any($1::uuid[])
+          and entry.source_revision_id=any($2::uuid[])
+        group by entry.id`,
+      [tocEntryIds, sourceRevisionIds],
+    );
+    if (mappedEntries.rowCount !== tocEntryIds.length
+      || mappedEntries.rows.some((entry) => entry.mapped_chunk_count < 1)) {
+      throw new DomainError(
+        'GENERATION_TOC_SCOPE_EMPTY',
+        '선택한 목차에 연결된 현재 리비전 청크가 없습니다.',
+      );
+    }
+    const chunks = await client.query<{ id: string }>(
+      `select distinct chunk.id
+         from source_chunks chunk
+         join source_chunk_toc_entries mapping
+           on mapping.source_chunk_id=chunk.id
+          and mapping.source_revision_id=chunk.source_revision_id
+        where mapping.source_toc_entry_id=any($1::uuid[])
+          and chunk.source_revision_id=any($2::uuid[])
+        order by chunk.id`,
+      [tocEntryIds, sourceRevisionIds],
+    );
+    if (!chunks.rowCount) {
+      throw new DomainError(
+        'GENERATION_TOC_SCOPE_EMPTY',
+        '선택한 목차에 연결된 현재 리비전 청크가 없습니다.',
+      );
+    }
+    const pinnedScope = {
+      ...scope,
+      resolvedChunkIds: chunks.rows.map((chunk) => chunk.id),
+    };
+    await client.query(
+      `update generation_batches
+          set source_scope=$2::jsonb,
+              updated_at=now()
+        where id=$1`,
+      [batchId, JSON.stringify(pinnedScope)],
+    );
+    return pinnedScope;
+  });
+}
+
 export async function generateQuestions(
   batchId: string,
   options: GenerationOptions,
@@ -763,6 +916,10 @@ export async function generateQuestions(
       'GENERATION_EMBEDDING_NOT_CONFIGURED',
       '검색 질의 임베딩과 Gemini 문항 생성에 GOOGLE_API_KEY가 필요합니다.',
     );
+  }
+  if (!mock) {
+    const cooldown = await findActiveBenchmarkProviderCooldown('gemini');
+    if (cooldown) throw new ActiveBenchmarkProviderCooldownError(cooldown);
   }
 
   const existingSummary = await withTransaction((client) => readItemSummaryWithClient(client, batchId));
@@ -866,29 +1023,61 @@ export async function generateQuestions(
     );
   }
 
-  const tocEntryIds = batch.source_scope.tocEntryIds ?? [];
-  if (tocEntryIds.length) {
-    const mappedTocEntries = await db.query<{ id: string; mapped_chunk_count: number }>(
-      `select entry.id,count(distinct chunk.id)::int as mapped_chunk_count
-         from source_toc_entries entry
-         left join source_chunk_toc_entries mapping
-           on mapping.source_toc_entry_id=entry.id
-          and mapping.source_revision_id=entry.source_revision_id
-         left join source_chunks chunk
-           on chunk.id=mapping.source_chunk_id
-          and chunk.source_revision_id=mapping.source_revision_id
-          and chunk.source_revision_id=any($2::uuid[])
-        where entry.id=any($1::uuid[])
-          and entry.source_revision_id=any($2::uuid[])
-        group by entry.id`,
-      [tocEntryIds, sourceRevisionIds],
+  const sourceScope = await pinGenerationTocChunkScope(batchId, sourceRevisionIds, lease);
+  const tocEntryIds = sourceScope.tocEntryIds ?? [];
+  const hasResolvedChunkSnapshot = Object.prototype.hasOwnProperty.call(
+    sourceScope,
+    'resolvedChunkIds',
+  );
+  const resolvedChunkIds = sourceScope.resolvedChunkIds ?? [];
+  if (hasResolvedChunkSnapshot && (
+    !Array.isArray(sourceScope.resolvedChunkIds)
+    || resolvedChunkIds.some((chunkId) => typeof chunkId !== 'string')
+    || new Set(resolvedChunkIds).size !== resolvedChunkIds.length
+  )) {
+    throw new DomainError(
+      'GENERATION_TOC_SCOPE_SNAPSHOT_INVALID',
+      '고정된 목차 청크 범위가 유효하지 않습니다.',
     );
-    if (mappedTocEntries.rowCount !== tocEntryIds.length
-      || mappedTocEntries.rows.some((entry) => entry.mapped_chunk_count < 1)) {
-      throw new DomainError(
-        'GENERATION_TOC_SCOPE_EMPTY',
-        '선택한 목차에 연결된 현재 리비전 청크가 없습니다.',
+  }
+  if (tocEntryIds.length) {
+    if (hasResolvedChunkSnapshot) {
+      const pinnedChunks = await db.query<{ count: number }>(
+        `select count(*)::int count
+           from source_chunks
+          where id=any($1::uuid[])
+            and source_revision_id=any($2::uuid[])`,
+        [resolvedChunkIds, sourceRevisionIds],
       );
+      if (!resolvedChunkIds.length || pinnedChunks.rows[0]?.count !== resolvedChunkIds.length) {
+        throw new DomainError(
+          'GENERATION_TOC_SCOPE_SNAPSHOT_INVALID',
+          '고정된 목차 청크가 현재 교과서 리비전과 일치하지 않습니다.',
+        );
+      }
+    } else {
+      const mappedTocEntries = await db.query<{ id: string; mapped_chunk_count: number }>(
+        `select entry.id,count(distinct chunk.id)::int as mapped_chunk_count
+           from source_toc_entries entry
+           left join source_chunk_toc_entries mapping
+             on mapping.source_toc_entry_id=entry.id
+            and mapping.source_revision_id=entry.source_revision_id
+           left join source_chunks chunk
+             on chunk.id=mapping.source_chunk_id
+            and chunk.source_revision_id=mapping.source_revision_id
+            and chunk.source_revision_id=any($2::uuid[])
+          where entry.id=any($1::uuid[])
+            and entry.source_revision_id=any($2::uuid[])
+          group by entry.id`,
+        [tocEntryIds, sourceRevisionIds],
+      );
+      if (mappedTocEntries.rowCount !== tocEntryIds.length
+        || mappedTocEntries.rows.some((entry) => entry.mapped_chunk_count < 1)) {
+        throw new DomainError(
+          'GENERATION_TOC_SCOPE_EMPTY',
+          '선택한 목차에 연결된 현재 리비전 청크가 없습니다.',
+        );
+      }
     }
   }
 
@@ -1008,18 +1197,21 @@ export async function generateQuestions(
         let queryVector: string | null = null;
         let queryVectorAudit: QueryVectorAudit | null = null;
         if (embedder) {
-          const [vector] = await embedder.embed(
-            [
-              embeddingSettings.prefixStrategy === 'text_prefix'
-                ? `${embeddingSettings.queryPrefix}${questionDirection.searchQuery}`
-                : questionDirection.searchQuery,
-            ],
-            providerRequestSignal(
-              options.signal,
-              embeddingSettings.requestTimeoutMs,
+          const [vector] = await callGenerationEmbeddingWithCooldown({
+            modelId:embeddingModel!,
+            embed:() => embedder.embed(
+              [
+                embeddingSettings.prefixStrategy === 'text_prefix'
+                  ? `${embeddingSettings.queryPrefix}${questionDirection.searchQuery}`
+                  : questionDirection.searchQuery,
+              ],
+              providerRequestSignal(
+                options.signal,
+                embeddingSettings.requestTimeoutMs,
+              ),
+              embeddingSettings.queryTaskType,
             ),
-            embeddingSettings.queryTaskType,
-          );
+          });
           const values = vector!;
           queryVector = `[${values.join(',')}]`;
           queryVectorAudit = {
@@ -1049,6 +1241,10 @@ export async function generateQuestions(
                 and ($8::boolean or chunk.embedding is not null)
                 and (
                   cardinality($2::uuid[])=0
+                  or (
+                    $9::boolean
+                    and chunk.id=any($10::uuid[])
+                  )
                   or exists(
                     select 1
                       from source_chunk_toc_entries mapping
@@ -1058,6 +1254,7 @@ export async function generateQuestions(
                      where mapping.source_chunk_id=chunk.id
                        and mapping.source_revision_id=chunk.source_revision_id
                        and mapping.source_toc_entry_id=any($2::uuid[])
+                       and not $9::boolean
                   )
                 )
            ),
@@ -1121,6 +1318,8 @@ export async function generateQuestions(
             executionPins.embeddingRag.contentHash,
             embeddingSettings.vectorSpaceId,
             mock,
+            hasResolvedChunkSnapshot,
+            resolvedChunkIds,
           ],
         );
         if (!chunks.rowCount) {
@@ -1216,25 +1415,52 @@ export async function generateQuestions(
             } : {}),
             thinkingLevel:generationSettings.thinkingLevel,
           };
-          const response = await auditedGeneration({
-            batchId,
-            item,
-            stage: 'QUESTION',
-            provider,
+          question = await generateQuestionWithStructuredRepair({
             request: generationRequest,
-            signal: providerRequestSignal(
-              options.signal,
-              generationSettings.requestTimeoutMs,
+            questionType: batch.conditions.questionType,
+            generate: (stage, request) => auditedGeneration({
+              batchId,
+              item,
+              stage,
+              provider,
+              request,
+              signal: providerRequestSignal(
+                options.signal,
+                generationSettings.requestTimeoutMs,
+              ),
+            }),
+            onRepairStarted: ({ validationError }) => logWithLease(
+              batchId,
+              lease,
+              'QUESTION_RESPONSE_REPAIR_STARTED',
+              {
+                ordinal: item.ordinal,
+                attempt: item.attempts,
+                validationError,
+              },
+            ),
+            onRepairCompleted: ({ validationError }) => logWithLease(
+              batchId,
+              lease,
+              'QUESTION_RESPONSE_REPAIR_COMPLETED',
+              {
+                ordinal: item.ordinal,
+                attempt: item.attempts,
+                validationError,
+              },
+            ),
+            onRepairFailed: ({ validationError, error }) => logWithLease(
+              batchId,
+              lease,
+              'QUESTION_RESPONSE_REPAIR_FAILED',
+              {
+                ordinal: item.ordinal,
+                attempt: item.attempts,
+                validationError,
+                error,
+              },
             ),
           });
-          if (response.finishReason && response.finishReason !== 'STOP') {
-            throw new DomainError(
-              'GENERATION_INCOMPLETE_RESPONSE',
-              `Gemini 응답이 완료되지 않았습니다. finishReason=${response.finishReason}`,
-            );
-          }
-          question = parseGeneratedQuestionResponse(response.text);
-          validateGeneratedQuestionForType(question, batch.conditions.questionType);
         }
         if (question.evidenceChunkIds.some((id) => !allowedChunkIds.has(id))) {
           throw new DomainError(
@@ -1264,6 +1490,10 @@ export async function generateQuestions(
           lease,
         }));
       } catch (error) {
+        if (
+          error instanceof GenerationProviderRateLimitError
+          || error instanceof ActiveBenchmarkProviderCooldownError
+        ) throw error;
         if (isGenerationControlError(error, options.signal)) throw error;
         await persistItemFailure(batchId, item, lease, error);
         return;
@@ -1272,6 +1502,10 @@ export async function generateQuestions(
       await options.testHooks?.afterItemCommitted?.(hookContext);
     });
   } catch (error) {
+    if (
+      error instanceof GenerationProviderRateLimitError
+      || error instanceof ActiveBenchmarkProviderCooldownError
+    ) throw error;
     if (isGenerationControlError(error, options.signal)) throw error;
     await reconcileOwnedItemsAfterFailure(batchId, lease, error, false);
     throw error;

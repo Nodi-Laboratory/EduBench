@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, expect, test } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, expect, test, vi } from 'vitest';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
 import { SettingsWorkspace } from '@/components/settings/settings-workspace';
 import type { AuditQuestion, DatasetAuditVersion, QuestionSetAudit } from '@/server/datasets/audit';
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 function question(overrides: Partial<AuditQuestion> = {}): AuditQuestion {
   return {
@@ -36,7 +36,7 @@ function question(overrides: Partial<AuditQuestion> = {}): AuditQuestion {
   };
 }
 
-test('dataset workspace exposes working and immutable question research audits', () => {
+test('dataset workspace fetches one bounded page and one expanded audit detail', async () => {
   const pinned = question({ ordinal: 1, revision: 1, currentRevision: 2, revisionDrift: true, questionText: '고정 revision 질문' });
   const versions: DatasetAuditVersion[] = [{
     id: 'dataset-1', version: 'research-v1', status: 'PUBLISHED', title: '연구 데이터셋', description: '재현성 검증 버전',
@@ -48,6 +48,21 @@ test('dataset workspace exposes working and immutable question research audits',
     questionCount: 1, createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
     questions: [question({ ordinal: 1 })],
   }];
+  const summary = (item: AuditQuestion) => ({
+    id: item.id, publicId: item.publicId, ordinal: item.ordinal, status: item.status,
+    subject: item.subject, grade: item.grade, chapter: item.chapter, unit: item.unit,
+    purpose: item.purpose, difficulty: item.difficulty, questionType: item.questionType,
+    evidenceMode: item.evidenceMode, revision: item.revision, currentRevision: item.currentRevision,
+    revisionDrift: item.revisionDrift, questionSummary: item.questionText,
+  });
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('questionId=')) {
+      return { ok: true, json: async () => ({ item: url.includes('scope=version') ? pinned : questionSets[0]!.questions[0] }) };
+    }
+    const item = url.includes('scope=version') ? pinned : questionSets[0]!.questions[0]!;
+    return { ok: true, json: async () => ({ items: [summary(item)], page: 1, pageSize: 20, total: 1 }) };
+  }));
   render(<DatasetWorkspace
     approvedQuestionIds={['question-1']}
     workingDistribution={{ capabilities: { '선수 관계 적용': 1 }, responseFormats: { '구조화 서술형': 1 }, evidenceModes: { GROUNDED: 1 } }}
@@ -59,9 +74,9 @@ test('dataset workspace exposes working and immutable question research audits',
   expect(screen.getByRole('heading', { name: '문항 연구 감사' })).toBeInTheDocument();
   expect(screen.getByRole('tab', { name: /현재 질문 세트/ })).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('문항 검색'), { target: { value: '전하' } });
-  expect(screen.getByText(/Q-RESEARCH-1/)).toBeInTheDocument();
+  expect(await screen.findByText(/Q-RESEARCH-1/)).toBeInTheDocument();
   fireEvent.click(screen.getByText(/Q-RESEARCH-1/));
-  expect(screen.getByText('선수관계 청사진')).toBeInTheDocument();
+  expect(await screen.findByText('선수관계 청사진')).toBeInTheDocument();
   expect(screen.getByText('필수 추론 단계')).toBeInTheDocument();
   expect(screen.getByText('교과서 근거')).toBeInTheDocument();
   expect(screen.getByText('생성 provenance')).toBeInTheDocument();
@@ -69,8 +84,9 @@ test('dataset workspace exposes working and immutable question research audits',
 
   fireEvent.click(screen.getByRole('tab', { name: /불변 버전/ }));
   expect(screen.getAllByText('research-v1').length).toBeGreaterThan(0);
-  expect(screen.getAllByText('고정 revision 질문').length).toBeGreaterThan(0);
-  expect(screen.getAllByText(/고정 revision 1/).length).toBeGreaterThan(0);
+  expect(await screen.findByText('고정 revision 질문')).toBeInTheDocument();
+  fireEvent.click(screen.getByText('고정 revision 질문'));
+  await waitFor(() => expect(screen.getAllByText(/고정 revision 1/).length).toBeGreaterThan(0));
   expect(screen.getByText(/현재 revision 2와 다릅니다/)).toBeInTheDocument();
 });
 

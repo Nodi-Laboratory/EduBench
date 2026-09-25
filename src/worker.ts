@@ -6,16 +6,24 @@ import { db } from '@/server/db/pool';
 import { createRunProviderResolver } from '@/server/providers/registry';
 import { processDocument, markDocumentFailed } from '@/server/documents/pipeline';
 import { classifyDocumentFailure } from '@/server/documents/failure';
-import { generateQuestions, markGenerationFailed } from '@/server/questions/generator';
+import {
+  GenerationProviderRateLimitError,
+  generateQuestions,
+  markGenerationFailed,
+} from '@/server/questions/generator';
 import { classifyGenerationFailure } from '@/server/questions/failure';
 import {
   claimJobs,
   completeJob,
+  deferJobForProviderCooldown,
   failJob,
   recoverExpiredLeases,
   releaseJobForShutdown,
   withJobLeaseHeartbeat,
 } from '@/server/jobs/queue';
+import {
+  ActiveBenchmarkProviderCooldownError,
+} from '@/server/runs/provider-cooldown';
 import { fillTaskSlots, TaskSlotPool } from '@/server/jobs/task-slot-pool';
 import { scoreRun } from '@/server/scoring/service';
 import { executeRunItem, providerErrorDetails } from '@/server/runs/executor';
@@ -116,6 +124,21 @@ async function processPersistentJob(job: ClaimedJob, leaseMs: number) {
       }
       return;
     }
+    if (!leaseLost && job.kind === 'question.generate') {
+      try {
+        const cooldown = error instanceof ActiveBenchmarkProviderCooldownError
+          ? error.cooldown
+          : error instanceof GenerationProviderRateLimitError
+            ? error.cooldown
+            : null;
+        if (cooldown) {
+          await deferJobForProviderCooldown(lease, cooldown);
+          return;
+        }
+      } catch (cooldownError) {
+        console.error(`[EduBench worker] could not defer generation ${job.payload.batchId} for provider cooldown`, cooldownError);
+      }
+    }
     if (!leaseLost && job.kind === 'document.parse') await markDocumentFailed(String(job.payload.sourceId), error, job.id);
     if (!leaseLost && job.kind === 'question.generate') {
       try {
@@ -188,6 +211,13 @@ async function processScoringRuns() {
        and (
          last_scoring_error->>'retryAt' is null
          or (last_scoring_error->>'retryAt')::timestamptz <= now()
+       )
+       and not exists(
+         select 1 from benchmark_provider_cooldowns cooldown
+          where cooldown.provider_key=(
+            benchmark_runs.score_profile_snapshot->>'judgeProvider'
+          )
+            and cooldown.blocked_until>now()
        )
      order by updated_at
      limit 5`,

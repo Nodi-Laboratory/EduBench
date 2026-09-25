@@ -313,7 +313,9 @@ export function ResearchControlRoom() {
   const failures = safeArray(snapshot?.failures);
   const events = safeArray(snapshot?.recentEvents);
   const profiles = safeArray(snapshot?.profiles);
-  const scoreboard = safeArray(snapshot?.scoreboard);
+  const scoreboard = safeArray(snapshot?.scoreboard).filter(
+    (row) => row.metric !== 'exact_match',
+  );
   const databaseSignal = snapshot?.system?.database ?? null;
   const workerSignal = snapshot?.system?.worker ?? null;
   const queueSignal = snapshot?.system?.queue ?? null;

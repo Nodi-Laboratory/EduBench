@@ -71,7 +71,7 @@ export async function GET(
     const invocations = await client.query<{
       id: string;
       item_attempt: number;
-      stage: 'DIRECTION' | 'QUESTION';
+      stage: 'DIRECTION' | 'QUESTION' | 'QUESTION_REPAIR';
       state: 'REQUESTED' | 'COMPLETED' | 'FAILED' | 'ABANDONED';
       provider: string;
       model_id: string;

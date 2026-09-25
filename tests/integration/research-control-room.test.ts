@@ -123,9 +123,14 @@ test('reads live leases, operations, failures, profiles, events, and partial sco
   await db.query(
     `insert into scores(
        model_response_id,score_profile_id,metric_key,value,provenance
-     ) values(
+     ) values
+     (
        $1,'20000000-0000-0000-0000-000000000001',
        'exact_match',0.75,'DETERMINISTIC_ENGINE_VERIFIED'
+     ),
+     (
+       $1,'20000000-0000-0000-0000-000000000001',
+       'response_present',1,'DETERMINISTIC_ENGINE_VERIFIED'
      )`,
     [response.rows[0]!.id],
   );
@@ -242,12 +247,13 @@ test('reads live leases, operations, failures, profiles, events, and partial sco
       runId: run.id,
       runLabel: expect.stringContaining('관제실 점수'),
       model: 'Control Room Model',
-      metric: 'exact_match',
-      mean: 0.75,
+      metric: 'response_present',
+      mean: 1,
       scored: 1,
       eligible: 1,
     }),
   ]));
+  expect(snapshot.scoreboard.some((row) => row.metric === 'exact_match')).toBe(false);
   expect(snapshot.scoreboard.length).toBeLessThanOrEqual(50);
   expect(snapshot.scoreboardTotal).toBeGreaterThanOrEqual(snapshot.scoreboard.length);
   expect(snapshot.pipelineStages.map(({ key, label }) => ({ key, label }))).toEqual([

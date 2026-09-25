@@ -234,7 +234,7 @@ test('structured controls expose question token budgets and concurrency with ope
   renderSettings(completeResearchProfiles);
 
   const questionCard = screen.getByTestId('research-config-card-question_generation');
-  expect(within(questionCard).getByLabelText('방향 생성 출력 토큰')).toHaveValue(2048);
+  expect(within(questionCard).getByLabelText('방향 생성 출력 토큰')).toHaveValue(8192);
   expect(within(questionCard).getByLabelText('질문 생성 출력 토큰')).toHaveValue(16384);
   expect(within(questionCard).getByLabelText('질문 생성 동시성')).toHaveValue(4);
   expect(within(questionCard).getByText(/문항별 방향성 설계 응답의 최대 길이/)).toBeInTheDocument();
@@ -246,18 +246,22 @@ test('structured benchmark controls expose each model runtime and generation par
   renderSettings(completeResearchProfiles);
 
   const benchmarkCard = screen.getByTestId('research-config-card-benchmark_models');
-  expect(within(benchmarkCard).getByLabelText('Gemini 3.6 Flash 모델 ID'))
-    .toHaveValue('gemini-3.6-flash');
-  expect(within(benchmarkCard).getByLabelText('Gemini 3.6 Flash 최대 출력 토큰'))
+  expect(within(benchmarkCard).getByLabelText('Gemini 3.5 Flash 모델 ID'))
+    .toHaveValue('gemini-3.5-flash');
+  expect(within(benchmarkCard).getByLabelText('Gemini 3.5 Flash 최대 출력 토큰'))
     .toHaveValue(16384);
   expect(within(benchmarkCard).getByLabelText('Upstage Solar Pro 3 Temperature'))
     .toHaveValue(0.7);
   expect(within(benchmarkCard).getByLabelText('K-EXAONE 236B A23B 요청 간격(ms)'))
     .toHaveValue(30000);
+  expect(within(benchmarkCard).getByLabelText('OpenAI GPT-5.5 모델 ID'))
+    .toHaveValue('gpt-5.5');
+  expect(within(benchmarkCard).getByLabelText('OpenAI GPT-5.5 프로토콜'))
+    .toHaveValue('openai-responses');
   expect(within(benchmarkCard).getAllByText(/모델별 호출 동시성은 공급자 한도와 실행 속도/))
-    .toHaveLength(3);
+    .toHaveLength(4);
   expect(within(benchmarkCard).getAllByText(/출력 토큰 한도는 응답 잘림과 비용에 직접 영향/))
-    .toHaveLength(3);
+    .toHaveLength(4);
 });
 
 test('temporarily incomplete advanced JSON hides structured controls without crashing the editor', () => {

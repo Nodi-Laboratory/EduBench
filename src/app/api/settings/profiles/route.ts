@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { hasJudgeMetrics, isJudgeProvenanceResolved } from '@/domain/score-profile';
+import {
+  hasJudgeMetrics,
+  isJudgeProvenanceResolved,
+  isRetiredScoreMetric,
+} from '@/domain/score-profile';
 import { db } from '@/server/db/pool';
 import { isSupportedProviderKey } from '@/server/providers/registry';
 
@@ -17,6 +21,13 @@ const scoreSchema = z.object({
 }).superRefine((profile, context) => {
   const provider = profile.judgeProvider || null;
   const model = profile.judgeModel || null;
+  if (profile.metrics.some(isRetiredScoreMetric)) {
+    context.addIssue({
+      code:'custom',
+      path:['metrics'],
+      message:'exact_match는 폐기된 지표입니다. 의미 기반 Judge 지표 또는 response_present를 사용하십시오.',
+    });
+  }
   if ((provider == null) !== (model == null)) {
     context.addIssue({
       code:'custom',

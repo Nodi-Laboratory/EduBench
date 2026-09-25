@@ -9,10 +9,11 @@ const isEntrypoint = process.argv[1]
 
 export async function seedDatabase(): Promise<void> {
   await withTransaction(async (client) => {
-    await client.query(`delete from provider_configs where provider_key in ('claude','openai','midm')`);
+    await client.query(`delete from provider_configs where provider_key in ('claude','midm')`);
     const providers = [
       { key: 'exaone', name: 'EXAONE', protocol: 'openai-compatible', baseUrl: process.env.EXAONE_BASE_URL || 'https://api.friendli.ai/serverless/v1', modelId: 'LGAI-EXAONE/K-EXAONE-236B-A23B' },
-      { key: 'gemini', name: 'Gemini', protocol: 'gemini', baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com', modelId: 'gemini-3.6-flash' },
+      { key: 'gemini', name: 'Gemini', protocol: 'gemini', baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com', modelId: 'gemini-3.5-flash' },
+      { key: 'openai', name: 'OpenAI', protocol: 'openai-responses', baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1', modelId: process.env.OPENAI_MODEL || 'gpt-5.5' },
       { key: 'upstage', name: 'Upstage', protocol: 'openai-compatible', baseUrl: process.env.UPSTAGE_BASE_URL || 'https://api.upstage.ai/v1', modelId: 'solar-pro3' },
     ];
     for (const provider of providers) {

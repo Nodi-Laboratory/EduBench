@@ -15,7 +15,7 @@ beforeAll(async () => {
   const profile = await db.query<{ id: string }>(
     `insert into score_profiles(
        version,title,metrics,weights,rubric_prompt,content_hash
-     ) values($1,'엔진 런타임 검사','["exact_match"]'::jsonb,'{}'::jsonb,'정확히 비교','temporary')
+     ) values($1,'엔진 런타임 검사','["response_present"]'::jsonb,'{}'::jsonb,'응답 존재 검사','temporary')
      returning id`,
     [`engine-runtime-${randomUUID()}`],
   );

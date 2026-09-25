@@ -112,25 +112,16 @@ test('seeds the exact current scoring rules and keeps engine definitions append-
     currentScoringEngineDefinition,
   );
   expect(current.rows[0]).toMatchObject({
-    version:'edubench-scoring-v1',
+    version:'edubench-scoring-v2',
     definition:{
-      version:'edubench-scoring-v1',
+      version:'edubench-scoring-v2',
       deterministic:{
-        exactMatch:{
-          implementationVersion:'normalize-korean-answer-v1',
-          normalization:[
-            'Unicode NFC normalization',
-            'CRLF to LF',
-            'collapse whitespace',
-            'trim',
-            'remove trailing . ! ? and ideographic full stop',
-            'Korean-locale lowercase',
-          ],
-        },
         responsePresent:{ implementationVersion:'normalized-response-present-v1' },
       },
       metricResolution:{
-        implementationVersion:'required-metrics-v1',
+        implementationVersion:'required-metrics-v2',
+        baseMetrics:['response_present'],
+        profileMetrics:'discard retired exact_match, then append score profile metrics in stored order and deduplicate by first occurrence',
         prerequisiteBenchmarkType:'PREREQUISITE_RELATIONSHIP',
         prerequisiteMetrics:[
           'target_concept_correctness',
@@ -185,6 +176,13 @@ test('seeds the exact current scoring rules and keeps engine definitions append-
   );
   expect(current.rows[0]!.content_hash).toBe(digest.rows[0]!.expected);
   expect(current.rows[0]!.content_hash).toMatch(/^[0-9a-f]{64}$/);
+  expect(current.rows[0]!.definition.deterministic)
+    .not.toHaveProperty('exactMatch');
+  const historical = await db.query<{ version:string }>(
+    `select version from scoring_engine_versions
+     where version='edubench-scoring-v1'`,
+  );
+  expect(historical.rows).toEqual([{ version:'edubench-scoring-v1' }]);
   expect(
     (current.rows[0]!.definition.judge as {
       sampling:Record<string, unknown>;
@@ -217,7 +215,7 @@ test('pins a verified immutable scoring-engine snapshot on every post-migration 
     scoring_engine_version_id:fixture.engineId,
     scoring_engine_snapshot:{
       id:fixture.engineId,
-      version:'edubench-scoring-v1',
+      version:'edubench-scoring-v2',
       contentHash:expect.stringMatching(/^[0-9a-f]{64}$/),
     },
     scoring_engine_snapshot_provenance:'AT_CREATION_VERIFIED',

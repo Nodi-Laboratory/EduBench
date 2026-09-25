@@ -10,20 +10,18 @@ import {
 
 describe('scoring engine domain contract', () => {
   test('publishes the substantive current scoring behavior', () => {
-    expect(scoringEngineVersion).toBe('edubench-scoring-v1');
+    expect(scoringEngineVersion).toBe('edubench-scoring-v2');
     expect(currentScoringEngineDefinition).toMatchObject({
-      version:'edubench-scoring-v1',
+      version:'edubench-scoring-v2',
       deterministic:{
-        exactMatch:{
-          implementationVersion:'normalize-korean-answer-v1',
-          normalization:expect.arrayContaining([
-            'Unicode NFC normalization',
-            'collapse whitespace',
-            'Korean-locale lowercase',
-          ]),
+        responsePresent:{
+          implementationVersion:'normalized-response-present-v1',
         },
       },
       metricResolution:{
+        implementationVersion:'required-metrics-v2',
+        baseMetrics:['response_present'],
+        profileMetrics:expect.stringContaining('discard retired exact_match'),
         prerequisiteMetrics:[
           'target_concept_correctness',
           'prerequisite_identification',
@@ -63,6 +61,8 @@ describe('scoring engine domain contract', () => {
     expect(
       currentScoringEngineDefinition.judge.sampling,
     ).not.toHaveProperty('currentEnvironmentOverride');
+    expect(currentScoringEngineDefinition.deterministic)
+      .not.toHaveProperty('exactMatch');
   });
 
   test('allows only the durable forward lifecycle transitions', () => {
@@ -83,7 +83,7 @@ describe('scoring engine domain contract', () => {
       scoringEngineVersionId:'31d7f4d3-d24e-4b36-b890-5a08c3237075',
       scoringEngineSnapshot:{
         id:'31d7f4d3-d24e-4b36-b890-5a08c3237075',
-        version:'edubench-scoring-v1',
+        version:'edubench-scoring-v2',
         title:'engine',
         definition:currentScoringEngineDefinition,
         contentHash:hash,
@@ -94,7 +94,7 @@ describe('scoring engine domain contract', () => {
       scoringEngineVersionId:'31d7f4d3-d24e-4b36-b890-5a08c3237075',
       scoringEngineSnapshot:{
         id:'5e338285-a64d-425c-95de-dc314fd72aa7',
-        version:'edubench-scoring-v1',
+        version:'edubench-scoring-v2',
         title:'engine',
         definition:currentScoringEngineDefinition,
         contentHash:hash,
@@ -119,7 +119,7 @@ describe('scoring engine domain contract', () => {
       scoringEngineSnapshot:{
         id,
         version:scoringEngineVersion,
-        title:'EduBench 선수관계 평가 엔진 v1',
+        title:'EduBench 선수관계 평가 엔진 v2',
         definition:{
           judge:currentScoringEngineDefinition.judge,
           version:currentScoringEngineDefinition.version,
@@ -137,7 +137,7 @@ describe('scoring engine domain contract', () => {
       scoringEngineSnapshot:{
         id,
         version:scoringEngineVersion,
-        title:'EduBench 선수관계 평가 엔진 v1',
+        title:'EduBench 선수관계 평가 엔진 v2',
         definition:{
           ...currentScoringEngineDefinition,
           judge:{

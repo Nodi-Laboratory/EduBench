@@ -28,6 +28,38 @@ test('builds a distinct per-question direction before retrieval', () => {
   expect(first.prompt).not.toBe(second.prompt);
 });
 
+test('assigns exactly one selected unit to a single-unit direction by ordinal', () => {
+  const units = Array.from({ length:70 }, (_, index) => `단원 ${index + 1}`);
+  const direction = buildQuestionDirectionInstructions({
+    conditions:{
+      subject:'과학', grade:'고등학교 1학년', units,
+      purpose:'핵심 개념 이해', difficulty:'중', direction:'없음', crossUnit:false,
+    },
+    ordinal:37,
+    total:70,
+  });
+
+  expect(direction.prompt).toContain('- 단원: 단원 37');
+  expect(direction.prompt).not.toContain('단원 36');
+  expect(direction.prompt).not.toContain('단원 38');
+});
+
+test('assigns exactly two adjacent units to a cross-unit direction by ordinal', () => {
+  const units = Array.from({ length:70 }, (_, index) => `단원 ${index + 1}`);
+  const direction = buildQuestionDirectionInstructions({
+    conditions:{
+      subject:'과학', grade:'고등학교 1학년', units,
+      purpose:'핵심 개념 이해', difficulty:'중', direction:'없음', crossUnit:true,
+    },
+    ordinal:70,
+    total:70,
+  });
+
+  expect(direction.prompt).toContain('- 단원: 단원 70 / 단원 1');
+  expect(direction.prompt).not.toContain('단원 2');
+  expect(direction.prompt).not.toContain('단원 69');
+});
+
 test('parses a search-ready question direction', () => {
   expect(parseQuestionDirectionResponse(JSON.stringify({
     directionSummary: '속도 변화에서 가속도로 이어지는 관계를 적용한다.',

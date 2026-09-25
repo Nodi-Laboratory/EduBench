@@ -25,6 +25,7 @@ test('installs vector and the auditable benchmark tables', async () => {
   expect(tables).toEqual(expect.arrayContaining([
     'source_files',
     'source_chunks',
+    'source_html_blobs',
     'questions',
     'question_revisions',
     'dataset_versions',

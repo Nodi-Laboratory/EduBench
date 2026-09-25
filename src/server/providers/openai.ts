@@ -1,10 +1,17 @@
 import { assertProviderResponse, executeFetch, requestIdFrom } from './http';
-import type { FetchLike, GenerationRequest, ModelProvider, NormalizedGeneration } from './types';
+import {
+  ProviderError,
+  type FetchLike,
+  type GenerationRequest,
+  type ModelProvider,
+  type NormalizedGeneration,
+} from './types';
 
 type OpenAIResponse = {
   id?: string;
   model?: string;
   status?: string;
+  incomplete_details?: { reason?: string };
   output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
   usage?: { input_tokens?: number; output_tokens?: number };
 };
@@ -35,14 +42,34 @@ export class OpenAIProvider implements ModelProvider {
     }));
     await assertProviderResponse(response, this.apiKey);
     const raw = await response.json() as OpenAIResponse;
+    const requestId = requestIdFrom(response) ?? raw.id ?? null;
     const text = raw.output?.flatMap((item) => item.content ?? [])
       .filter((item) => item.type === 'output_text').map((item) => item.text ?? '').join('') ?? '';
+    if (raw.status && raw.status !== 'completed') {
+      const reason = raw.incomplete_details?.reason ?? raw.status;
+      throw new ProviderError({
+        kind:'PARSE',
+        message:`OPENAI_INCOMPLETE_RESPONSE: OpenAI 응답이 완료되지 않았습니다. status=${raw.status}, reason=${reason}`,
+        retryable:false,
+        status:response.status,
+        requestId,
+      });
+    }
+    if (!text.trim()) {
+      throw new ProviderError({
+        kind:'PARSE',
+        message:'OPENAI_EMPTY_RESPONSE: OpenAI 응답에 저장 가능한 output_text가 없습니다.',
+        retryable:false,
+        status:response.status,
+        requestId,
+      });
+    }
     return {
       text, raw,
       inputTokens: raw.usage?.input_tokens ?? null,
       outputTokens: raw.usage?.output_tokens ?? null,
       finishReason: raw.status ?? null,
-      requestId: requestIdFrom(response) ?? raw.id ?? null,
+      requestId,
       modelId: raw.model ?? this.modelId,
       modelSnapshot: raw.model ?? null,
       latencyMs: Math.round(performance.now() - started),

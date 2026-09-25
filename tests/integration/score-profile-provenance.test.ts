@@ -43,7 +43,7 @@ async function createProfile(input: {
   const result = await db.query<{ id:string; content_hash:string }>(
     `insert into score_profiles(
        version,title,metrics,weights,rubric_prompt,judge_provider,judge_model,content_hash
-     ) values($1,$2,'["exact_match"]'::jsonb,'{}'::jsonb,'검증 루브릭',$3,$4,'temporary')
+     ) values($1,$2,'["response_present"]'::jsonb,'{}'::jsonb,'검증 루브릭',$3,$4,'temporary')
      returning id,content_hash`,
     [version, `${input.versionPrefix} 프로필`, input.judgeProvider ?? null, input.judgeModel ?? null],
   );

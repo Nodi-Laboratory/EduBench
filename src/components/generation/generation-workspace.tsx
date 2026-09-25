@@ -1,13 +1,29 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { BookOpen, ChevronDown, RefreshCw, RotateCcw, Sparkles } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
 import { buildQuestionGenerationInstructions } from '@/domain/question-prompt';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
 
-type TocEntry = { id: string; source_file_id: string; title: string; level: number; printed_page: number | null };
+type TocEntry = {
+  id: string;
+  source_file_id: string;
+  title: string;
+  level: number;
+  printed_page: number | null;
+  mapping_status: 'MAPPED' | 'UNMAPPED';
+  mapped_chunk_count: number;
+  mapping_confidence: number | null;
+};
 type GenerationSource = { id: string; original_name: string; subject: string | null; grade: string | null; tocEntries: TocEntry[] };
 type GenerationBatch = {
   id: string; state: string; requested_count: number; created_at: string; updated_at?: string;
@@ -18,7 +34,7 @@ type GeneratedQuestion = { public_id: string; status: string; question_text: str
 type GenerationProviderInvocation = {
   id: string;
   itemAttempt: number;
-  stage: 'DIRECTION' | 'QUESTION';
+  stage: 'DIRECTION' | 'QUESTION' | 'QUESTION_REPAIR';
   state: string;
   provider: string;
   modelId: string;
@@ -103,7 +119,41 @@ type Activity = {
   eventCursor: string;
 };
 
+function isUsableTocEntry(entry: TocEntry) {
+  return entry.mapping_status === 'MAPPED' && entry.mapped_chunk_count > 0;
+}
+
 const ITEM_AUDIT_PAGE_SIZE = 20;
+
+function LazyDisclosure({
+  summary,
+  children,
+  defaultOpen = false,
+  className,
+  onOpenChange,
+  unmountClosed = true,
+}: {
+  summary:ReactNode;
+  children:ReactNode;
+  defaultOpen?:boolean;
+  className?:string;
+  onOpenChange?:(open:boolean) => void;
+  unmountClosed?:boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return <details
+    className={className}
+    open={open}
+    onToggle={(event) => {
+      const nextOpen = event.currentTarget.open;
+      setOpen(nextOpen);
+      onOpenChange?.(nextOpen);
+    }}
+  >
+    <summary>{summary}</summary>
+    {open || !unmountClosed ? children : null}
+  </details>;
+}
 
 const eventLabels: Record<string, string> = {
   JOB_ENQUEUED: '작업 대기열 등록', JOB_CLAIMED: '작업 실행 시작', JOB_LEASED: '작업 실행 시작', JOB_RETRY_SCHEDULED: '작업 재시도 예약', JOB_RELEASED_ON_SHUTDOWN: '워커 종료 · 안전 재개 대기', JOB_FAILED: '작업 최종 실패', JOB_TERMINAL_FAILED: '작업 최종 실패',
@@ -111,6 +161,9 @@ const eventLabels: Record<string, string> = {
   QUESTION_DIRECTION_STARTED: '단일 문항 방향성 설계 시작', QUESTION_DIRECTION_COMPLETED: '단일 문항 방향성 설계 완료',
   QUESTION_RETRIEVAL_STARTED: '단일 문항 전용 벡터 검색 시작', QUESTION_RETRIEVAL_COMPLETED: '단일 문항 전용 벡터 검색 완료',
   QUESTION_GENERATION_STARTED: '단일 문항 생성 시작', QUESTION_GENERATION_COMPLETED: '단일 문항 생성 완료',
+  QUESTION_RESPONSE_REPAIR_STARTED: '구조화 응답 자동 교정 시작',
+  QUESTION_RESPONSE_REPAIR_COMPLETED: '구조화 응답 자동 교정 완료',
+  QUESTION_RESPONSE_REPAIR_FAILED: '구조화 응답 자동 교정 실패',
   QUESTION_GENERATION_FAILED: '단일 문항 생성 실패', GENERATION_COMPLETED: '전체 문항 생성 완료', GENERATION_FAILED: '생성 배치 실패',
   GENERATION_RESUMED: '미완료 문항 생성 재개',
 };
@@ -242,7 +295,9 @@ function DirectionRecord({ value }: { value: Record<string, unknown> | null }) {
     {primary.length ? <dl className="lab-request-info">{primary.map((entry) => <div key={entry.key}>
       <dt>{entry.label}</dt><dd>{entry.value}</dd>
     </div>)}</dl> : <p>사람이 읽을 수 있는 방향성 필드가 없습니다.</p>}
-    <details><summary>원본 방향성 기록</summary><JsonBlock value={value} /></details>
+    <LazyDisclosure summary="원본 방향성 기록">
+      <JsonBlock value={value} />
+    </LazyDisclosure>
   </>;
 }
 
@@ -281,23 +336,29 @@ function RetrievalRecord({ value }: { value: GenerationRetrievalAudit | null }) 
         {chunkId && <small className="mono">chunk <code>{chunkId}</code></small>}
       </article>;
     }) : <p>선택 청크 기록 없음</p>}
-    <details><summary>검색 감사 원본</summary><JsonBlock value={value} /></details>
+    <LazyDisclosure summary="검색 감사 원본">
+      <JsonBlock value={value} />
+    </LazyDisclosure>
   </div>;
 }
 
 function ProviderInvocationRecord({ invocation }: { invocation: GenerationProviderInvocation }) {
   const title = invocation.stage === 'DIRECTION'
     ? '실제 방향성 프롬프트'
-    : '실제 질문 생성 프롬프트';
+    : invocation.stage === 'QUESTION_REPAIR'
+      ? '구조화 응답 자동 교정 프롬프트'
+      : '실제 질문 생성 프롬프트';
   const system = readableValue(invocation.requestSnapshot.system);
   const prompt = readableValue(invocation.requestSnapshot.prompt);
   const responseText = readableValue(invocation.responseSnapshot?.text);
-  return <details className="source-event provider-invocation-record">
-    <summary>
+  return <LazyDisclosure
+    className="source-event provider-invocation-record"
+    summary={<>
       <strong>{title}</strong>
       <span className={`state-label state-${invocation.state.toLowerCase()}`}>{invocation.state}</span>
       <small className="mono">{invocation.provider} / {invocation.modelId}</small>
-    </summary>
+    </>}
+  >
     <div className="event-payload">
       <p className="run-meta mono">
         시도 {invocation.itemAttempt} · request {invocation.requestId ?? '기록 없음'} · model snapshot {invocation.modelSnapshot ?? '기록 없음'}
@@ -311,7 +372,9 @@ function ProviderInvocationRecord({ invocation }: { invocation: GenerationProvid
         <p className="run-meta mono">
           maxOutputTokens {readableValue(invocation.requestSnapshot.maxOutputTokens) ?? '기록 없음'}
         </p>
-        <details><summary>전체 요청 스냅샷</summary><JsonBlock value={invocation.requestSnapshot} /></details>
+        <LazyDisclosure summary="전체 요청 스냅샷">
+          <JsonBlock value={invocation.requestSnapshot} />
+        </LazyDisclosure>
       </section>
       <section>
         <h4>Provider 응답</h4>
@@ -320,11 +383,13 @@ function ProviderInvocationRecord({ invocation }: { invocation: GenerationProvid
           finish {invocation.finishReason ?? '기록 없음'} · token {invocation.inputTokens ?? '—'} / {invocation.outputTokens ?? '—'} · {invocation.latencyMs ?? '—'} ms
         </p>
         {invocation.error && <div className="event-error"><strong>호출 실패</strong><JsonBlock value={invocation.error} /></div>}
-        <details><summary>Provider 원시 응답</summary><JsonBlock value={invocation.rawResponse ?? '기록 없음'} /></details>
+        <LazyDisclosure summary="Provider 원시 응답">
+          <JsonBlock value={invocation.rawResponse ?? '기록 없음'} />
+        </LazyDisclosure>
       </section>
       <small className="mono">시작 {invocation.startedAt} · 완료 {invocation.completedAt ?? '기록 없음'} · invocation {invocation.id}</small>
     </div>
-  </details>;
+  </LazyDisclosure>;
 }
 
 function mergeBatchSnapshot(
@@ -352,8 +417,10 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
   const [activity, setActivity] = useState<Activity | null>(null);
   const [itemAudits, setItemAudits] = useState<Record<string, GenerationItemAuditState>>({});
   const auditBatchRef = useRef<string | null>(selectedBatchId);
+  const activeAuditItemRef = useRef<string | null>(null);
   const auditGenerationRef = useRef(0);
   const auditRequestsRef = useRef(new Set<string>());
+  const auditAbortRef = useRef<AbortController | null>(null);
   const [promptInputs, setPromptInputs] = useState({
     subject: '과학', grade: '중학교 2학년', purpose: '핵심 개념 이해',
     questionType: '구조화 서술형', difficulty: '중',
@@ -389,6 +456,8 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     }).catch(() => undefined);
     return () => abort.abort();
   }, [fetchActivity, selectedBatchId]);
+
+  useEffect(() => () => auditAbortRef.current?.abort(), []);
 
   const refreshSelectedSnapshot = useCallback(async () => {
     if (!selectedBatchId) return;
@@ -437,12 +506,23 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     },
   });
 
+  function evictItemAudit(itemId?:string) {
+    if (
+      itemId != null
+      && activeAuditItemRef.current !== itemId
+    ) return;
+    activeAuditItemRef.current = null;
+    auditGenerationRef.current += 1;
+    auditRequestsRef.current.clear();
+    auditAbortRef.current?.abort();
+    auditAbortRef.current = null;
+    setItemAudits({});
+  }
+
   function selectGenerationBatch(batchId: string) {
     if (auditBatchRef.current !== batchId) {
       auditBatchRef.current = batchId;
-      auditGenerationRef.current += 1;
-      auditRequestsRef.current.clear();
-      setItemAudits({});
+      evictItemAudit();
     }
     setActivity(null);
     setSelectedBatchId(batchId);
@@ -451,6 +531,12 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
   async function loadItemAudit(itemId: string, offset = 0, force = false) {
     const batchId = selectedBatchId;
     if (!batchId) return;
+    if (activeAuditItemRef.current !== itemId) {
+      activeAuditItemRef.current = itemId;
+      auditGenerationRef.current += 1;
+      auditRequestsRef.current.clear();
+      setItemAudits({});
+    }
     const auditGeneration = auditGenerationRef.current;
     const cached = itemAudits[itemId];
     if (
@@ -463,10 +549,12 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     const requestKey = `${batchId}:${itemId}:${offset}`;
     if (auditRequestsRef.current.has(requestKey)) return;
     auditRequestsRef.current.add(requestKey);
+    auditAbortRef.current?.abort();
+    const abort = new AbortController();
+    auditAbortRef.current = abort;
     setItemAudits((current) => {
       const previous = current[itemId]?.batchId === batchId ? current[itemId] : null;
       return {
-        ...current,
         [itemId]: {
           batchId,
           loaded: previous?.loaded ?? false,
@@ -482,12 +570,13 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     try {
       const response = await fetch(
         `/api/generation/${batchId}/items/${itemId}/audit?limit=${ITEM_AUDIT_PAGE_SIZE}&offset=${offset}`,
-        { cache: 'no-store' },
+        { cache: 'no-store', signal:abort.signal },
       );
       if (!response.ok) throw new Error('상세 감사 기록을 불러오지 못했습니다.');
       const page = await response.json() as GenerationItemAuditPage;
       if (
         auditBatchRef.current !== batchId
+        || activeAuditItemRef.current !== itemId
         || auditGenerationRef.current !== auditGeneration
         || page.batchId !== batchId
         || page.itemId !== itemId
@@ -499,7 +588,6 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
           ? page.providerInvocations
           : [...(previous?.providerInvocations ?? []), ...page.providerInvocations];
         return {
-          ...current,
           [itemId]: {
             batchId,
             loaded: true,
@@ -516,13 +604,13 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     } catch (error) {
       if (
         auditBatchRef.current !== batchId
+        || activeAuditItemRef.current !== itemId
         || auditGenerationRef.current !== auditGeneration
       ) return;
       setItemAudits((current) => {
         if (auditGenerationRef.current !== auditGeneration) return current;
         const previous = current[itemId]?.batchId === batchId ? current[itemId] : null;
         return {
-          ...current,
           [itemId]: {
             batchId,
             loaded: previous?.loaded ?? false,
@@ -536,6 +624,7 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
       });
     } finally {
       auditRequestsRef.current.delete(requestKey);
+      if (auditAbortRef.current === abort) auditAbortRef.current = null;
     }
   }
 
@@ -547,9 +636,10 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     setSelectedTocIds((current) => checked ? [...new Set([...current, id])] : current.filter((entryId) => entryId !== id));
   }
   function toggleAllToc(source: GenerationSource, checked: boolean) {
+    const usableEntries = source.tocEntries.filter(isUsableTocEntry);
     if (checked) {
       setSelectedSourceIds((current) => [...new Set([...current, source.id])]);
-      setSelectedTocIds((current) => [...new Set([...current, ...source.tocEntries.map((entry) => entry.id)])]);
+      setSelectedTocIds((current) => [...new Set([...current, ...usableEntries.map((entry) => entry.id)])]);
     } else {
       setSelectedTocIds((current) => current.filter((id) => !source.tocEntries.some((entry) => entry.id === id)));
     }
@@ -614,13 +704,17 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
         <fieldset className="source-scope-fieldset"><legend>교과서와 목차 선택</legend><small>교과서를 체크한 뒤 목차를 펼쳐 사용할 범위를 선택합니다. 목차를 선택하지 않으면 교과서 전체를 사용합니다.</small>
           <div className="source-scope-list">{sources.map((source) => {
             const selected = selectedSourceIds.includes(source.id);
-            const selectedCount = source.tocEntries.filter((entry) => selectedTocIds.includes(entry.id)).length;
-            const allSelected = source.tocEntries.length > 0 && selectedCount === source.tocEntries.length;
+            const usableEntries = source.tocEntries.filter(isUsableTocEntry);
+            const selectedCount = usableEntries.filter((entry) => selectedTocIds.includes(entry.id)).length;
+            const allSelected = usableEntries.length > 0 && selectedCount === usableEntries.length;
             return <details key={source.id} className={selected ? 'selected' : ''}>
-              <summary><label onClick={(event) => event.stopPropagation()}><input aria-label={`교과서 ${source.original_name}`} type="checkbox" checked={selected} onChange={(event) => toggleSource(source, event.target.checked)} /><BookOpen size={15} /><span><strong>{source.original_name}</strong><small>{source.subject ?? '과목 미지정'} · {source.grade ?? '학년 미지정'} · 목차 {source.tocEntries.length}개</small></span></label><ChevronDown size={15} /></summary>
+              <summary><label onClick={(event) => event.stopPropagation()}><input aria-label={`교과서 ${source.original_name}`} type="checkbox" checked={selected} onChange={(event) => toggleSource(source, event.target.checked)} /><BookOpen size={15} /><span><strong>{source.original_name}</strong><small>{source.subject ?? '과목 미지정'} · {source.grade ?? '학년 미지정'} · 사용 가능 목차 {usableEntries.length}/{source.tocEntries.length}개</small></span></label><ChevronDown size={15} /></summary>
               <div className="toc-check-list">{source.tocEntries.length ? <>
-                <label className="toc-select-all"><input aria-label={`${source.original_name} 전체 단원 선택`} type="checkbox" checked={allSelected} onChange={(event) => toggleAllToc(source, event.target.checked)} /><strong>전체 단원 선택</strong><small>{selectedCount}/{source.tocEntries.length}</small></label>
-                {source.tocEntries.map((entry) => <label key={entry.id} className={`toc-level-${entry.level}`}><input aria-label={entry.title} type="checkbox" disabled={!selected} checked={selectedTocIds.includes(entry.id)} onChange={(event) => toggleToc(entry.id, event.target.checked)} /><span>{entry.title}</span>{entry.printed_page && <small className="mono">p.{entry.printed_page}</small>}</label>)}
+                <label className="toc-select-all"><input aria-label={`${source.original_name} 전체 단원 선택`} type="checkbox" disabled={usableEntries.length === 0} checked={allSelected} onChange={(event) => toggleAllToc(source, event.target.checked)} /><strong>전체 단원 선택</strong><small>{selectedCount}/{usableEntries.length}</small></label>
+                {source.tocEntries.map((entry) => {
+                  const usable = isUsableTocEntry(entry);
+                  return <label key={entry.id} className={`toc-level-${entry.level}`} title={usable && entry.mapping_confidence !== null ? `매핑 신뢰도 ${Math.round(entry.mapping_confidence * 100)}%` : undefined}><input aria-label={entry.title} type="checkbox" disabled={!selected || !usable} checked={selectedTocIds.includes(entry.id)} onChange={(event) => toggleToc(entry.id, event.target.checked)} /><span>{entry.title}</span><small>{entry.printed_page !== null && <span className="mono">p.{entry.printed_page} · </span>}{usable ? <span>{entry.mapped_chunk_count}청크</span> : <span>매핑 없음</span>}</small></label>;
+                })}
               </> : <p>앞 10페이지에서 목차 항목을 찾지 못했습니다. 이 교과서는 전체 범위로 사용할 수 있습니다.</p>}</div>
             </details>;
           })}</div>
@@ -669,14 +763,23 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
                 failed: 0,
                 abandoned: 0,
               };
-              return <details
-                key={item.id}
-                open={item.state === 'FAILED' ? true : undefined}
-                onToggle={(event) => {
-                  if (event.currentTarget.open) void loadItemAudit(item.id);
+              return <LazyDisclosure
+                key={`${item.id}:${item.state === 'FAILED' ? 'failed' : 'other'}`}
+                defaultOpen={item.state === 'FAILED'}
+                unmountClosed={false}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    evictItemAudit(item.id);
+                  } else if (
+                    item.state !== 'FAILED'
+                    && !audit?.loaded
+                    && !audit?.loading
+                  ) {
+                    void loadItemAudit(item.id);
+                  }
                 }}
+                summary={<><strong>{item.ordinal}번 문항</strong><span className={`state-label state-${item.state.toLowerCase()}`}>{item.state}</span><small className="mono">시도 {item.attempts}회</small></>}
               >
-                <summary><strong>{item.ordinal}번 문항</strong><span className={`state-label state-${item.state.toLowerCase()}`}>{item.state}</span><small className="mono">시도 {item.attempts}회</small></summary>
                 <div className="event-payload">
                   {item.questionPublicId && <p><strong>저장 문항</strong> <span className="mono">{item.questionPublicId}</span></p>}
                   {item.error && <p className="event-error"><strong>{item.error.code ?? 'GENERATION_ITEM_FAILED'} · {item.error.retryable ? '재시도 가능' : '입력·범위 수정 필요'}</strong><br />{item.error.message ?? '문항 생성에 실패했습니다.'}</p>}
@@ -703,7 +806,9 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
                   </button>
                   {audit?.error && <p className="event-error" role="alert">{audit.error}</p>}
                   {audit?.loaded && <section aria-label={`${item.ordinal}번 문항 상세 감사 기록`}>
-                    <details><summary>검색 감사 상세</summary><RetrievalRecord value={audit.latestRetrieval} /></details>
+                    <LazyDisclosure summary="검색 감사 상세">
+                      <RetrievalRecord value={audit.latestRetrieval} />
+                    </LazyDisclosure>
                     <h4>
                       불러온 모델 호출 {audit.providerInvocations.length}/{audit.pagination?.total ?? audit.providerInvocations.length}건
                     </h4>
@@ -721,13 +826,17 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
                   </section>}
                   <small>최근 변경 {new Date(item.updatedAt).toLocaleString('ko-KR')}</small>
                 </div>
-              </details>;
+              </LazyDisclosure>;
             })}</div>}
-            <div className="generation-event-list">{activity.events.length === 0 ? <p className="empty-events">아직 기록이 없습니다.</p> : [...activity.events].reverse().map((event) => <details key={event.id} open={event.event_type.includes('FAILED')}><summary><span className={`event-dot ${event.event_type.includes('FAILED') ? 'failed' : ''}`} /><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></summary><div className="event-payload">
+            <div className="generation-event-list">{activity.events.length === 0 ? <p className="empty-events">아직 기록이 없습니다.</p> : [...activity.events].reverse().map((event) => <LazyDisclosure
+              key={event.id}
+              defaultOpen={event.event_type.includes('FAILED')}
+              summary={<><span className={`event-dot ${event.event_type.includes('FAILED') ? 'failed' : ''}`} /><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></>}
+            ><div className="event-payload">
               {event.event_type === 'QUESTION_GENERATION_COMPLETED' && <><h4>{String(event.payload.ordinal)}번 문항</h4><p>{String(event.payload.questionText ?? '')}</p><strong>답안</strong><p>{String(event.payload.answerText ?? '')}</p></>}
               {event.event_type.includes('FAILED') && <p className="event-error">{String(event.payload.message ?? event.payload.code ?? '실패 원인이 기록되지 않았습니다.')}</p>}
               <JsonBlock value={event.payload} />
-            </div></details>)}</div>
+            </div></LazyDisclosure>)}</div>
             {activity.questions.length > 0 && <div className="persisted-questions"><h3>저장된 문항 {activity.questions.length}개</h3>{activity.questions.map((question) => <details key={question.public_id}><summary><strong>{question.public_id}</strong><span>{question.status}</span></summary><div><p>{question.question_text}</p><strong>모범 답안</strong><p>{question.answer_text}</p></div></details>)}</div>}
           </div>}
         </section>

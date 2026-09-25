@@ -7,6 +7,7 @@ export type RetryOptions = {
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
   signal?: AbortSignal;
+  shouldRetry?: (error: ProviderError) => boolean;
   onRetry?: (
     input: { attempt: number; delayMs: number; error: ProviderError },
   ) => Promise<void> | void;
@@ -47,7 +48,12 @@ export async function withProviderRetry<T>(operation: () => Promise<T>, options:
     try {
       return await operation();
     } catch (error) {
-      if (!(error instanceof ProviderError) || !error.retryable || attempt >= options.maxAttempts) throw error;
+      if (
+        !(error instanceof ProviderError)
+        || !error.retryable
+        || attempt >= options.maxAttempts
+        || options.shouldRetry?.(error) === false
+      ) throw error;
       const exponential = Math.min(maxDelay, baseDelay * (2 ** (attempt - 1)));
       const delayMs = error.retryAfterMs ?? Math.round(exponential * (0.5 + random()));
       await options.onRetry?.({ attempt, delayMs, error });

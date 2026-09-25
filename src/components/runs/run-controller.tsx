@@ -1,13 +1,24 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import Link from 'next/link';
 import { ArrowLeft, CirclePause, CirclePlay, RefreshCcw, RotateCcw, Square, StopCircle } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
+import {
+  benchmarkRetrievalModeMetadata,
+  type StoredBenchmarkRetrievalMode,
+} from '@/domain/benchmark-retrieval';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
 
-type Run = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; dataset_version: string; score_version: string; price_profile_version: string; created_at: string; last_scoring_error?: { code?: string; message?: string; attempts?: number; retryAt?:string | null; retryDelayMs?:number | null } | null };
+type Run = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; dataset_version: string; score_version: string; price_profile_version: string; created_at: string; retrieval_modes?:StoredBenchmarkRetrievalMode[]; last_scoring_error?: { code?: string; message?: string; attempts?: number; retryAt?:string | null; retryDelayMs?:number | null } | null };
 type Model = { id: string; provider_key?: string; display_name: string; blind_id: string; model_id: string; protocol: string; concurrency: number };
 type Profile = { version: string; title: string; metrics: string[]; weights?: Record<string, number>; rubricPrompt: string; judgeProvider: string | null; judgeModel: string | null; contentHash: string; dynamicMetrics: string[]; snapshotProvenance?: string };
 type ScoringEngine = {
@@ -54,13 +65,72 @@ type JudgeInvocation = {
   updatedAt:string;
 };
 type Score = { metricKey: string; value: number | null; label: string | null; rationale: string | null; evidence: unknown; judgeProvider?: string | null; judgeModel?: string | null; judgeRequestId?:string | null; judgeInvocationId?:string | null; provenance?:string | null };
-type RunItem = { id: string; state: string; attempts: number; maxAttempts?: number; errorCode: string | null; errorMessage: string | null; questionPublicId: string; questionText: string; providerKey: string; displayName: string; modelId: string; blindId: string; request: Record<string, unknown> | null; response: { text: string; raw: unknown; requestId: string | null; finishReason?: string | null; inputTokens?: number | null; outputTokens?: number | null; latencyMs?: number | null; retryHistory: unknown } | null; requiredMetricKeys?:string[]; scores: Score[]; judgeInvocations?:JudgeInvocation[] };
+type RunItem = { id: string; runModelId?:string; state: string; attempts: number; maxAttempts?: number; errorCode: string | null; errorMessage: string | null; questionPublicId: string; questionText: string; providerKey: string; displayName: string; modelId: string; blindId: string; retrievalMode?:StoredBenchmarkRetrievalMode; generationRetrievalId?:string | null; hasResponse?:boolean; retrieval?:Record<string, unknown> | null; request?: Record<string, unknown> | null; response?: { text: string; raw: unknown; requestId: string | null; finishReason?: string | null; inputTokens?: number | null; outputTokens?: number | null; latencyMs?: number | null; retryHistory: unknown } | null; requiredMetricKeys?:string[]; scores?: Score[]; judgeInvocations?:JudgeInvocation[] };
+type ItemPagination = {
+  page:number;
+  pageSize:number;
+  total:number;
+  totalPages:number;
+};
+type ItemFilters = {
+  runModelId?:string | null;
+  state:string | null;
+  retrievalMode:StoredBenchmarkRetrievalMode | null;
+};
+type ModelFilterOption = {
+  runModelId:string;
+  providerKey:string;
+  displayName:string;
+  blindId:string;
+  modelId:string;
+};
+type ItemFilterOptions = {
+  models?:ModelFilterOption[];
+  states:string[];
+  retrievalModes:StoredBenchmarkRetrievalMode[];
+};
+type RunCounters = {
+  itemTotal:number;
+  scoreEligibleItems:number;
+  requiredScorePairs:number;
+  scoredPairs:number;
+};
+type JudgePagination = {
+  limit:number;
+  offset:number;
+  total:number;
+  nextOffset:number | null;
+};
+type ItemAuditState = {
+  loading:boolean;
+  loaded:boolean;
+  error:string | null;
+  item:RunItem | null;
+  judgePagination:JudgePagination | null;
+};
 type EventRecord = { id: string; type: string; data: Record<string, unknown> };
 type SnapshotEvent = {
   id: string;
   event_type: string;
   payload: Record<string, unknown>;
   created_at: string;
+};
+type ProviderCooldown = {
+  providerKey:string;
+  active:boolean;
+  rateLimitDimension:'RPM' | 'RPD' | 'TPM' | 'UNKNOWN';
+  rateLimitScope?:string | null;
+  blockedUntil:string;
+  sourcePhase:string;
+  sourceRunId?:string | null;
+  sourceRunItemId?:string | null;
+  sourceModelId:string | null;
+  retryAfterMs:number | null;
+  hitCount:number;
+  lastErrorMessage:string | null;
+  requestId:string | null;
+  activatedAt:string;
+  updatedAt:string;
 };
 const connectionLabels = {
   idle: '연결 대기',
@@ -69,9 +139,87 @@ const connectionLabels = {
   reconnecting: '재연결 중',
 } as const;
 
+function LazyDisclosure({
+  summary,
+  children,
+  className,
+}: {
+  summary:ReactNode;
+  children:ReactNode;
+  className?:string;
+}) {
+  const [open, setOpen] = useState(false);
+  return <details
+    className={className}
+    open={open}
+    onToggle={(event) => setOpen(event.currentTarget.open)}
+  >
+    <summary>{summary}</summary>
+    {open ? children : null}
+  </details>;
+}
+
+function retrievalModeLabel(mode?:StoredBenchmarkRetrievalMode):string {
+  return !mode || mode === 'LEGACY_EVIDENCE'
+    ? '기존 근거'
+    : benchmarkRetrievalModeMetadata[mode].shortLabel;
+}
+
+function retrievalModeTitle(mode?:StoredBenchmarkRetrievalMode):string {
+  return !mode || mode === 'LEGACY_EVIDENCE'
+    ? '기존 문항 근거'
+    : benchmarkRetrievalModeMetadata[mode].title;
+}
+
+function retrievalModeDescription(mode?:StoredBenchmarkRetrievalMode):string {
+  return !mode || mode === 'LEGACY_EVIDENCE'
+    ? '문항에 저장된 기존 교과서 근거를 그대로 사용한 레거시 조건입니다.'
+    : benchmarkRetrievalModeMetadata[mode].description;
+}
+
+function hasInlineAudit(item:RunItem) {
+  return Object.prototype.hasOwnProperty.call(item, 'scores')
+    || Object.prototype.hasOwnProperty.call(item, 'request')
+    || Object.prototype.hasOwnProperty.call(item, 'response')
+    || Object.prototype.hasOwnProperty.call(item, 'judgeInvocations');
+}
+
+function itemSummary(item:RunItem):RunItem {
+  const summary:RunItem = {
+    ...item,
+    hasResponse:item.hasResponse ?? item.response != null,
+  };
+  delete summary.retrieval;
+  delete summary.request;
+  delete summary.response;
+  delete summary.requiredMetricKeys;
+  delete summary.scores;
+  delete summary.judgeInvocations;
+  return summary;
+}
+
+function countersFromInlineItems(items:RunItem[]):RunCounters {
+  const scoreEligibleItems = items.filter((item) => item.response != null);
+  const requiredScorePairs = scoreEligibleItems.reduce(
+    (total, item) => total + (item.requiredMetricKeys?.length ?? 0),
+    0,
+  );
+  const scoredPairs = scoreEligibleItems.reduce((total, item) => {
+    const stored = new Set((item.scores ?? []).map((score) => score.metricKey));
+    return total + (item.requiredMetricKeys ?? [])
+      .filter((metric) => stored.has(metric)).length;
+  }, 0);
+  return {
+    itemTotal:items.length,
+    scoreEligibleItems:scoreEligibleItems.length,
+    requiredScorePairs,
+    scoredPairs,
+  };
+}
+
 const metricLabels: Record<string, string> = {
   accuracy:'정확성', faithfulness:'교과서 충실성', completeness:'완결성', curriculum_alignment:'교육과정 정합성',
-  student_fit:'학생 수준 적합성', misconception:'오개념 대응', hallucination:'환각 억제', exact_match:'완전 일치',
+  student_fit:'학생 수준 적합성', misconception:'오개념 대응', hallucination:'환각 억제',
   response_present:'응답 존재', target_concept_correctness:'목표 개념 정확성', prerequisite_identification:'선수 개념 식별',
   prerequisite_relation_accuracy:'선수 관계 방향 정확성', prerequisite_application:'선수 개념 적용',
   reasoning_chain_completeness:'추론 사슬 완결성', textbook_grounding:'교과서 근거 충실성',
@@ -83,6 +231,11 @@ export function RunController({
   profile,
   scoringEngine,
   initialItems,
+  initialItemPagination,
+  initialCounters,
+  initialItemFilters,
+  initialItemFilterOptions,
+  initialProviderCooldowns = [],
   initialEvents = [],
   initialEventCursor,
 }: {
@@ -91,11 +244,63 @@ export function RunController({
   profile: Profile;
   scoringEngine?:ScoringEngine;
   initialItems: RunItem[];
+  initialItemPagination?:ItemPagination;
+  initialCounters?:RunCounters;
+  initialItemFilters?:ItemFilters;
+  initialItemFilterOptions?:ItemFilterOptions;
+  initialProviderCooldowns?:ProviderCooldown[];
   initialEvents?: SnapshotEvent[];
   initialEventCursor?: string;
 }) {
   const [run, setRun] = useState(initialRun);
-  const [items, setItems] = useState(initialItems);
+  const [items, setItems] = useState(() => initialItems.map(itemSummary));
+  const [itemPagination, setItemPagination] = useState<ItemPagination>(
+    initialItemPagination ?? {
+      page:1,
+      pageSize:50,
+      total:initialItems.length,
+      totalPages:initialItems.length ? 1 : 0,
+    },
+  );
+  const [counters, setCounters] = useState<RunCounters>(
+    initialCounters ?? countersFromInlineItems(initialItems),
+  );
+  const [itemFilterOptions, setItemFilterOptions] = useState<ItemFilterOptions>(
+    initialItemFilterOptions ?? {
+      models:models.map((model) => ({
+        runModelId:model.id,
+        providerKey:model.provider_key ?? '',
+        displayName:model.display_name,
+        blindId:model.blind_id,
+        modelId:model.model_id,
+      })),
+      states:[...new Set(initialItems.map((item) => item.state))],
+      retrievalModes:[...new Set(initialItems.map(
+        (item) => item.retrievalMode ?? 'LEGACY_EVIDENCE',
+      ))],
+    },
+  );
+  const initialInlineAudit = initialItems.find(hasInlineAudit) ?? null;
+  const [itemAudits, setItemAudits] = useState<Record<string, ItemAuditState>>(
+    () => initialInlineAudit
+      ? {
+        [initialInlineAudit.id]:{
+        loading:false,
+        loaded:true,
+        error:null,
+        item:initialInlineAudit,
+        judgePagination:{
+          limit:20,
+          offset:0,
+          total:initialInlineAudit.judgeInvocations?.length ?? 0,
+          nextOffset:null,
+        },
+      }}
+      : {},
+  );
+  const [providerCooldowns, setProviderCooldowns] = useState(
+    initialProviderCooldowns,
+  );
   const [engine, setEngine] = useState<ScoringEngine>(() => scoringEngine ?? {
     id:null,
     version:null,
@@ -113,18 +318,122 @@ export function RunController({
     })));
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
-  const [modelFilter, setModelFilter] = useState('ALL');
-  const [stateFilter, setStateFilter] = useState('ALL');
+  const [modelFilter, setModelFilter] = useState(
+    initialItemFilters?.runModelId ?? 'ALL',
+  );
+  const [retrievalFilter, setRetrievalFilter] = useState(
+    initialItemFilters?.retrievalMode ?? 'ALL',
+  );
+  const [stateFilter, setStateFilter] = useState(
+    initialItemFilters?.state ?? 'ALL',
+  );
+  const overviewSequenceRef = useRef(0);
+  const itemAuditEpochRef = useRef(0);
+  const itemAuditAbortRef = useRef<AbortController | null>(null);
+  const activeItemAuditRef = useRef<string | null>(initialInlineAudit?.id ?? null);
+  const visibleItemIdsRef = useRef(new Set(initialItems.map((item) => item.id)));
+  const viewRef = useRef({
+    page:itemPagination.page,
+    pageSize:itemPagination.pageSize,
+    runModelId:initialItemFilters?.runModelId ?? null,
+    state:initialItemFilters?.state ?? null,
+    retrievalMode:initialItemFilters?.retrievalMode ?? null,
+  });
   const profileWeights = profile.weights ?? {};
+  const clearItemAudit = useCallback(() => {
+    itemAuditEpochRef.current += 1;
+    itemAuditAbortRef.current?.abort();
+    itemAuditAbortRef.current = null;
+    activeItemAuditRef.current = null;
+    setItemAudits({});
+  }, []);
 
-  const refreshDetails = useCallback(async () => {
-    const response = await fetch(`/api/runs/${run.id}/details?history=0`);
+  useEffect(() => () => {
+    itemAuditEpochRef.current += 1;
+    itemAuditAbortRef.current?.abort();
+    itemAuditAbortRef.current = null;
+    activeItemAuditRef.current = null;
+  }, []);
+
+  const refreshDetails = useCallback(async (viewOverride:Partial<{
+    page:number;
+    pageSize:number;
+    runModelId:string | null;
+    state:string | null;
+    retrievalMode:StoredBenchmarkRetrievalMode | null;
+  }> = {}) => {
+    const requestedView = { ...viewRef.current, ...viewOverride };
+    viewRef.current = requestedView;
+    const requestSequence = ++overviewSequenceRef.current;
+    const query = new URLSearchParams({ history:'0' });
+    const isDefaultView = requestedView.page === 1
+      && requestedView.pageSize === 50
+      && requestedView.runModelId == null
+      && requestedView.state == null
+      && requestedView.retrievalMode == null;
+    if (!isDefaultView) {
+      query.set('page', String(requestedView.page));
+      query.set('pageSize', String(requestedView.pageSize));
+    }
+    if (requestedView.runModelId) {
+      query.set('runModelId', requestedView.runModelId);
+    }
+    if (requestedView.state) query.set('state', requestedView.state);
+    if (requestedView.retrievalMode) {
+      query.set('retrievalMode', requestedView.retrievalMode);
+    }
+    const response = await fetch(`/api/runs/${run.id}/details?${query}`);
+    if (requestSequence !== overviewSequenceRef.current) return true;
     if (!response.ok) return false;
     const body = await response.json();
-    setRun(body.run); setItems(body.items);
+    if (requestSequence !== overviewSequenceRef.current) return true;
+    setRun(body.run); setItems(body.items.map((item:RunItem) => itemSummary(item)));
+    setProviderCooldowns(body.providerCooldowns ?? []);
+    if (body.itemPagination) {
+      setItemPagination(body.itemPagination);
+      viewRef.current = {
+        page:body.itemPagination.page,
+        pageSize:body.itemPagination.pageSize,
+        runModelId:body.itemFilters?.runModelId
+          ?? requestedView.runModelId,
+        state:body.itemFilters?.state ?? requestedView.state,
+        retrievalMode:body.itemFilters?.retrievalMode
+          ?? requestedView.retrievalMode,
+      };
+    }
+    if (body.counters) setCounters(body.counters);
+    if (body.itemFilterOptions) setItemFilterOptions(body.itemFilterOptions);
+    if (body.itemFilters) {
+      setModelFilter(body.itemFilters.runModelId ?? 'ALL');
+      setStateFilter(body.itemFilters.state ?? 'ALL');
+      setRetrievalFilter(body.itemFilters.retrievalMode ?? 'ALL');
+    }
+    const visibleIds = new Set<string>(
+      body.items.map((item:RunItem) => item.id),
+    );
+    visibleItemIdsRef.current = visibleIds;
+    const activeItemId = activeItemAuditRef.current;
+    if (activeItemId && !visibleIds.has(activeItemId)) {
+      clearItemAudit();
+    } else {
+      setItemAudits((current) => Object.fromEntries(
+        Object.entries(current).filter(([itemId]) => visibleIds.has(itemId)),
+      ));
+    }
     if (body.scoringEngine) setEngine(body.scoringEngine);
     return true;
-  }, [run.id]);
+  }, [clearItemAudit, run.id]);
+  const navigateOverview = useCallback((viewOverride:Partial<{
+    page:number;
+    runModelId:string | null;
+    state:string | null;
+    retrievalMode:StoredBenchmarkRetrievalMode | null;
+  }>) => {
+    viewRef.current = { ...viewRef.current, ...viewOverride };
+    visibleItemIdsRef.current = new Set();
+    clearItemAudit();
+    return refreshDetails(viewRef.current);
+  }, [clearItemAudit, refreshDetails]);
   const coalescedRefresh = useCoalescedRefresh(async () => {
     if (!await refreshDetails()) {
       throw new Error('RUN_DETAILS_REFRESH_FAILED');
@@ -161,6 +470,100 @@ export function RunController({
     },
   });
 
+  async function loadItemDetail(itemId:string, judgeOffset = 0) {
+    const existing = itemAudits[itemId];
+    if (existing?.loading) return;
+    if (judgeOffset === 0 && existing?.loaded) return;
+    if (activeItemAuditRef.current !== itemId) {
+      itemAuditEpochRef.current += 1;
+      itemAuditAbortRef.current?.abort();
+      itemAuditAbortRef.current = null;
+      activeItemAuditRef.current = itemId;
+    }
+    const requestEpoch = ++itemAuditEpochRef.current;
+    itemAuditAbortRef.current?.abort();
+    const abort = new AbortController();
+    itemAuditAbortRef.current = abort;
+    setItemAudits((current) => ({
+      [itemId]:{
+        loading:true,
+        loaded:current[itemId]?.loaded ?? false,
+        error:null,
+        item:current[itemId]?.item ?? null,
+        judgePagination:current[itemId]?.judgePagination ?? null,
+      },
+    }));
+    try {
+      const response = await fetch(
+        `/api/runs/${run.id}/items/${itemId}/details?judgeLimit=20&judgeOffset=${judgeOffset}`,
+        { cache:'no-store', signal:abort.signal },
+      );
+      if (!response.ok) throw new Error('항목 상세 감사 기록을 불러오지 못했습니다.');
+      const page = await response.json() as {
+        runId:string;
+        item:RunItem;
+        judgePagination:JudgePagination;
+      };
+      if (
+        abort.signal.aborted
+        || requestEpoch !== itemAuditEpochRef.current
+        || activeItemAuditRef.current !== itemId
+        || !visibleItemIdsRef.current.has(itemId)
+        || page.runId !== run.id
+        || page.item.id !== itemId
+      ) return;
+      setItemAudits((current) => {
+        if (
+          abort.signal.aborted
+          || requestEpoch !== itemAuditEpochRef.current
+          || activeItemAuditRef.current !== itemId
+        ) return current;
+        const previous = current[itemId];
+        const judgeInvocations = judgeOffset === 0
+          ? page.item.judgeInvocations ?? []
+          : [
+            ...(previous?.item?.judgeInvocations ?? []),
+            ...(page.item.judgeInvocations ?? []),
+          ];
+        return {
+          [itemId]:{
+            loading:false,
+            loaded:true,
+            error:null,
+            item:{ ...page.item, judgeInvocations:[...new Map(
+              judgeInvocations.map((invocation) => [invocation.id, invocation]),
+            ).values()] },
+            judgePagination:page.judgePagination,
+          },
+        };
+      });
+    } catch (error) {
+      if (
+        abort.signal.aborted
+        || requestEpoch !== itemAuditEpochRef.current
+        || activeItemAuditRef.current !== itemId
+        || !visibleItemIdsRef.current.has(itemId)
+      ) return;
+      setItemAudits((current) => abort.signal.aborted
+        || requestEpoch !== itemAuditEpochRef.current
+        || activeItemAuditRef.current !== itemId
+        ? current
+        : {
+          [itemId]:{
+            loading:false,
+            loaded:current[itemId]?.loaded ?? false,
+            error:error instanceof Error
+              ? error.message
+              : '항목 상세 감사 기록을 불러오지 못했습니다.',
+            item:current[itemId]?.item ?? null,
+            judgePagination:current[itemId]?.judgePagination ?? null,
+          },
+        });
+    } finally {
+      if (itemAuditAbortRef.current === abort) itemAuditAbortRef.current = null;
+    }
+  }
+
   async function command(value: string) {
     setBusy(true); setNotice('');
     const response = await fetch(`/api/runs/${run.id}/commands`, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ command:value }) });
@@ -176,28 +579,32 @@ export function RunController({
   }
 
   const filteredItems = useMemo(() => items.filter((item) =>
-    (modelFilter === 'ALL' || item.providerKey === modelFilter) && (stateFilter === 'ALL' || item.state === stateFilter),
-  ), [items, modelFilter, stateFilter]);
-  const states = [...new Set(items.map((item) => item.state))];
+    (modelFilter === 'ALL' || item.runModelId === modelFilter)
+    && (
+      retrievalFilter === 'ALL'
+      || (item.retrievalMode ?? 'LEGACY_EVIDENCE') === retrievalFilter
+    )
+    && (stateFilter === 'ALL' || item.state === stateFilter),
+  ), [items, modelFilter, retrievalFilter, stateFilter]);
+  const modelOptions = itemFilterOptions.models ?? models.map((model) => ({
+    runModelId:model.id,
+    providerKey:model.provider_key ?? '',
+    displayName:model.display_name,
+    blindId:model.blind_id,
+    modelId:model.model_id,
+  }));
+  const states = itemFilterOptions.states;
+  const retrievalModes = itemFilterOptions.retrievalModes;
   const executedItems = run.completed_items + run.failed_items;
   const executionPercent = run.total_items ? Math.round((executedItems / run.total_items) * 100) : 0;
-  const scoreEligibleItems = items.filter((item) => item.response != null);
-  const requiredScorePairs = scoreEligibleItems.reduce(
-    (total, item) => total + (item.requiredMetricKeys?.length ?? 0),
-    0,
-  );
-  const scoredPairs = scoreEligibleItems.reduce((total, item) => {
-    const stored = new Set(item.scores.map((score) => score.metricKey));
-    return total + (item.requiredMetricKeys ?? [])
-      .filter((metric) => stored.has(metric)).length;
-  }, 0);
+  const { requiredScorePairs, scoredPairs } = counters;
   const scoringPercent = requiredScorePairs
     ? Math.round((scoredPairs / requiredScorePairs) * 100)
     : 0;
   const scoringCoverage = requiredScorePairs
     ? `${scoredPairs} / ${requiredScorePairs} 지표`
     : '기록 없음';
-  const legacyPartial = items.length < executedItems;
+  const legacyPartial = counters.itemTotal < executedItems;
 
   return <div className="workflow-page">
     <header className="page-heading"><div><Link className="text-link" href="/runs"><ArrowLeft size={13}/> 실행 목록</Link><span className="eyebrow mono">{run.public_id}</span><h1>{run.title}</h1><p>{run.dataset_version} · {run.score_version} · {run.price_profile_version}</p></div><div className="heading-actions">
@@ -210,6 +617,18 @@ export function RunController({
     </div></header>
     {notice && <p className="inline-notice" role="status">{notice}</p>}
     {run.last_scoring_error && <div className="result-warning"><strong>{run.last_scoring_error.code ?? 'SCORING_FAILED'}</strong> {run.last_scoring_error.message} · 시도 {run.last_scoring_error.attempts ?? 1}회{run.last_scoring_error.retryAt ? ` · 다음 자동 재시도 ${new Date(run.last_scoring_error.retryAt).toLocaleString('ko-KR')}` : ''}</div>}
+    {providerCooldowns.some((cooldown) => cooldown.active) && <section className="provider-cooldown-panel" role="region" aria-live="polite" aria-label="공급자 호출 제한 자동 대기">
+      <div className="provider-cooldown-heading"><div><CirclePause size={16}/><strong>공급자 호출 제한으로 자동 대기 중</strong></div><small>다른 공급자의 실행은 계속됩니다.</small></div>
+      <div className="provider-cooldown-list">{providerCooldowns.filter((cooldown) => cooldown.active).map((cooldown) => {
+        const model = models.find((entry) => entry.provider_key === cooldown.providerKey);
+        return <article key={cooldown.providerKey}>
+          <div><strong>{model?.display_name ?? cooldown.providerKey}</strong><span className="state-label state-RETRY_WAIT">{cooldown.rateLimitDimension}</span></div>
+          <p>같은 공급자의 신규 모델·Judge 호출을 보류했습니다. <b>자동 재개 예정</b> {new Date(cooldown.blockedUntil).toLocaleString('ko-KR')}</p>
+          <small className="mono">{cooldown.sourcePhase} · {cooldown.sourceModelId ?? 'model 기록 없음'} · hit {cooldown.hitCount} · request {cooldown.requestId ?? '—'}</small>
+          {(cooldown.rateLimitScope || cooldown.lastErrorMessage) && <details><summary>제한 감지 근거</summary><JsonBlock className="run-payload" value={{ dimension:cooldown.rateLimitDimension, scope:cooldown.rateLimitScope, error:cooldown.lastErrorMessage, sourceRunId:cooldown.sourceRunId, sourceRunItemId:cooldown.sourceRunItemId, retryAfterMs:cooldown.retryAfterMs }}/></details>}
+        </article>;
+      })}</div>
+    </section>}
     <section className="run-control-strip panel" role="region" aria-label="실행 및 채점 진행률">
       <div><span>STATE</span><strong className="mono">{run.state}</strong></div>
       <div><span>실행 진행</span><strong className="mono">{executedItems} / {run.total_items}</strong><div className="progress-track"><i style={{width:`${executionPercent}%`}}/></div><small>완료와 실패를 합친 모델 실행 처리량</small></div>
@@ -218,12 +637,114 @@ export function RunController({
       <div><span>LIVE EVENT</span><strong><RefreshCcw size={13}/> {connectionLabels[stream.status]}</strong></div>
     </section>
 
-    <section className="panel run-profile-panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>평가 프로필</h2></div><span className="count-label mono">불변 스냅샷 · {profile.version}</span></div>{profile.snapshotProvenance === 'LEGACY_BACKFILL_UNVERIFIED' && <p className="result-warning">이 실행은 생성 시점 스냅샷 출처가 검증되지 않았습니다. 공식 근거로 사용하지 말고 새 프로필과 새 실행을 생성하십시오.</p>}<details open><summary><strong>{profile.title}</strong> · exact Judge {profile.judgeProvider ?? '결정론적'} / {profile.judgeModel ?? '—'}</summary><div className="profile-detail"><p>{profile.rubricPrompt}</p><div className="metric-chip-list">{profile.metrics.map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : metric === 'response_present' ? 0 : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div>{profile.dynamicMetrics.length > 0 && <><h3>선수관계 문항 추가 지표</h3><div className="metric-chip-list">{profile.dynamicMetrics.map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div></>}<small className="mono">스냅샷 provenance {profile.snapshotProvenance ?? '—'} · 내용 해시 {profile.contentHash}</small></div></details></section>
+    <section className="panel run-profile-panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>평가 프로필</h2></div><span className="count-label mono">불변 스냅샷 · {profile.version}</span></div>{profile.snapshotProvenance === 'LEGACY_BACKFILL_UNVERIFIED' && <p className="result-warning">이 실행은 생성 시점 스냅샷 출처가 검증되지 않았습니다. 공식 근거로 사용하지 말고 새 프로필과 새 실행을 생성하십시오.</p>}<details open><summary><strong>{profile.title}</strong> · 고정 Judge {profile.judgeProvider ?? '결정론적'} / {profile.judgeModel ?? '—'}</summary><div className="profile-detail"><p>{profile.rubricPrompt}</p><div className="metric-chip-list">{profile.metrics.filter((metric) => metric !== 'exact_match').map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : metric === 'response_present' ? 0 : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div>{profile.dynamicMetrics.length > 0 && <><h3>선수관계 문항 추가 지표</h3><div className="metric-chip-list">{profile.dynamicMetrics.map((metric) => { const weight=Object.prototype.hasOwnProperty.call(profileWeights, metric) ? profileWeights[metric] : 1; return <span key={metric}>{metricLabels[metric] ?? metric}<small className="mono">{metric} · weight {weight}</small></span>; })}</div></>}<small className="mono">스냅샷 provenance {profile.snapshotProvenance ?? '—'} · 내용 해시 {profile.contentHash}</small></div></details></section>
 
-    <section className="panel run-profile-panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>채점 엔진</h2></div><span className="count-label mono">{engine.verified ? '검증된 불변 스냅샷' : '검증 불가'}</span></div>{!engine.verified && <p className="result-warning"><strong>채점 엔진 출처를 검증할 수 없습니다.</strong> 기존 실행의 엔진 정의를 추정하거나 복원하지 않습니다. 공식 근거가 필요하면 현재 엔진으로 새 실행을 생성하십시오.</p>}{engine.definition ? <details open><summary><strong>{engine.title ?? engine.version ?? '저장된 채점 엔진'}</strong> · {engine.version ?? '버전 기록 없음'}</summary><div className="profile-detail"><small className="mono">스냅샷 provenance {engine.snapshotProvenance ?? '기록 없음'} · 내용 해시 {engine.contentHash ?? '기록 없음'} · ID {engine.id ?? '기록 없음'}</small><details><summary>엔진 정의 전체 보기</summary><JsonBlock className="run-payload" value={engine.definition}/></details></div></details> : <p>저장된 채점 엔진 정의가 없습니다.</p>}</section>
+    <section className="panel run-profile-panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>채점 엔진</h2></div><span className="count-label mono">{engine.verified ? '검증된 불변 스냅샷' : '검증 불가'}</span></div>{!engine.verified && <p className="result-warning"><strong>채점 엔진 출처를 검증할 수 없습니다.</strong> 기존 실행의 엔진 정의를 추정하거나 복원하지 않습니다. 공식 근거가 필요하면 현재 엔진으로 새 실행을 생성하십시오.</p>}{engine.definition ? <details open><summary><strong>{engine.title ?? engine.version ?? '저장된 채점 엔진'}</strong> · {engine.version ?? '버전 기록 없음'}</summary><div className="profile-detail"><small className="mono">스냅샷 provenance {engine.snapshotProvenance ?? '기록 없음'} · 내용 해시 {engine.contentHash ?? '기록 없음'} · ID {engine.id ?? '기록 없음'}</small><LazyDisclosure summary="엔진 정의 전체 보기"><JsonBlock className="run-payload" value={engine.definition}/></LazyDisclosure></div></details> : <p>저장된 채점 엔진 정의가 없습니다.</p>}</section>
 
-    <section className="panel run-items-panel"><div className="panel-heading"><div><span className="section-index mono">03</span><h2>질문별 실행·채점 기록</h2></div><span className="count-label mono">{filteredItems.length} / {items.length} ITEMS</span></div><div className="run-item-filters"><label>모델<select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}><option value="ALL">전체</option>{models.map((model) => <option key={model.id} value={model.provider_key ?? model.blind_id}>{model.display_name}</option>)}</select></label><label>상태<select value={stateFilter} onChange={(event) => setStateFilter(event.target.value)}><option value="ALL">전체</option>{states.map((state) => <option key={state}>{state}</option>)}</select></label></div><div className="run-item-list">{filteredItems.map((item) => <details key={item.id} className={`run-item run-item-${item.state}`}><summary><span className="mono">{item.questionPublicId}</span><strong>{item.blindId} · {item.displayName}</strong><span className={`state-label state-${item.state}`}>{item.state}</span><small>시도 {item.attempts}/{item.maxAttempts ?? '—'}</small></summary><div className="run-item-body"><section><h3>질문</h3><p className="run-question">{item.questionText}</p></section><section><h3>실제 전송 프롬프트</h3>{item.request ? <><h4>System</h4><JsonBlock className="run-payload" value={item.request.system}/><h4>User</h4><JsonBlock className="run-payload" value={item.request.prompt}/><details><summary>전체 요청 스냅샷</summary><JsonBlock className="run-payload" value={item.request}/></details></> : <p>외부 요청 전에 실패했거나 아직 실행되지 않았습니다.</p>}</section><section><h3>모델 응답</h3>{item.response ? <><JsonBlock className="run-payload" value={item.response.text}/><p className="run-meta mono">request {item.response.requestId ?? '—'} · {item.response.latencyMs ?? '—'} ms · token {item.response.inputTokens ?? '—'} / {item.response.outputTokens ?? '—'}</p><details><summary>원본 응답·재시도 기록</summary><JsonBlock className="run-payload" value={{ raw:item.response.raw, retryHistory:item.response.retryHistory }}/></details></> : <p>저장된 응답이 없습니다.</p>}</section>{(item.errorCode || item.errorMessage) && <section className="run-error"><h3>실패 원인</h3><strong className="mono">{item.errorCode ?? 'EXECUTION_FAILED'}</strong><p>{item.errorMessage}</p></section>}<section><h3>Judge 채점 호출 감사</h3>{item.judgeInvocations?.length ? <details><summary>Judge 호출 {item.judgeInvocations.length}건</summary><div className="run-score-list">{item.judgeInvocations.map((invocation) => <details key={invocation.id}><summary><strong>{invocation.invocationKind} · {invocation.state}</strong><span className="mono">시도 {invocation.attempt}</span><small>{invocation.logicalKey}</small></summary><p className="run-meta mono">호출 {invocation.id} · parent {invocation.parentInvocationId ?? '—'} · {invocation.providerKey}/{invocation.modelId}</p><p className="run-meta mono">요청 {invocation.requestedAt} · 응답 {invocation.responseReceivedAt ?? '—'} · 파싱 {invocation.parsedAt ?? '—'} · 저장 {invocation.persistedAt ?? '—'}</p><details><summary>요청 스냅샷·해시</summary><JsonBlock className="run-payload" value={{ requestHash:invocation.requestHash, requestedMetricKeys:invocation.requestedMetricKeys, requestSnapshot:invocation.requestSnapshot }}/></details><details><summary>원본 Judge 응답</summary><JsonBlock className="run-payload" value={{ providerRequestId:invocation.providerRequestId, responseModelId:invocation.responseModelId, responseModelSnapshot:invocation.responseModelSnapshot, finishReason:invocation.finishReason, inputTokens:invocation.inputTokens, outputTokens:invocation.outputTokens, latencyMs:invocation.latencyMs, responseText:invocation.responseText, rawResponse:invocation.rawResponse }}/></details><details><summary>파싱 결과</summary><JsonBlock className="run-payload" value={{ resolvedMetricKeys:invocation.resolvedMetricKeys, missingMetricKeys:invocation.missingMetricKeys, parsedResponse:invocation.parsedResponse }}/></details>{(invocation.errorCode || invocation.errorMessage) && <div className="run-error"><strong className="mono">{invocation.errorCode ?? 'JUDGE_FAILED'}</strong><p>{invocation.errorMessage}</p><small className="mono">단계 {invocation.errorStage ?? '기록 없음'} · 실패 {invocation.failedAt ?? '기록 없음'}</small></div>}</details>)}</div></details> : <p>이 응답에 기록된 Judge 호출이 없습니다. 레거시 호출은 추정하여 생성하지 않습니다.</p>}</section><section><h3>점수와 판정 근거</h3>{item.scores.length ? <div className="run-score-list">{item.scores.map((score) => <details key={score.metricKey}><summary><strong>{metricLabels[score.metricKey] ?? score.metricKey}</strong><span className="mono">{score.value == null ? '—' : `${(score.value * 100).toFixed(1)}%`}</span><small>{score.label}</small></summary><p>{score.rationale}</p><JsonBlock className="run-payload" value={score.evidence}/><small>{score.judgeProvider ? `${score.judgeProvider} · ${score.judgeModel}` : '결정론적 채점'} · provenance {score.provenance ?? '기록 없음'} · invocation {score.judgeInvocationId ?? '—'}</small></details>)}</div> : <p>아직 저장된 점수가 없습니다.</p>}</section></div></details>)}</div></section>
+    <section className="panel run-items-panel">
+      <div className="panel-heading">
+        <div><span className="section-index mono">03</span><h2>질문별 실행·채점 기록</h2></div>
+        <span className="count-label mono">{filteredItems.length} / {itemPagination.total} ITEMS</span>
+      </div>
+      <div className="run-item-filters">
+        <label>모델<select value={modelFilter} onChange={(event) => {
+          const value = event.target.value;
+          setModelFilter(value);
+          void navigateOverview({
+            page:1,
+            runModelId:value === 'ALL' ? null : value,
+          });
+        }}><option value="ALL">전체</option>{modelOptions.map((model) => <option key={model.runModelId} value={model.runModelId}>{model.displayName}</option>)}</select></label>
+        <label>검색 조건<select value={retrievalFilter} onChange={(event) => {
+          const value = event.target.value;
+          setRetrievalFilter(value);
+          void navigateOverview({
+            page:1,
+            retrievalMode:value === 'ALL'
+              ? null
+              : value as StoredBenchmarkRetrievalMode,
+          });
+        }}><option value="ALL">전체</option>{retrievalModes.map((mode) => <option key={mode} value={mode}>{retrievalModeLabel(mode)}</option>)}</select></label>
+        <label>상태<select value={stateFilter} onChange={(event) => {
+          const value = event.target.value;
+          setStateFilter(value);
+          void navigateOverview({
+            page:1,
+            state:value === 'ALL' ? null : value,
+          });
+        }}><option value="ALL">전체</option>{states.map((state) => <option key={state}>{state}</option>)}</select></label>
+      </div>
+      <div className="run-item-list">{filteredItems.map((summaryItem) => {
+        const audit = itemAudits[summaryItem.id];
+        const item = audit?.item ?? summaryItem;
+        return <details
+          key={summaryItem.id}
+          className={`run-item run-item-${summaryItem.state}`}
+          onToggle={(event) => {
+            if (event.currentTarget.open) {
+              void loadItemDetail(summaryItem.id);
+            } else if (activeItemAuditRef.current === summaryItem.id) {
+              clearItemAudit();
+            }
+          }}
+        >
+          <summary>
+            <span className="mono">{summaryItem.questionPublicId}</span>
+            <strong>{summaryItem.blindId} · {summaryItem.displayName} · {retrievalModeLabel(summaryItem.retrievalMode)}</strong>
+            <span className={`state-label state-${summaryItem.state}`}>{summaryItem.state}</span>
+            <small>시도 {summaryItem.attempts}/{summaryItem.maxAttempts ?? '—'}</small>
+          </summary>
+          {audit?.loaded && audit.item ? <div className="run-item-body">
+            <section><h3>질문</h3><p className="run-question">{item.questionText}</p></section>
+            <section><h3>검색·RAG 감사</h3><p><strong>{retrievalModeTitle(item.retrievalMode)}</strong><br/><small>{retrievalModeDescription(item.retrievalMode)}</small></p>{item.retrieval ? <LazyDisclosure summary="검색 질의·범위·선택 청크·그래프 추적"><JsonBlock className="run-payload" value={item.retrieval}/></LazyDisclosure> : <p>실행 전이거나 검색 감사 기록을 남기기 전 실패했습니다.</p>}</section>
+            <section><h3>실제 전송 프롬프트</h3>{item.request ? <>
+              <LazyDisclosure summary="System"><JsonBlock className="run-payload" value={item.request.system}/></LazyDisclosure>
+              <LazyDisclosure summary="User"><JsonBlock className="run-payload" value={item.request.prompt}/></LazyDisclosure>
+              <LazyDisclosure summary="전체 요청 스냅샷"><JsonBlock className="run-payload" value={item.request}/></LazyDisclosure>
+            </> : <p>외부 요청 전에 실패했거나 아직 실행되지 않았습니다.</p>}</section>
+            <section><h3>모델 응답</h3>{item.response ? <>
+              <LazyDisclosure summary="모델 응답 텍스트"><JsonBlock className="run-payload" value={item.response.text}/></LazyDisclosure>
+              <p className="run-meta mono">request {item.response.requestId ?? '—'} · {item.response.latencyMs ?? '—'} ms · token {item.response.inputTokens ?? '—'} / {item.response.outputTokens ?? '—'}</p>
+              <LazyDisclosure summary="원본 응답·재시도 기록"><JsonBlock className="run-payload" value={{ raw:item.response.raw, retryHistory:item.response.retryHistory }}/></LazyDisclosure>
+            </> : <p>저장된 응답이 없습니다.</p>}</section>
+            {(item.errorCode || item.errorMessage) && <section className="run-error"><h3>실패 원인</h3><strong className="mono">{item.errorCode ?? 'EXECUTION_FAILED'}</strong><p>{item.errorMessage}</p></section>}
+            <section><h3>Judge 채점 호출 감사</h3>{item.judgeInvocations?.length ? <>
+              <LazyDisclosure summary={<>Judge 호출 {audit.judgePagination && audit.judgePagination.total !== item.judgeInvocations.length ? `${item.judgeInvocations.length} / ${audit.judgePagination.total}` : item.judgeInvocations.length}건</>}>
+                <div className="run-score-list">{item.judgeInvocations.map((invocation) => <LazyDisclosure
+                  key={invocation.id}
+                  summary={<><strong>{invocation.invocationKind} · {invocation.state}</strong><span className="mono">시도 {invocation.attempt}</span><small>{invocation.logicalKey}</small></>}
+                >
+                  <p className="run-meta mono">호출 {invocation.id} · parent {invocation.parentInvocationId ?? '—'} · {invocation.providerKey}/{invocation.modelId}</p>
+                  <p className="run-meta mono">요청 {invocation.requestedAt} · 응답 {invocation.responseReceivedAt ?? '—'} · 파싱 {invocation.parsedAt ?? '—'} · 저장 {invocation.persistedAt ?? '—'}</p>
+                  <LazyDisclosure summary="요청 스냅샷·해시"><JsonBlock className="run-payload" value={{ requestHash:invocation.requestHash, requestedMetricKeys:invocation.requestedMetricKeys, requestSnapshot:invocation.requestSnapshot }}/></LazyDisclosure>
+                  <LazyDisclosure summary="원본 Judge 응답"><JsonBlock className="run-payload" value={{ providerRequestId:invocation.providerRequestId, responseModelId:invocation.responseModelId, responseModelSnapshot:invocation.responseModelSnapshot, finishReason:invocation.finishReason, inputTokens:invocation.inputTokens, outputTokens:invocation.outputTokens, latencyMs:invocation.latencyMs, responseText:invocation.responseText, rawResponse:invocation.rawResponse }}/></LazyDisclosure>
+                  <LazyDisclosure summary="파싱 결과"><JsonBlock className="run-payload" value={{ resolvedMetricKeys:invocation.resolvedMetricKeys, missingMetricKeys:invocation.missingMetricKeys, parsedResponse:invocation.parsedResponse }}/></LazyDisclosure>
+                  {(invocation.errorCode || invocation.errorMessage) && <div className="run-error"><strong className="mono">{invocation.errorCode ?? 'JUDGE_FAILED'}</strong><p>{invocation.errorMessage}</p><small className="mono">단계 {invocation.errorStage ?? '기록 없음'} · 실패 {invocation.failedAt ?? '기록 없음'}</small></div>}
+                </LazyDisclosure>)}</div>
+              </LazyDisclosure>
+              {audit.judgePagination?.nextOffset != null && <button className="button" disabled={audit.loading} onClick={() => void loadItemDetail(item.id, audit.judgePagination!.nextOffset!)}>Judge 호출 더 보기</button>}
+            </> : <p>이 응답에 기록된 Judge 호출이 없습니다. 레거시 호출은 추정하여 생성하지 않습니다.</p>}</section>
+            <section><h3>점수와 판정 근거</h3>{(item.scores ?? []).some((score) => score.metricKey !== 'exact_match') ? <div className="run-score-list">{(item.scores ?? []).filter((score) => score.metricKey !== 'exact_match').map((score) => <LazyDisclosure
+              key={score.metricKey}
+              summary={<><strong>{metricLabels[score.metricKey] ?? score.metricKey}</strong><span className="mono">{score.value == null ? '—' : `${(score.value * 100).toFixed(1)}%`}</span><small>{score.label}</small></>}
+            >
+              <p>{score.rationale}</p>
+              <JsonBlock className="run-payload" value={score.evidence}/>
+              <small>{score.judgeProvider ? `${score.judgeProvider} · ${score.judgeModel}` : '결정론적 채점'} · provenance {score.provenance ?? '기록 없음'} · invocation {score.judgeInvocationId ?? '—'}</small>
+            </LazyDisclosure>)}</div> : <p>아직 저장된 점수가 없습니다.</p>}</section>
+          </div> : <div className="run-item-body"><p>{audit?.error ?? (audit?.loading ? '상세 감사 기록을 불러오는 중입니다.' : '항목을 펼치면 상세 감사 기록을 불러옵니다.')}</p>{audit?.error && <button className="button" onClick={() => void loadItemDetail(summaryItem.id)}>다시 시도</button>}</div>}
+        </details>;
+      })}</div>
+      {itemPagination.totalPages > 1 && <nav className="pagination" aria-label="실행 항목 페이지">
+        <button className="button" disabled={busy || itemPagination.page <= 1} onClick={() => void navigateOverview({ page:itemPagination.page - 1 })}>이전 페이지</button>
+        <span className="mono">{itemPagination.page} / {itemPagination.totalPages}</span>
+        <button className="button" disabled={busy || itemPagination.page >= itemPagination.totalPages} onClick={() => void navigateOverview({ page:itemPagination.page + 1 })}>다음 페이지</button>
+      </nav>}
+    </section>
 
-    <section className="panel event-panel"><div className="panel-heading"><div><span className="section-index mono">04</span><h2>실시간 감사 이벤트</h2></div></div><div className="event-log">{events.length === 0 ? <p>SSE 이벤트를 기다리는 중입니다.</p> : events.slice().reverse().map((event) => <details key={`${event.id}-${event.type}`}><summary><span className="mono">#{event.id}</span><strong>{event.type}</strong><small>{String(event.data.createdAt ?? '')}</small></summary><JsonBlock className="run-payload" value={event.data}/></details>)}</div></section>
+    <section className="panel event-panel"><div className="panel-heading"><div><span className="section-index mono">04</span><h2>실시간 감사 이벤트</h2></div></div><div className="event-log">{events.length === 0 ? <p>SSE 이벤트를 기다리는 중입니다.</p> : events.slice().reverse().map((event) => <LazyDisclosure
+      key={`${event.id}-${event.type}`}
+      summary={<><span className="mono">#{event.id}</span><strong>{event.type}</strong><small>{String(event.data.createdAt ?? '')}</small></>}
+    ><JsonBlock className="run-payload" value={event.data}/></LazyDisclosure>)}</div></section>
   </div>;
 }

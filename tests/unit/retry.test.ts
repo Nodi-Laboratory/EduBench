@@ -25,6 +25,31 @@ test('never retries authentication and invalid request errors', async () => {
   expect(attempts).toBe(1);
 });
 
+test('can delegate rate-limit retry to an outer coordinator without sleeping', async () => {
+  const rateLimit = new ProviderError({
+    kind: 'RATE_LIMIT',
+    message: 'limited',
+    retryable: true,
+    status: 429,
+  });
+  const delays: number[] = [];
+  let attempts = 0;
+
+  await expect(withProviderRetry(async () => {
+    attempts += 1;
+    throw rateLimit;
+  }, {
+    maxAttempts: 4,
+    shouldRetry: (error) => error.kind !== 'RATE_LIMIT',
+    sleep: async (delayMs) => {
+      delays.push(delayMs);
+    },
+  })).rejects.toBe(rateLimit);
+
+  expect(attempts).toBe(1);
+  expect(delays).toEqual([]);
+});
+
 test('interrupts a provider backoff immediately when the owning job is cancelled', async () => {
   const controller = new AbortController();
   const reason = new Error('job cancelled');

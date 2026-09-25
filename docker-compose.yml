@@ -1,6 +1,7 @@
 services:
   db:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     environment:
       POSTGRES_DB: edubench
       POSTGRES_USER: edubench
@@ -16,6 +17,7 @@ services:
       retries: 20
   web:
     build: .
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false
@@ -50,6 +52,14 @@ services:
     depends_on:
       web:
         condition: service_healthy
+    # Informational liveness/DB-connectivity check; it intentionally does not
+    # treat a long-running scoring job as unhealthy.
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const { Client } = require('pg'); const client = new Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 3000, statement_timeout: 3000 }); client.connect().then(() => client.query('SELECT 1')).then(() => client.end()).catch(async () => { await client.end().catch(() => undefined); process.exitCode = 1; });\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   edubench_db:

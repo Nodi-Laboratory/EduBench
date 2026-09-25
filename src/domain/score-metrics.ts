@@ -16,13 +16,6 @@ export type ScoreMetricDefinition = {
 };
 
 const baseMetrics: Record<string, Omit<ScoreMetricDefinition, 'key'>> = {
-  exact_match: {
-    label: '완전 일치', category: '결정론적 검사', method: 'deterministic', range: '0 또는 1', direction: '높을수록 좋음',
-    definition: '모델 응답을 유니코드·공백·문장부호 기준으로 정규화한 뒤 허용 답안 중 하나와 완전히 같은지 검사합니다.',
-    evaluates: '정답 표현이 사전에 정의된 허용 답안과 정확히 일치하는지',
-    interpretation: '1은 정규화 후 완전 일치, 0은 불일치입니다. 서술형 의미 동등성은 이 지표만으로 판단하지 않습니다.',
-    rubric: '코드로 계산하며 Judge 모델을 호출하지 않습니다.',
-  },
   response_present: {
     label: '응답 존재', category: '결정론적 검사', method: 'deterministic', range: '0 또는 1', direction: '높을수록 좋음',
     definition: '모델이 비어 있지 않은 응답을 반환했는지 검사합니다.', evaluates: '응답 생성 자체의 성공 여부',
@@ -94,5 +87,7 @@ export function describeScoreMetric(metricKey: string): ScoreMetricDefinition {
 }
 
 export function describeScoreMetrics(metricKeys: string[]): ScoreMetricDefinition[] {
-  return [...new Set(metricKeys)].map(describeScoreMetric);
+  return [...new Set(metricKeys)]
+    .filter((metricKey) => metricKey !== 'exact_match')
+    .map(describeScoreMetric);
 }

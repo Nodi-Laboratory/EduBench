@@ -6,6 +6,9 @@ import { POST } from '@/app/api/generation/route';
 import { POST as resumeGeneration } from '@/app/api/generation/[id]/resume/route';
 import { GET as getGenerationActivity } from '@/app/api/generation/[id]/activity/route';
 import { claimJobs, recoverExpiredLeases } from '@/server/jobs/queue';
+import { deferJobForProviderCooldown } from '@/server/jobs/queue';
+import { ProviderError } from '@/server/providers/types';
+import { registerBenchmarkProviderRateLimit } from '@/server/runs/provider-cooldown';
 
 const sourceIds: string[] = [];
 const batchIds: string[] = [];
@@ -93,6 +96,60 @@ test('creates a persistent nine-stage generation batch limited to selected files
     state: 'PENDING',
     attempts: 0,
   })));
+});
+
+test('keeps a question-generation batch nonterminal when Gemini 429 starts a global cooldown', async () => {
+  const sourceId = randomUUID();
+  const revisionId = randomUUID();
+  sourceIds.push(sourceId);
+  await db.query(
+    `insert into source_files(
+       id,sha256,original_name,storage_path,mime_type,byte_size,subject,grade,status
+     ) values($1,$2,'generation-rate-limit.pdf','fixture','application/pdf',10,'과학','중학교 2학년','READY')`,
+    [sourceId, randomUUID().replaceAll('-', '')],
+  );
+  await db.query(
+    `insert into source_revisions(id,source_file_id,revision,parse_model)
+     values($1,$2,1,'test')`,
+    [revisionId, sourceId],
+  );
+  const response = await POST(new Request('http://localhost/api/generation', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body:JSON.stringify({
+      subject:'과학', grade:'중학교 2학년', sourceFileIds:[sourceId],
+      purpose:'핵심 개념 이해', questionType:'구조화 서술형', difficulty:'중',
+      direction:'교과서 근거로 개념 관계를 설명', chunkCount:8,
+      crossUnit:false, requestedCount:1, executionMode:'sequential',
+    }),
+  }));
+  const body = await response.json();
+  batchIds.push(body.id);
+  await db.query('update jobs set priority=1 where id=$1', [body.jobId]);
+  const [job] = await claimJobs('generation-rate-limit-worker', 1, 60_000, ['question.generate']);
+  const cooldown = await registerBenchmarkProviderRateLimit({
+    providerKey:'gemini',
+    error:new ProviderError({
+      kind:'RATE_LIMIT', message:'Gemini 429', retryable:true,
+      retryAfterMs:60_000, rateLimitDimension:'RPM', requestId:'generation-429',
+    }),
+    sourceRunId:null,
+    sourcePhase:'QUESTION_GENERATION',
+    sourceModelId:'gemini-3.5-flash',
+  });
+  await deferJobForProviderCooldown({
+    jobId:job!.id,
+    workerId:'generation-rate-limit-worker',
+    attempt:job!.attempts,
+  }, cooldown);
+
+  const batch = await db.query<{ state:string }>('select state from generation_batches where id=$1', [body.id]);
+  const deferred = await db.query<{ state:string; attempts:number }>(
+    'select state,attempts from jobs where id=$1', [job!.id],
+  );
+  expect(batch.rows[0]?.state).toBe('QUEUED');
+  expect(deferred.rows[0]).toEqual({ state:'RETRY_WAIT', attempts:0 });
+  await db.query(`delete from benchmark_provider_cooldowns where provider_key='gemini'`);
 });
 
 test('rejects resume while a generation job is active and enqueues a monotonic resume after it stops', async () => {
@@ -214,6 +271,74 @@ test('rejects resume while a generation job is active and enqueues a monotonic r
   });
 });
 
+test('reclassifies only legacy Gemini MAX_TOKENS failures as retryable when resuming', async () => {
+  const sourceId = randomUUID();
+  const revisionId = randomUUID();
+  sourceIds.push(sourceId);
+  await db.query(
+    `insert into source_files(
+       id,sha256,original_name,storage_path,mime_type,byte_size,subject,grade,status
+     ) values($1,$2,'legacy-max-tokens.pdf','fixture','application/pdf',10,'과학','중학교 2학년','READY')`,
+    [sourceId, randomUUID().replaceAll('-', '')],
+  );
+  await db.query(
+    `insert into source_revisions(id,source_file_id,revision,parse_model)
+     values($1,$2,1,'test')`,
+    [revisionId, sourceId],
+  );
+  const created = await POST(new Request('http://localhost/api/generation', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body:JSON.stringify({
+      subject:'과학', grade:'중학교 2학년', sourceFileIds:[sourceId],
+      purpose:'핵심 개념 이해', questionType:'구조화 서술형', difficulty:'중',
+      direction:'교과서 근거로 개념 관계를 설명', chunkCount:8,
+      crossUnit:false, requestedCount:1, executionMode:'sequential',
+    }),
+  }));
+  const body = await created.json();
+  batchIds.push(body.id);
+  await db.query(
+    `update generation_items
+        set state='FAILED',attempts=1,retryable=false,
+            error_code='PARSE',
+            error_message='PARSE: Gemini 응답이 완료되지 않았습니다. finishReason=MAX_TOKENS'
+      where generation_batch_id=$1`,
+    [body.id],
+  );
+  await db.query(`update generation_batches set state='FAILED' where id=$1`, [body.id]);
+  await db.query(
+    `update jobs set state='TERMINAL_FAILED',completed_at=now()
+      where id=$1`,
+    [body.jobId],
+  );
+
+  const resumed = await resumeGeneration(
+    new Request(`http://localhost/api/generation/${body.id}/resume`, { method:'POST' }),
+    { params:Promise.resolve({ id:body.id }) },
+  );
+
+  expect(resumed.status).toBe(202);
+  await expect(resumed.json()).resolves.toMatchObject({ state:'QUEUED', resumeSequence:2 });
+  const item = await db.query<{ state:string; retryable:boolean; error_code:string | null }>(
+    `select state,retryable,error_code
+       from generation_items where generation_batch_id=$1`,
+    [body.id],
+  );
+  expect(item.rows[0]).toEqual({ state:'PENDING', retryable:true, error_code:null });
+  const audit = await db.query<{ event_type:string; payload:Record<string, unknown> }>(
+    `select event_type,payload from job_events
+      where aggregate_type='generation'
+        and aggregate_id=$1
+        and event_type='GENERATION_LEGACY_MAX_TOKENS_RECLASSIFIED'`,
+    [body.id],
+  );
+  expect(audit.rows).toEqual([expect.objectContaining({
+    event_type:'GENERATION_LEGACY_MAX_TOKENS_RECLASSIFIED',
+    payload:expect.objectContaining({ ordinal:1, previousRetryable:false, retryable:true }),
+  })]);
+});
+
 test('rejects a selected TOC entry that has no chunk mapping in the latest revision', async () => {
   const sourceId = randomUUID();
   const revisionId = randomUUID();
@@ -258,6 +383,79 @@ test('rejects a selected TOC entry that has no chunk mapping in the latest revis
 
   expect(response.status).toBe(409);
   await expect(response.json()).resolves.toMatchObject({ code: 'GENERATION_TOC_SCOPE_EMPTY' });
+});
+
+test('snapshots resolved chunk IDs when creating a TOC-scoped generation batch', async () => {
+  const sourceId = randomUUID();
+  const revisionId = randomUUID();
+  const tocEntryId = randomUUID();
+  const chunkId = randomUUID();
+  sourceIds.push(sourceId);
+  await db.query(
+    `insert into source_files(
+       id,sha256,original_name,storage_path,mime_type,byte_size,subject,grade,status
+     ) values($1,$2,'snapshot-scope.pdf','fixture','application/pdf',10,'과학','중학교 2학년','READY')`,
+    [sourceId, randomUUID().replaceAll('-', '')],
+  );
+  await db.query(
+    `insert into source_revisions(
+       id,source_file_id,revision,parse_model,toc_alignment_attempted_at,toc_alignment_version
+     ) values($1,$2,1,'test',now(),2)`,
+    [revisionId, sourceId],
+  );
+  await db.query(
+    `insert into source_chunks(
+       id,source_file_id,source_revision_id,ordinal,content,page_start,chapter
+     ) values($1,$2,$3,1,'물질의 구성 단원 본문',12,'물질의 구성')`,
+    [chunkId, sourceId, revisionId],
+  );
+  await db.query(
+    `insert into source_toc_entries(
+       id,source_file_id,source_revision_id,ordinal,title,level,mapping_status,mapping_confidence
+     ) values($1,$2,$3,1,'물질의 구성',1,'MAPPED',1)`,
+    [tocEntryId, sourceId, revisionId],
+  );
+  await db.query(
+    `insert into source_chunk_toc_entries(
+       source_chunk_id,source_toc_entry_id,source_revision_id,relation,confidence
+     ) values($1,$2,$3,'DIRECT',1)`,
+    [chunkId, tocEntryId, revisionId],
+  );
+
+  const response = await POST(new Request('http://localhost/api/generation', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      subject: '과학',
+      grade: '중학교 2학년',
+      sourceFileIds: [sourceId],
+      tocEntryIds: [tocEntryId],
+      purpose: '핵심 개념 이해',
+      questionType: '구조화 서술형',
+      difficulty: '중',
+      direction: '교과서 근거로 개념 관계를 설명',
+      chunkCount: 8,
+      crossUnit: false,
+      requestedCount: 1,
+      executionMode: 'sequential',
+    }),
+  }));
+  const body = await response.json();
+
+  expect(response.status).toBe(201);
+  batchIds.push(body.id);
+  const batch = await db.query<{
+    source_scope: {
+      sourceRevisionIds: string[];
+      tocEntryIds: string[];
+      resolvedChunkIds: string[];
+    };
+  }>('select source_scope from generation_batches where id=$1', [body.id]);
+  expect(batch.rows[0]?.source_scope).toMatchObject({
+    sourceRevisionIds: [revisionId],
+    tocEntryIds: [tocEntryId],
+    resolvedChunkIds: [chunkId],
+  });
 });
 
 test('terminates a final-attempt expired lease and lets resume recover its orphan item', async () => {

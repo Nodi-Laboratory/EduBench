@@ -1,8 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
+import {
+  parseBenchmarkRetrievalModes,
+  hashBenchmarkRetrievalSnapshot,
+  type BenchmarkRetrievalMode,
+  type StoredBenchmarkRetrievalMode,
+} from '@/domain/benchmark-retrieval';
 import { DomainError } from '@/domain/errors';
 import {
   hasJudgeMetrics,
+  isRetiredScoreMetric,
   isJudgeProvenanceResolved,
   isRunScoreProfileUsable,
   scoreProfileReplacementRequiredMessage,
@@ -23,6 +30,10 @@ import { transitionRun, type RunCommand, type RunState } from '@/domain/status';
 import { withTransaction } from '@/server/db/transaction';
 import { createProviderForModel, isSupportedProviderKey } from '@/server/providers/registry';
 import { generationParametersSchema } from '@/server/providers/types';
+import {
+  type BenchmarkProviderCooldown,
+  markExpiredProviderCooldownsResumedForRun,
+} from './provider-cooldown';
 
 export type RunModelInput = {
   providerKey: string;
@@ -43,11 +54,18 @@ export type CreateRunInput = {
   systemPrompt: string;
   parameters?: Record<string, unknown>;
   models: RunModelInput[];
+  retrievalModes?: BenchmarkRetrievalMode[];
   questionLimit?: number;
   questionIds?: string[];
 };
 
-export type RunSummary = { id: string; publicId: string; state: RunState; totalItems: number };
+export type RunSummary = {
+  id:string;
+  publicId:string;
+  state:RunState;
+  totalItems:number;
+  retrievalModes:StoredBenchmarkRetrievalMode[];
+};
 
 export type RunItemRecord = {
   id: string;
@@ -55,6 +73,7 @@ export type RunItemRecord = {
   run_model_id: string;
   question_id: string;
   question_revision: number;
+  retrieval_mode: StoredBenchmarkRetrievalMode;
   state: string;
   attempts: number;
   max_attempts: number;
@@ -80,6 +99,50 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
   if (new Set(input.models.map((model) => model.providerKey)).size !== input.models.length) {
     throw new DomainError('DUPLICATE_RUN_PROVIDER', '동일 제공자를 한 실행에 두 번 등록할 수 없습니다.');
   }
+  let retrievalModes: StoredBenchmarkRetrievalMode[];
+  try {
+    retrievalModes = input.retrievalModes
+      ? parseBenchmarkRetrievalModes(input.retrievalModes)
+      : ['LEGACY_EVIDENCE'];
+  } catch (error) {
+    throw new DomainError(
+      'RUN_RETRIEVAL_MODES_INVALID',
+      error instanceof Error ? error.message : '검색 조건이 올바르지 않습니다.',
+    );
+  }
+  const isVerifiedRetrievalRun = !retrievalModes.includes('LEGACY_EVIDENCE');
+  const retrievalConfigSnapshot = isVerifiedRetrievalRun
+    ? {
+      schemaVersion:1,
+      strategyVersion:'benchmark-retrieval-v1',
+      modes:retrievalModes,
+      none:{
+        context:'none',
+      },
+      vector:{
+        querySource:'public-question-and-options-only',
+        scope:'generation-source-revisions',
+        ranking:'cosine',
+        neighborWindow:0,
+        topK:'question-generation-embedding-profile',
+      },
+      pike:{
+        treatment:'pike-inspired-authoring-graph-snapshot',
+        source:'question-generation-retrieval-snapshot',
+        ordering:'prerequisite-graph-evidence-first',
+        graphRole:'post-retrieval-evidence-prioritization',
+        promptDisclosure:'chunk-content-only',
+      },
+      scoringEvidencePolicy:'static-question-ground-truth',
+    }
+    : {
+      schemaVersion:1,
+      strategyVersion:'legacy-question-evidence',
+      modes:retrievalModes,
+    };
+  const retrievalConfigHash = isVerifiedRetrievalRun
+    ? hashBenchmarkRetrievalSnapshot(retrievalConfigSnapshot)
+    : null;
   return withTransaction(async (client) => {
     const dataset = await client.query<{ status: string; distribution: { sample_data?: boolean } }>(
       'select status, distribution from dataset_versions where id = $1', [input.datasetVersionId],
@@ -199,6 +262,12 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
     const profile = profileResult.rows[0];
     if (!profile) throw new DomainError('SCORE_PROFILE_NOT_FOUND', '채점 프로필을 찾을 수 없습니다.');
     const profileMetrics = Array.isArray(profile.metrics) ? profile.metrics.map(String) : [];
+    if (profileMetrics.some(isRetiredScoreMetric)) {
+      throw new DomainError(
+        'SCORE_PROFILE_REPLACEMENT_REQUIRED',
+        'exact_match는 폐기된 지표입니다. 새 채점 프로필 버전을 만들어 실행하십시오.',
+      );
+    }
     const profileWeights = profile.weights && typeof profile.weights === 'object' && !Array.isArray(profile.weights)
       ? profile.weights as Record<string, number>
       : {};
@@ -230,11 +299,47 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
       question_id:string;
       question_revision:number;
       quality_scores:unknown;
+      generation_batch_id:string | null;
+      generation_item_id:string | null;
+      generation_retrieval_id:string | null;
+      generation_pins_verified:boolean;
+      retrieval_candidate_scope:unknown;
+      retrieval_selected_chunks:unknown;
     }>(
-      `select dq.question_id, dq.question_revision, qr.quality_scores
+      `select dq.question_id,dq.question_revision,qr.quality_scores,
+         question.generation_batch_id,question.generation_item_id,
+         generation_retrieval.id generation_retrieval_id,
+         (
+           batch.question_generation_profile_snapshot_provenance=
+             'AT_CREATION_VERIFIED'
+           and batch.question_generation_profile_id is not null
+           and batch.question_generation_profile_snapshot is not null
+           and batch.question_generation_profile_hash
+             ~ '^[0-9a-f]{64}$'
+           and batch.embedding_rag_profile_snapshot_provenance=
+             'AT_CREATION_VERIFIED'
+           and batch.embedding_rag_profile_id is not null
+           and batch.embedding_rag_profile_snapshot is not null
+           and batch.embedding_rag_profile_hash
+             ~ '^[0-9a-f]{64}$'
+         ) generation_pins_verified,
+         generation_retrieval.candidate_scope retrieval_candidate_scope,
+         generation_retrieval.selected_chunks retrieval_selected_chunks
        from dataset_questions dq
+       join questions question on question.id=dq.question_id
+       left join generation_batches batch
+         on batch.id=question.generation_batch_id
        join question_revisions qr
          on qr.question_id=dq.question_id and qr.revision=dq.question_revision
+       left join lateral(
+         select retrieval.id,retrieval.candidate_scope,
+           retrieval.selected_chunks
+           from generation_retrievals retrieval
+          where retrieval.generation_batch_id=question.generation_batch_id
+            and retrieval.generation_item_id=question.generation_item_id
+          order by retrieval.attempt desc,retrieval.created_at desc
+          limit 1
+       ) generation_retrieval on true
        where dq.dataset_version_id = $1
          and ($2::uuid[] is null or dq.question_id = any($2::uuid[]))
        order by dq.ordinal
@@ -242,6 +347,58 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
       [input.datasetVersionId, input.questionIds?.length ? input.questionIds : null, input.questionLimit ?? 1000000],
     );
     if (!questions.rowCount) throw new DomainError('RUN_QUESTIONS_REQUIRED', '실행할 문항이 없습니다.');
+    const needsVector = retrievalModes.includes('VECTOR');
+    const needsPike = retrievalModes.includes('PIKE');
+    if (
+      needsVector
+      && process.env.MOCK_PROVIDERS?.toLowerCase() !== 'true'
+      && !process.env.GOOGLE_API_KEY
+    ) {
+      throw new DomainError(
+        'BENCHMARK_EMBEDDING_PROVIDER_NOT_CONFIGURED',
+        'RAG 조건의 질의 임베딩에 GOOGLE_API_KEY가 필요합니다.',
+      );
+    }
+    if (needsVector || needsPike) {
+      const ineligible = questions.rows.filter((question) => {
+        if (
+          !question.generation_batch_id
+          || !question.generation_item_id
+          || !question.generation_retrieval_id
+          || !question.generation_pins_verified
+        ) {
+          return true;
+        }
+        const candidateScope = question.retrieval_candidate_scope
+          && typeof question.retrieval_candidate_scope === 'object'
+          && !Array.isArray(question.retrieval_candidate_scope)
+          ? question.retrieval_candidate_scope as Record<string, unknown>
+          : {};
+        const sourceRevisionIds = Array.isArray(
+          candidateScope.sourceRevisionIds,
+        )
+          ? candidateScope.sourceRevisionIds.filter(
+            (value):value is string => typeof value === 'string',
+          )
+          : [];
+        const selectedChunks = Array.isArray(
+          question.retrieval_selected_chunks,
+        )
+          ? question.retrieval_selected_chunks
+          : [];
+        return (
+          (needsVector && sourceRevisionIds.length === 0)
+          || (needsPike && selectedChunks.length === 0)
+        );
+      });
+      if (ineligible.length) {
+        throw new DomainError(
+          'RUN_RETRIEVAL_PROVENANCE_REQUIRED',
+          `선택한 문항 중 ${ineligible.length}개에 질문 생성 검색 계보가 없어 RAG/Pike 비교를 시작할 수 없습니다. 해당 문항을 현재 생성 파이프라인으로 다시 생성하거나 일반 조건만 선택하십시오.`,
+          { ineligibleQuestionCount:ineligible.length },
+        );
+      }
+    }
     const needsJudge = questions.rows.some((question) =>
       hasJudgeMetrics(requiredMetricsForQuestion(profileMetrics, question.quality_scores)),
     );
@@ -265,18 +422,29 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
 
     const runId = randomUUID();
     const publicId = `RUN-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${runId.slice(0, 6).toUpperCase()}`;
-    const totalItems = questions.rows.length * executionModels.length;
+    const totalItems = questions.rows.length
+      * executionModels.length
+      * retrievalModes.length;
     await client.query(
       `insert into benchmark_runs(
          id, public_id, title, dataset_version_id, score_profile_id,
-         score_profile_snapshot, price_profile_version, system_prompt, parameters, total_items
-       ) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10)`,
+         score_profile_snapshot, price_profile_version, system_prompt, parameters, total_items,
+         retrieval_modes,retrieval_config_snapshot,retrieval_config_hash,
+         retrieval_snapshot_provenance
+       ) values (
+         $1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9::jsonb,$10,
+         $11::text[],$12::jsonb,$13,$14
+       )`,
       [runId, publicId, input.title, input.datasetVersionId, input.scoreProfileId,
         JSON.stringify(scoreProfileSnapshot), input.priceProfileVersion, input.systemPrompt, JSON.stringify({
           ...(input.parameters ?? {}),
           sample_data: Boolean(dataset.rows[0]?.distribution?.sample_data),
           mock_providers: process.env.MOCK_PROVIDERS?.toLowerCase() === 'true',
-        }), totalItems],
+        }), totalItems, retrievalModes, JSON.stringify(retrievalConfigSnapshot),
+        retrievalConfigHash,
+        isVerifiedRetrievalRun
+          ? 'AT_CREATION_VERIFIED'
+          : 'LEGACY_BACKFILL_UNVERIFIED'],
     );
 
     for (const [modelIndex, model] of executionModels.entries()) {
@@ -292,22 +460,40 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
           model.concurrency ?? 1, model.requestIntervalMs ?? 0],
       );
       for (const question of questions.rows) {
-        await client.query(
-          `insert into run_items(
-             benchmark_run_id, run_model_id, question_id, question_revision, idempotency_key
-           ) values ($1,$2,$3,$4,$5)`,
-          [runId, modelId, question.question_id, question.question_revision,
-            `${runId}:${model.providerKey}:${question.question_id}:${question.question_revision}`],
-        );
+        for (const retrievalMode of retrievalModes) {
+          await client.query(
+            `insert into run_items(
+               benchmark_run_id,run_model_id,question_id,question_revision,
+               retrieval_mode,idempotency_key,generation_retrieval_id
+             ) values ($1,$2,$3,$4,$5,$6,$7)`,
+            [
+              runId,
+              modelId,
+              question.question_id,
+              question.question_revision,
+              retrievalMode,
+              `${runId}:${model.providerKey}:${question.question_id}:${question.question_revision}:${retrievalMode}`,
+              question.generation_retrieval_id,
+            ],
+          );
+        }
       }
     }
     await appendRunEvent(client, runId, 'RUN_CREATED', {
       totalItems,
       models:executionModels.length,
+      retrievalModes,
+      retrievalConditions:retrievalModes.length,
       benchmarkModelsProfileId:modelProfile.id,
       benchmarkModelsProfileHash:modelProfile.content_hash,
     });
-    return { id: runId, publicId, state: 'DRAFT', totalItems };
+    return {
+      id:runId,
+      publicId,
+      state:'DRAFT',
+      totalItems,
+      retrievalModes,
+    };
   });
 }
 
@@ -390,6 +576,7 @@ export async function claimRunItems(
   return withTransaction(async (client) => {
     // Serialize claims per run so multiple workers cannot exceed a model's persisted concurrency.
     await client.query('select pg_advisory_xact_lock(hashtext($1))', [runId]);
+    await markExpiredProviderCooldownsResumedForRun(client, runId);
     const result = await client.query<RunItemRecord>(
       `with model_capacity as (
          select rm.id,
@@ -397,7 +584,7 @@ export async function claimRunItems(
              where ri.state = 'LEASED' and ri.lease_expires_at > now()
            ), 0)::int as available_slots,
            rm.request_interval_ms,
-           max(ri.started_at) as last_started_at
+           max(ri.last_attempt_started_at) as last_started_at
          from run_models rm
          left join run_items ri on ri.run_model_id = rm.id
          where rm.benchmark_run_id = $1
@@ -411,6 +598,19 @@ export async function claimRunItems(
          where ri.benchmark_run_id = $1 and br.state = 'RUNNING'
            and ri.state in ('PENDING','RETRY_WAIT') and ri.available_at <= now()
            and ri.attempts < ri.max_attempts
+           and not exists(
+             select 1 from benchmark_provider_cooldowns cooldown
+              join run_models dependency_model
+                on dependency_model.id=ri.run_model_id
+              where (
+                cooldown.provider_key=dependency_model.provider_key
+                or (
+                  ri.retrieval_mode='VECTOR'
+                  and cooldown.provider_key='gemini'
+                )
+              )
+                and cooldown.blocked_until>now()
+           )
            and (mc.last_started_at is null or mc.request_interval_ms = 0
              or mc.last_started_at <= now() - (mc.request_interval_ms::bigint * interval '1 millisecond'))
        ), candidates as (
@@ -422,7 +622,10 @@ export async function claimRunItems(
        update run_items ri set state = 'LEASED', lease_owner = $2,
          lease_expires_at = now() + ($4::bigint * interval '1 millisecond'),
          attempts = ri.attempts + 1,
-         started_at = coalesce(ri.started_at, now())
+         started_at = coalesce(ri.started_at, now()),
+         last_attempt_started_at = now(),
+         error_code = null,
+         error_message = null
        from candidates c where ri.id = c.id
        returning ri.*`,
       [runId, workerId, limit, leaseMs],
@@ -711,6 +914,78 @@ export async function beginScoringWhenExecutionFinished(runId: string): Promise<
     );
   }
   return outcome;
+}
+
+export async function deferRunItemForProviderCooldown(
+  itemId:string,
+  workerId:string,
+  cooldown:BenchmarkProviderCooldown,
+):Promise<boolean> {
+  return withTransaction(async (client) => {
+    const locked = await client.query<{
+      benchmark_run_id:string;
+      provider_key:string;
+      retrieval_mode:StoredBenchmarkRetrievalMode;
+      attempts:number;
+    }>(
+      `select item.benchmark_run_id,model.provider_key,
+         item.retrieval_mode,item.attempts
+         from run_items item
+         join run_models model on model.id=item.run_model_id
+        where item.id=$1 and item.state='LEASED' and item.lease_owner=$2
+        for update of item`,
+      [itemId, workerId],
+    );
+    const item = locked.rows[0];
+    if (!item) return false;
+    const cooldownAppliesToItem = item.provider_key === cooldown.providerKey
+      || (
+        item.retrieval_mode === 'VECTOR'
+        && cooldown.providerKey === 'gemini'
+      );
+    if (!cooldownAppliesToItem) {
+      throw new DomainError(
+        'RUN_ITEM_PROVIDER_MISMATCH',
+        '실행 항목의 모델·검색 공급자와 활성 호출 제한 공급자가 일치하지 않습니다.',
+      );
+    }
+    await client.query(
+      `update run_items set
+         state='RETRY_WAIT',
+         attempts=greatest(attempts-1,0),
+         available_at=$3,
+         lease_owner=null,
+         lease_expires_at=null,
+         error_code='RATE_LIMIT_PAUSED',
+         error_message=$4,
+         completed_at=null
+       where id=$1 and state='LEASED' and lease_owner=$2`,
+      [
+        itemId,
+        workerId,
+        cooldown.blockedUntil,
+        cooldown.lastErrorMessage
+          ?? `Provider cooldown active until ${cooldown.blockedUntil.toISOString()}`,
+      ],
+    );
+    await appendRunEvent(client, item.benchmark_run_id, 'RUN_ITEM_RETRY_SCHEDULED', {
+      itemId,
+      providerKey:cooldown.providerKey,
+      affectedScope:'PROVIDER_GLOBAL',
+      sourceRunId:cooldown.sourceRunId,
+      sourceRunItemId:cooldown.sourceRunItemId,
+      sourcePhase:cooldown.sourcePhase,
+      sourceModelId:cooldown.sourceModelId,
+      rateLimitDimension:cooldown.rateLimitDimension,
+      rateLimitScope:cooldown.rateLimitScope,
+      retryAfterMs:cooldown.retryAfterMs,
+      blockedUntil:cooldown.blockedUntil.toISOString(),
+      resumeAt:cooldown.blockedUntil.toISOString(),
+      automaticResume:true,
+      attemptRestoredTo:Math.max(item.attempts - 1, 0),
+    });
+    return true;
+  });
 }
 
 export async function finishCancellationWhenDrained(runId: string): Promise<boolean> {

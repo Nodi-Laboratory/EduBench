@@ -55,6 +55,98 @@ describe('provider response normalization', () => {
     });
   });
 
+  test('rejects a Gemini safety-blocked response as content filtering', async () => {
+    const provider = new GeminiProvider({
+      apiKey:'secret',
+      modelId:'gemini-test',
+      fetch:fixtureFetch({
+        promptFeedback:{ blockReason:'SAFETY' },
+        usageMetadata:{ promptTokenCount:17 },
+      }, { 'x-request-id':'gem-blocked' }),
+    });
+    await expect(provider.generate(request)).rejects.toMatchObject({
+      kind:'CONTENT_FILTER',
+      retryable:false,
+      status:200,
+      requestId:'gem-blocked',
+    });
+  });
+
+  test('classifies a Gemini MAX_TOKENS response as retryable', async () => {
+    const provider = new GeminiProvider({
+      apiKey:'secret',
+      modelId:'gemini-test',
+      fetch:fixtureFetch({
+        candidates:[{ content:{ parts:[] }, finishReason:'MAX_TOKENS' }],
+        usageMetadata:{ promptTokenCount:17, candidatesTokenCount:300 },
+      }, { 'x-request-id':'gem-empty' }),
+    });
+    await expect(provider.generate(request)).rejects.toMatchObject({
+      kind:'PARSE',
+      retryable:true,
+      status:200,
+      requestId:'gem-empty',
+    });
+  });
+
+  test('rejects nonblank Gemini output without a completed finish reason', async () => {
+    const provider = new GeminiProvider({
+      apiKey:'secret',
+      modelId:'gemini-test',
+      fetch:fixtureFetch({
+        candidates:[{ content:{ parts:[{ text:'아직 생성 중인 답변' }] } }],
+      }, { 'x-request-id':'gem-unfinished' }),
+    });
+    await expect(provider.generate(request)).rejects.toMatchObject({
+      kind:'PARSE',
+      retryable:false,
+      status:200,
+      requestId:'gem-unfinished',
+    });
+  });
+
+  test('rejects an incomplete OpenAI response instead of storing an empty successful answer', async () => {
+    const provider = new OpenAIProvider({
+      apiKey: 'secret',
+      modelId: 'openai-test',
+      fetch: fixtureFetch({
+        id: 'resp_incomplete',
+        model: 'openai-snapshot',
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ type: 'reasoning', content: [] }],
+        usage: { input_tokens: 14, output_tokens: 300 },
+      }, { 'x-request-id': 'oai-incomplete' }),
+    });
+
+    await expect(provider.generate(request)).rejects.toMatchObject({
+      kind: 'PARSE',
+      retryable: false,
+      status: 200,
+      requestId: 'oai-incomplete',
+    });
+  });
+
+  test('rejects a completed OpenAI response without output text', async () => {
+    const provider = new OpenAIProvider({
+      apiKey: 'secret',
+      modelId: 'openai-test',
+      fetch: fixtureFetch({
+        id: 'resp_empty',
+        model: 'openai-snapshot',
+        status: 'completed',
+        output: [{ type: 'message', content: [] }],
+      }),
+    });
+
+    await expect(provider.generate(request)).rejects.toMatchObject({
+      kind: 'PARSE',
+      retryable: false,
+      status: 200,
+      requestId: 'resp_empty',
+    });
+  });
+
   test('normalizes OpenAI-compatible chat completions', async () => {
     const provider = new OpenAICompatibleProvider({ providerKey: 'upstage', apiKey: 'secret', baseUrl: 'https://example.test/v1', modelId: 'solar-test', fetch: fixtureFetch({
       id: 'chat_1', model: 'solar-snapshot', choices: [{ message: { content: '원자는 기본 입자이다.' }, finish_reason: 'stop' }],
@@ -73,7 +165,7 @@ test('sends Gemini structured-output and thinking configuration', async () => {
     apiKey: 'secret', modelId: 'gemini-test',
     fetch: async (_input, init) => {
       sent = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[]' }] } }] }), { status: 200 });
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[]' }] }, finishReason:'STOP' }] }), { status: 200 });
     },
   });
   await provider.generate({ ...request, responseMimeType: 'application/json', responseJsonSchema: { type: 'object' }, thinkingLevel: 'LOW' });
@@ -89,7 +181,7 @@ test('maps optional Gemini sampling parameters while omitted sampling values sta
     apiKey: 'secret', modelId: 'gemini-test',
     fetch: async (_input, init) => {
       sent = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }), { status: 200 });
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason:'STOP' }] }), { status: 200 });
     },
   });
 
@@ -180,8 +272,22 @@ test('registers all six providers from environment configuration', () => {
 test('uses normalized provider base URL overrides from environment configuration', async () => {
   const requestedUrls: string[] = [];
   vi.stubGlobal('fetch', async (input: string | URL | Request) => {
-    requestedUrls.push(String(input));
-    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    const url = String(input);
+    requestedUrls.push(url);
+    const body = url.includes('/responses')
+      ? {
+        status:'completed',
+        output:[{ type:'message', content:[{ type:'output_text', text:'ok' }] }],
+      }
+      : url.includes('/messages')
+        ? { content:[{ type:'text', text:'ok' }] }
+        : url.includes('/chat/completions')
+          ? { choices:[{ message:{ content:'ok' }, finish_reason:'stop' }] }
+          : { candidates:[{ content:{ parts:[{ text:'ok' }] }, finishReason:'STOP' }] };
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
   });
   try {
     const registry = createProviderRegistry({

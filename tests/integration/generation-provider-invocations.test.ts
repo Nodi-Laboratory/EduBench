@@ -288,3 +288,52 @@ test('preserves provider failure classification even when no response is returne
   );
   expect(wrongBatchResponse.status).toBe(404);
 });
+
+test('stores the validation-aware question repair as a distinct auditable stage', async () => {
+  const invocationId = await beginGenerationProviderInvocation({
+    batchId,
+    itemId,
+    itemAttempt: 1,
+    stage: 'QUESTION_REPAIR',
+    provider: 'gemini',
+    modelId: 'gemini-test',
+    request: {
+      system: 'STRUCTURE_REPAIR_SYSTEM',
+      prompt: 'STRUCTURE_REPAIR_VALIDATION_AND_RESPONSE',
+      maxOutputTokens: 8192,
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseJsonSchema: { type: 'object' },
+    },
+  });
+  await completeGenerationProviderInvocation(invocationId, {
+    text: '{"repaired":true}',
+    raw: { repair: true },
+    inputTokens: 300,
+    outputTokens: 40,
+    finishReason: 'STOP',
+    requestId: 'request-repair-1',
+    modelId: 'gemini-test',
+    modelSnapshot: 'gemini-test-20260727',
+    latencyMs: 200,
+  });
+
+  const auditResponse = await getGenerationItemAudit(
+    new Request(`http://localhost/api/generation/${batchId}/items/${itemId}/audit?limit=100`),
+    { params: Promise.resolve({ id: batchId, itemId }) },
+  );
+  expect(auditResponse.status).toBe(200);
+  const audit = await auditResponse.json();
+  expect(audit.providerInvocations).toContainEqual(expect.objectContaining({
+    id: invocationId,
+    stage: 'QUESTION_REPAIR',
+    state: 'COMPLETED',
+    requestSnapshot: expect.objectContaining({
+      system: 'STRUCTURE_REPAIR_SYSTEM',
+      prompt: 'STRUCTURE_REPAIR_VALIDATION_AND_RESPONSE',
+      temperature: 0,
+      responseMimeType: 'application/json',
+    }),
+    responseSnapshot: { text: '{"repaired":true}', modelId: 'gemini-test', modelSnapshot: 'gemini-test-20260727' },
+  }));
+});

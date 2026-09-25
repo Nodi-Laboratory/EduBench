@@ -22,7 +22,8 @@ export type ScoreProfileAuditData = {
 const methodLabel = { deterministic: '결정론적 검사', judge: 'Judge 모델 절대평가' } as const;
 
 export function ScoreProfileAudit({ profile }: { profile: ScoreProfileAuditData }) {
-  const definitions = describeScoreMetrics(['exact_match', 'response_present', ...profile.metrics, ...prerequisiteScoreMetrics]);
+  const activeProfileMetrics = profile.metrics.filter((metric) => metric !== 'exact_match');
+  const definitions = describeScoreMetrics(['response_present', ...activeProfileMetrics, ...prerequisiteScoreMetrics]);
   const recentRuns = Array.isArray(profile.recent_runs) ? profile.recent_runs : [];
   const effectiveWeight = (metric: string) =>
     Object.prototype.hasOwnProperty.call(profile.weights ?? {}, metric)
@@ -50,7 +51,7 @@ export function ScoreProfileAudit({ profile }: { profile: ScoreProfileAuditData 
         <h3><Scale size={16}/> 평가 처리 흐름</h3>
         <ol className="score-pipeline">
           <li><FileSearch size={15}/><b>01</b><div><strong>평가 입력 고정</strong><span>데이터셋에 고정된 질문 revision, 교과서 근거, 모범 답안, 채점 기준과 모델 응답을 읽습니다.</span></div></li>
-          <li><Calculator size={15}/><b>02</b><div><strong>결정론적 검사</strong><span>응답 존재 여부와 정규화된 허용 답안 완전 일치를 코드로 계산합니다.</span></div></li>
+          <li><Calculator size={15}/><b>02</b><div><strong>결정론적 검사</strong><span>공백이 아닌 응답이 존재하는지 코드로 계산합니다.</span></div></li>
           <li><Bot size={15}/><b>03</b><div><strong>블라인드 Judge 절대평가</strong><span>모델 식별 편향을 줄인 입력에 프로필 루브릭과 문항별 선수관계 청사진을 적용합니다.</span></div></li>
           <li><CheckCircle2 size={15}/><b>04</b><div><strong>판정 근거 보존</strong><span>지표별 점수, 라벨, 판정 이유, 인용 근거, Judge 모델과 요청 ID를 실행 상세에 저장합니다.</span></div></li>
         </ol>
@@ -60,7 +61,7 @@ export function ScoreProfileAudit({ profile }: { profile: ScoreProfileAuditData 
         <h3><Braces size={16}/> 지표 정의와 판정 기준</h3>
         <p>결정론적 지표는 모든 응답에 자동 적용됩니다. 프로필 고정 지표는 이 프로필을 선택한 실행에 적용되고, 선수관계 지표 6개는 문항의 benchmarkDesign이 `PREREQUISITE_RELATIONSHIP`일 때 동적으로 추가됩니다.</p>
         <div className="metric-definition-list">{definitions.map((metric) => <article key={metric.key}>
-          <header><div><strong>{metric.label}</strong><code>{metric.key}</code></div><div className="metric-definition-tags"><span>{metric.category}</span><em>{profile.metrics.includes(metric.key) ? '프로필 고정' : prerequisiteScoreMetrics.includes(metric.key as (typeof prerequisiteScoreMetrics)[number]) ? '선수관계 문항 동적 적용' : '모든 응답 자동 적용'}</em></div></header>
+          <header><div><strong>{metric.label}</strong><code>{metric.key}</code></div><div className="metric-definition-tags"><span>{metric.category}</span><em>{activeProfileMetrics.includes(metric.key) ? '프로필 고정' : prerequisiteScoreMetrics.includes(metric.key as (typeof prerequisiteScoreMetrics)[number]) ? '선수관계 문항 동적 적용' : '모든 응답 자동 적용'}</em></div></header>
           <dl>
             <div><dt>판정 방식</dt><dd>{methodLabel[metric.method]}</dd></div>
             <div><dt>점수 범위</dt><dd>{metric.range}</dd></div>

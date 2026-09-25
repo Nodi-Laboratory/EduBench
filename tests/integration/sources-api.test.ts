@@ -27,6 +27,10 @@ beforeAll(async () => {
 beforeEach(async () => {
   await db.query(`delete from job_events where job_id in (select id from jobs where kind = 'document.parse')`);
   await db.query(`delete from jobs where kind = 'document.parse'`);
+  await db.query(
+    `delete from question_evidence
+      where source_chunk_id in (select id from source_chunks)`,
+  );
   await db.query('delete from source_chunks');
   await db.query('delete from source_revisions');
   await db.query('delete from source_files');
@@ -438,6 +442,27 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
   const upload = await POST(uploadRequest());
   const { id } = await upload.json();
   await processDocument(id);
+  const canonicalHtml = await db.query<{
+    chunks:number;
+    inline_html:number;
+    canonical_refs:number;
+  }>(
+    `select count(*)::int chunks,
+            count(*) filter (where chunk.html is not null)::int inline_html,
+            count(*) filter (
+              where chunk.html_blob_id is not null
+                and blob.id is not null
+            )::int canonical_refs
+       from source_chunks chunk
+       left join source_html_blobs blob on blob.id=chunk.html_blob_id
+      where chunk.source_file_id=$1`,
+    [id],
+  );
+  expect(canonicalHtml.rows[0]).toEqual({
+    chunks:expect.any(Number),
+    inline_html:0,
+    canonical_refs:canonicalHtml.rows[0]!.chunks,
+  });
 
   const revisionResponse = await GET_ARTIFACTS(
     new Request(`http://localhost/api/sources/${id}/artifacts?kind=revision`),
@@ -461,19 +486,35 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
         rawMarkdown:expect.any(Number),
         reviewedHtml:expect.any(Number),
       },
-      rawResponse: {
-        pageCount: 1,
-        pages: [{
-          pageNumber: 1,
-          requestId: 'mock-document-parse',
-          model: 'mock-document-parse',
+      rawResponse: null,
+      rawResponseIncluded:false,
+    },
+  });
+  const revisionRawResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeRaw=1`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(revisionRawResponse.status).toBe(200);
+  await expect(revisionRawResponse.json()).resolves.toMatchObject({
+    kind:'revision',
+    artifact:{
+      id:revision.artifact.id,
+      rawResponseIncluded:true,
+      rawResponse:{
+        pageCount:1,
+        pages:[{
+          pageNumber:1,
+          requestId:'mock-document-parse',
+          model:'mock-document-parse',
         }],
       },
     },
   });
   const revisionContentResponse = await GET_ARTIFACTS(
     new Request(
-      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeContent=1`,
+      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeContent=1&contentView=markdown`,
     ),
     { params:Promise.resolve({ id }) },
   );
@@ -483,8 +524,44 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
     artifact:{
       id:revision.artifact.id,
       contentIncluded:true,
-      rawHtml:expect.stringContaining('로컬 파이프라인 검증'),
+      contentView:'markdown',
+      rawHtml:null,
       rawMarkdown:expect.stringContaining('science-2.pdf'),
+      reviewedHtml:null,
+    },
+  });
+  const revisionHtmlResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeContent=1&contentView=html`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(revisionHtmlResponse.status).toBe(200);
+  await expect(revisionHtmlResponse.json()).resolves.toMatchObject({
+    kind:'revision',
+    artifact:{
+      id:revision.artifact.id,
+      contentView:'html',
+      rawHtml:expect.stringContaining('로컬 파이프라인 검증'),
+      rawMarkdown:null,
+      reviewedHtml:null,
+    },
+  });
+  const revisionReviewedResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=revision&revisionId=${revision.artifact.id}&includeContent=1&contentView=reviewed`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(revisionReviewedResponse.status).toBe(200);
+  await expect(revisionReviewedResponse.json()).resolves.toMatchObject({
+    kind:'revision',
+    artifact:{
+      id:revision.artifact.id,
+      contentView:'reviewed',
+      rawHtml:null,
+      rawMarkdown:null,
+      reviewedHtml:expect.stringContaining('로컬 파이프라인 검증'),
     },
   });
 
@@ -503,10 +580,33 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
     nextAfterPage: null,
     items: [{
       pageNumber: 1,
-      rawHtml: expect.stringContaining('로컬 파이프라인 검증'),
-      rawMarkdown: expect.stringContaining('science-2.pdf'),
+      rawHtml: null,
+      rawMarkdown: null,
+      contentIncluded: false,
+      contentAvailable: true,
+      contentBytes: {
+        rawHtml: expect.any(Number),
+        rawMarkdown: expect.any(Number),
+      },
+      contentPreview: expect.stringContaining('science-2.pdf'),
       rawResponse: null,
       rawResponseIncluded:false,
+    }],
+  });
+  const pageContentResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=pages&revisionId=${pages.revision.id}&artifactId=${pages.items[0].id}&includeContent=1`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(pageContentResponse.status).toBe(200);
+  await expect(pageContentResponse.json()).resolves.toMatchObject({
+    kind:'pages',
+    items:[{
+      id:pages.items[0].id,
+      contentIncluded:true,
+      rawHtml:expect.stringContaining('로컬 파이프라인 검증'),
+      rawMarkdown:expect.stringContaining('science-2.pdf'),
     }],
   });
   const pageRawResponse = await GET_ARTIFACTS(
@@ -537,7 +637,12 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
     items: [
       {
         ordinal: 1,
-        content: expect.stringContaining('science-2.pdf'),
+        content: null,
+        html: null,
+        contentIncluded: false,
+        contentAvailable: true,
+        contentPreview: expect.stringContaining('science-2.pdf'),
+        contentBytes: expect.any(Number),
         embedding: {
           model: 'mock-embedding-3072',
           dimensions: expect.any(Number),
@@ -547,6 +652,22 @@ test('exposes parsed revision, chunk content, vector metadata, and TOC as inspec
     ],
   });
   expect(chunks.items[0]).not.toHaveProperty('storagePath');
+  const chunkContentResponse = await GET_ARTIFACTS(
+    new Request(
+      `http://localhost/api/sources/${id}/artifacts?kind=chunks&revisionId=${chunks.revision.id}&artifactId=${chunks.items[0].id}&includeContent=1`,
+    ),
+    { params:Promise.resolve({ id }) },
+  );
+  expect(chunkContentResponse.status).toBe(200);
+  await expect(chunkContentResponse.json()).resolves.toMatchObject({
+    kind:'chunks',
+    items:[{
+      id:chunks.items[0].id,
+      contentIncluded:true,
+      content:expect.stringContaining('science-2.pdf'),
+      html:expect.stringContaining('science-2.pdf'),
+    }],
+  });
 
   const tocResponse = await GET_ARTIFACTS(
     new Request(`http://localhost/api/sources/${id}/artifacts?kind=toc`),

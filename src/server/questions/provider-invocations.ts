@@ -6,7 +6,7 @@ import {
   type NormalizedGeneration,
 } from '@/server/providers/types';
 
-export type GenerationProviderStage = 'DIRECTION' | 'QUESTION';
+export type GenerationProviderStage = 'DIRECTION' | 'QUESTION' | 'QUESTION_REPAIR';
 
 export async function abandonSupersededGenerationProviderInvocations(
   client: PoolClient,

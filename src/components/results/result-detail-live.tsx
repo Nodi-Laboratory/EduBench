@@ -4,6 +4,12 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, Download, FileJson, FileText } from 'lucide-react';
 import { ResultAnalyticsDashboard } from '@/components/results/result-analytics-dashboard';
+import {
+  benchmarkRetrievalModeMetadata,
+  benchmarkRetrievalModes,
+  type BenchmarkRetrievalMode,
+  type StoredBenchmarkRetrievalMode,
+} from '@/domain/benchmark-retrieval';
 import { resultMetricLabels } from '@/domain/result-metrics';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
@@ -16,12 +22,23 @@ const connectionLabels = {
   reconnecting: '재연결 중',
 } as const;
 
+function retrievalLabel(mode: StoredBenchmarkRetrievalMode): string {
+  return mode === 'LEGACY_EVIDENCE'
+    ? '기존 근거'
+    : benchmarkRetrievalModeMetadata[mode].shortLabel;
+}
+
 export function ResultDetailLive({
   initialDetails,
 }: {
   initialDetails: ResultDetails;
 }) {
   const [details, setDetails] = useState(initialDetails);
+  const [selectedModes, setSelectedModes] = useState<
+    BenchmarkRetrievalMode[]
+  >(() => benchmarkRetrievalModes.filter((mode) => (
+    initialDetails.run.retrievalModes.includes(mode)
+  )));
   const [initialEventCursor] = useState(initialDetails.eventCursor);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const runId = initialDetails.run.id;
@@ -61,6 +78,40 @@ export function ResultDetailLive({
     !summary.profileReplacementRequired
     && scoringEngine.currentVerified
   );
+  const hasComparableModes = details.run.retrievalModes.some(
+    (mode) => mode !== 'LEGACY_EVIDENCE',
+  );
+  const visibleMode = (mode:StoredBenchmarkRetrievalMode) => (
+    !hasComparableModes
+    || (
+      mode !== 'LEGACY_EVIDENCE'
+      && selectedModes.includes(mode)
+    )
+  );
+  const visibleModels = details.models.filter((model) => (
+    visibleMode(model.retrievalMode)
+  ));
+  const visibleMetrics = details.metricSummary.filter((row) => (
+    visibleMode(row.retrievalMode)
+  ));
+  const visibleCapabilities = details.capabilities.filter((row) => (
+    visibleMode(row.retrievalMode)
+  ));
+  const visibleTotalItems = visibleModels.reduce(
+    (sum, model) => sum + Number(model.totalItems),
+    0,
+  );
+  const visibleResponses = visibleModels.reduce(
+    (sum, model) => sum + Number(model.responses),
+    0,
+  );
+  const visibleFailedItems = visibleModels.reduce(
+    (sum, model) => sum + Number(model.failedItems),
+    0,
+  );
+  const modeQuery = hasComparableModes
+    ? `&modes=${encodeURIComponent(selectedModes.join(','))}`
+    : '';
 
   return (
     <div className="workflow-page">
@@ -80,15 +131,15 @@ export function ResultDetailLive({
           </span>
         </div>
         <div className="heading-actions">
-          <a className="button" href={`/api/results/${runId}/export?format=json`}>
+          <a className="button" href={`/api/results/${runId}/export?format=json${modeQuery}`}>
             <FileJson size={14} /> JSON
           </a>
-          <a className="button" href={`/api/results/${runId}/export?format=pdf`}>
+          <a className="button" href={`/api/results/${runId}/export?format=pdf${modeQuery}`}>
             <FileText size={14} /> PDF 보고서
           </a>
           <a
             className="button primary"
-            href={`/api/results/${runId}/export?format=csv`}
+            href={`/api/results/${runId}/export?format=csv${modeQuery}`}
           >
             <Download size={14} /> CSV 근거표
           </a>
@@ -146,17 +197,17 @@ export function ResultDetailLive({
         <div className="metric-card metric-feature">
           <div className="metric-label">응답 완료</div>
           <div className="metric-value mono">
-            {summary.eligibleItems}
-            <small> / {summary.totalItems}</small>
+            {visibleResponses}
+            <small> / {visibleTotalItems}</small>
           </div>
         </div>
         <div className="metric-card">
           <div className="metric-label">실패 항목</div>
-          <div className="metric-value mono">{summary.failedItems}</div>
+          <div className="metric-value mono">{visibleFailedItems}</div>
         </div>
         <div className="metric-card">
-          <div className="metric-label">비교 모델</div>
-          <div className="metric-value mono">{details.models.length}</div>
+          <div className="metric-label">비교 시계열</div>
+          <div className="metric-value mono">{visibleModels.length}</div>
         </div>
         <div className="metric-card">
           <div className="metric-label">실행 상태</div>
@@ -169,7 +220,13 @@ export function ResultDetailLive({
           : '비공식 벤치마크 분석 차트'}
         data-official={officialAnalysis ? 'true' : 'false'}
       >
-        <ResultAnalyticsDashboard analytics={details.analytics} />
+        <ResultAnalyticsDashboard
+          analytics={details.analytics}
+          selectedModes={selectedModes}
+          onSelectedModesChange={setSelectedModes}
+          runId={runId}
+          snapshotVersion={details.eventCursor}
+        />
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -184,8 +241,9 @@ export function ResultDetailLive({
               <tr>
                 <th>블라인드</th>
                 <th>모델</th>
+                <th>실행 커버리지</th>
                 <th className="numeric">응답</th>
-                <th className="numeric">완전 일치</th>
+                <th>대표 실패 원인</th>
                 <th className="numeric">평균 지연</th>
                 <th className="numeric">입력 토큰</th>
                 <th className="numeric">출력 토큰</th>
@@ -193,21 +251,52 @@ export function ResultDetailLive({
               </tr>
             </thead>
             <tbody>
-              {details.models.map((model) => (
-                <tr key={model.blindId}>
+              {visibleModels.map((model) => {
+                const totalItems = Number(model.totalItems);
+                const failedItems = Number(model.failedItems);
+                const allFailedWithoutResponse = totalItems > 0
+                  && failedItems === totalItems
+                  && Number(model.responses) === 0;
+                return (
+                <tr key={`${model.blindId}-${model.retrievalMode}`}>
                   <td className="mono">
                     <strong>{model.blindId}</strong>
+                    <br />
+                    <small>{retrievalLabel(model.retrievalMode)}</small>
                   </td>
                   <td>
                     {model.displayName}
                     <br />
                     <small className="mono">{model.modelId}</small>
                   </td>
+                  <td>
+                    <strong className="mono">
+                      성공 {model.succeededItems} / 전체 {model.totalItems}
+                    </strong>
+                    <br />
+                    <small className="mono">실패 {model.failedItems}</small>
+                    {allFailedWithoutResponse && (
+                      <>
+                        <br />
+                        <small className="state-label state-FAILED">
+                          응답 0 · 전체 실패
+                        </small>
+                      </>
+                    )}
+                  </td>
                   <td className="numeric mono">{model.responses}</td>
-                  <td className="numeric mono">
-                    {model.exactMatch == null
-                      ? '—'
-                      : `${(Number(model.exactMatch) * 100).toFixed(1)}%`}
+                  <td>
+                    {model.representativeFailure ? (
+                      <>
+                        <strong className="mono">
+                          {model.representativeFailure.code}
+                          {' · '}
+                          {model.representativeFailure.count}건
+                        </strong>
+                        <br />
+                        <small>{model.representativeFailure.message}</small>
+                      </>
+                    ) : '—'}
                   </td>
                   <td className="numeric mono">
                     {model.latency == null
@@ -222,7 +311,7 @@ export function ResultDetailLive({
                       : Number(model.costKrw).toLocaleString('ko-KR')}
                   </td>
                 </tr>
-              ))}
+              );})}
             </tbody>
           </table>
         </div>
@@ -245,9 +334,11 @@ export function ResultDetailLive({
               </tr>
             </thead>
             <tbody>
-              {details.metricSummary.map((row) => (
-                <tr key={`${row.blindId}-${row.metricKey}`}>
-                  <td className="mono">{row.blindId}</td>
+              {visibleMetrics.filter(
+                (row) => row.metricKey !== 'exact_match',
+              ).map((row) => (
+                <tr key={`${row.blindId}-${row.retrievalMode}-${row.metricKey}`}>
+                  <td className="mono">{row.blindId} · {retrievalLabel(row.retrievalMode)}</td>
                   <td>{resultMetricLabels[row.metricKey] ?? row.metricKey}</td>
                   <td className="numeric mono">{row.sampleCount}</td>
                   <td className="numeric mono">
@@ -279,10 +370,10 @@ export function ResultDetailLive({
               </tr>
             </thead>
             <tbody>
-              {details.capabilities.map((row) => (
-                <tr key={`${row.purpose}-${row.blindId}`}>
+              {visibleCapabilities.map((row) => (
+                <tr key={`${row.purpose}-${row.blindId}-${row.retrievalMode}`}>
                   <td>{row.purpose}</td>
-                  <td className="mono">{row.blindId}</td>
+                  <td className="mono">{row.blindId} · {retrievalLabel(row.retrievalMode)}</td>
                   <td className="numeric mono">{row.sampleCount}</td>
                   <td className="numeric mono">
                     {row.score == null

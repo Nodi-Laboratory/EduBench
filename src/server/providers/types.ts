@@ -56,12 +56,16 @@ export type ProviderErrorKind =
   | 'AUTH' | 'RATE_LIMIT' | 'TIMEOUT' | 'NETWORK' | 'INVALID_REQUEST'
   | 'CONTENT_FILTER' | 'PROVIDER_5XX' | 'PARSE' | 'UNKNOWN';
 
+export type ProviderRateLimitDimension = 'RPM' | 'RPD' | 'TPM' | 'UNKNOWN';
+
 export class ProviderError extends Error {
   readonly kind: ProviderErrorKind;
   readonly retryable: boolean;
   readonly status: number | null;
   readonly requestId: string | null;
   readonly retryAfterMs: number | null;
+  readonly rateLimitDimension: ProviderRateLimitDimension;
+  readonly rateLimitScope: string | null;
 
   constructor(input: {
     kind: ProviderErrorKind;
@@ -70,6 +74,8 @@ export class ProviderError extends Error {
     status?: number | null;
     requestId?: string | null;
     retryAfterMs?: number | null;
+    rateLimitDimension?: ProviderRateLimitDimension;
+    rateLimitScope?: string | null;
     cause?: unknown;
   }) {
     super(input.message, { cause: input.cause });
@@ -79,6 +85,8 @@ export class ProviderError extends Error {
     this.status = input.status ?? null;
     this.requestId = input.requestId ?? null;
     this.retryAfterMs = input.retryAfterMs ?? null;
+    this.rateLimitDimension = input.rateLimitDimension ?? 'UNKNOWN';
+    this.rateLimitScope = input.rateLimitScope ?? null;
   }
 }
 

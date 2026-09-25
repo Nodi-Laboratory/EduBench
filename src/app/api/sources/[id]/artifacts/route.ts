@@ -2,6 +2,13 @@ import { NextResponse } from 'next/server';
 import { withReadOnlyRepeatableReadTransaction } from '@/server/db/snapshot';
 
 type ArtifactKind = 'revision' | 'pages' | 'chunks' | 'toc';
+type RevisionContentView = 'markdown' | 'html' | 'reviewed';
+const revisionContentViews = new Set<RevisionContentView>([
+  'markdown',
+  'html',
+  'reviewed',
+]);
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function boundedInteger(
   value: string | null,
@@ -13,12 +20,6 @@ function boundedInteger(
   return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum
     ? parsed
     : fallback;
-}
-
-function expectedPageCount(rawResponse: unknown): number | null {
-  if (!rawResponse || typeof rawResponse !== 'object') return null;
-  const value = (rawResponse as { pageCount?: unknown }).pageCount;
-  return Number.isInteger(value) && Number(value) >= 0 ? Number(value) : null;
 }
 
 export async function GET(
@@ -35,10 +36,32 @@ export async function GET(
   const afterOrdinal = boundedInteger(url.searchParams.get('afterOrdinal'), 0, 0, 1_000_000);
   const afterPage = boundedInteger(url.searchParams.get('afterPage'), 0, 0, 1_000_000);
   const revisionId = url.searchParams.get('revisionId');
+  const artifactId = url.searchParams.get('artifactId');
   const includeVector = url.searchParams.get('includeVector') === '1';
   const includeRaw = url.searchParams.get('includeRaw') === '1';
   const includeContent = url.searchParams.get('includeContent') === '1';
-  const limit = kind === 'pages' && includeRaw ? 1 : requestedLimit;
+  const requestedContentView = url.searchParams.get('contentView');
+  const revisionContentView:RevisionContentView = requestedContentView
+    && revisionContentViews.has(requestedContentView as RevisionContentView)
+    ? requestedContentView as RevisionContentView
+    : 'markdown';
+  if (
+    kind === 'revision'
+    && includeContent
+    && requestedContentView
+    && !revisionContentViews.has(requestedContentView as RevisionContentView)
+  ) {
+    return NextResponse.json(
+      { code:'SOURCE_ARTIFACT_CONTENT_VIEW_INVALID' },
+      { status:400 },
+    );
+  }
+  const singleArtifact = (includeContent || includeVector) && (
+    kind === 'pages' || kind === 'chunks'
+  );
+  const limit = (kind === 'pages' && includeRaw) || singleArtifact
+    ? 1
+    : requestedLimit;
   const hasPaginationCursor = kind === 'pages'
     ? url.searchParams.has('afterPage')
     : (kind === 'chunks' || kind === 'toc')
@@ -50,10 +73,22 @@ export async function GET(
       { status: 400 },
     );
   }
-  if (revisionId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(revisionId)) {
+  if (revisionId && !uuidPattern.test(revisionId)) {
     return NextResponse.json(
       { code: 'SOURCE_ARTIFACT_REVISION_MISMATCH' },
       { status: 409 },
+    );
+  }
+  if (artifactId && !uuidPattern.test(artifactId)) {
+    return NextResponse.json(
+      { code: 'SOURCE_ARTIFACT_ID_INVALID' },
+      { status: 400 },
+    );
+  }
+  if (singleArtifact && (!revisionId || !artifactId)) {
+    return NextResponse.json(
+      { code: 'SOURCE_ARTIFACT_DETAIL_REQUIRES_ID' },
+      { status: 400 },
     );
   }
 
@@ -80,18 +115,25 @@ export async function GET(
       raw_html_bytes: number | null;
       raw_markdown_bytes: number | null;
       reviewed_html_bytes: number | null;
+      expected_page_count: number | null;
       toc_alignment_attempted_at: Date | null;
       created_at: Date;
     }>(
-      `select id,revision,parse_model,parse_request_id,raw_response,
-              ${includeContent ? 'raw_html' : 'null::text as raw_html'},
-              ${includeContent ? 'raw_markdown' : 'null::text as raw_markdown'},
-              ${includeContent ? 'reviewed_html' : 'null::text as reviewed_html'},
+      `select id,revision,parse_model,parse_request_id,
+              ${includeRaw ? 'raw_response' : 'null::jsonb as raw_response'},
+              ${includeContent && revisionContentView === 'html' ? 'raw_html' : 'null::text as raw_html'},
+              ${includeContent && revisionContentView === 'markdown' ? 'raw_markdown' : 'null::text as raw_markdown'},
+              ${includeContent && revisionContentView === 'reviewed' ? 'reviewed_html' : 'null::text as reviewed_html'},
               review_summary,
               (raw_html is not null or raw_markdown is not null) has_content,
               octet_length(raw_html)::int raw_html_bytes,
               octet_length(raw_markdown)::int raw_markdown_bytes,
               octet_length(reviewed_html)::int reviewed_html_bytes,
+              case
+                when jsonb_typeof(raw_response->'pageCount')='number'
+                then (raw_response->>'pageCount')::int
+                else null
+              end expected_page_count,
               toc_alignment_attempted_at,created_at
          from source_revisions
         where source_file_id=$1
@@ -129,10 +171,12 @@ export async function GET(
           parseModel: revision.parse_model,
           parseRequestId: revision.parse_request_id,
           rawResponse: revision.raw_response,
+          rawResponseIncluded:includeRaw,
           rawHtml: revision.raw_html,
           rawMarkdown: revision.raw_markdown,
           reviewedHtml: revision.reviewed_html,
           contentIncluded:includeContent,
+          contentView:includeContent ? revisionContentView : null,
           contentAvailable:revision.has_content,
           contentBytes:{
             rawHtml:revision.raw_html_bytes,
@@ -147,7 +191,7 @@ export async function GET(
     }
 
     if (kind === 'pages') {
-      const expected = expectedPageCount(revision.raw_response);
+      const expected = revision.expected_page_count;
       const [count, pageRows] = await Promise.all([
         client.query<{ total: number }>(
           `select count(*)::int as total
@@ -168,22 +212,31 @@ export async function GET(
           raw_response: unknown;
           raw_html: string;
           raw_markdown: string | null;
+          raw_html_bytes: number | null;
+          raw_markdown_bytes: number | null;
+          content_preview: string | null;
           created_at: Date;
         }>(
           `select id,page_number,filename,mime_type,raster_width,raster_height,
                   parse_model,parse_request_id,request_config,
                   ${includeRaw ? 'raw_response' : 'null::jsonb as raw_response'},
-                  raw_html,raw_markdown,created_at
+                  ${includeContent ? 'raw_html' : 'null::text as raw_html'},
+                  ${includeContent ? 'raw_markdown' : 'null::text as raw_markdown'},
+                  octet_length(raw_html)::int raw_html_bytes,
+                  octet_length(raw_markdown)::int raw_markdown_bytes,
+                  left(coalesce(nullif(raw_markdown,''),raw_html),320) content_preview,
+                  created_at
              from source_revision_page_artifacts
             where source_revision_id=$1
-              and page_number>$2
+              and ($4::uuid is null or id=$4::uuid)
+              and ($4::uuid is not null or page_number>$2)
             order by page_number
             limit $3`,
-          [revision.id, afterPage, limit + 1],
+          [revision.id, afterPage, limit + 1, artifactId],
         ),
       ]);
       const persisted = count.rows[0]?.total ?? 0;
-      const hasMore = pageRows.rows.length > limit;
+      const hasMore = !artifactId && pageRows.rows.length > limit;
       const rows = pageRows.rows.slice(0, limit);
       return {
         kind,
@@ -210,6 +263,13 @@ export async function GET(
           requestConfig: page.request_config,
           rawResponse: page.raw_response,
           rawResponseIncluded:includeRaw,
+          contentIncluded:includeContent,
+          contentAvailable:Boolean(page.raw_html_bytes || page.raw_markdown_bytes),
+          contentBytes:{
+            rawHtml:page.raw_html_bytes,
+            rawMarkdown:page.raw_markdown_bytes,
+          },
+          contentPreview:page.content_preview,
           rawHtml: page.raw_html,
           rawMarkdown: page.raw_markdown,
           createdAt: page.created_at.toISOString(),
@@ -244,26 +304,37 @@ export async function GET(
           dimensions: number | null;
           norm: number | null;
           vector_text: string | null;
+          content_preview: string;
+          content_bytes: number;
+          html_bytes: number | null;
         }>(
-          `select id,ordinal,chapter,unit,page_start,page_end,kind,html,content,
-                  token_count,embedding_model,embedding_version,
-                  embedding_vector_space_id,embedding_rag_profile_hash,
-                  embedding_rag_profile_snapshot_provenance,
-                  case when embedding is null then null else vector_dims(embedding) end as dimensions,
-                  case when embedding is null then null
-                       else sqrt(greatest(0,-(embedding <#> embedding)))::double precision
+          `select chunk.id,chunk.ordinal,chunk.chapter,chunk.unit,
+                  chunk.page_start,chunk.page_end,chunk.kind,
+                  ${includeContent ? 'coalesce(chunk.html,blob.html)' : 'null::text'} as html,
+                  ${includeContent ? 'chunk.content' : 'null::text'} as content,
+                  left(chunk.content,320) content_preview,
+                  octet_length(chunk.content)::int content_bytes,
+                  octet_length(coalesce(chunk.html,blob.html))::int html_bytes,
+                  chunk.token_count,chunk.embedding_model,chunk.embedding_version,
+                  chunk.embedding_vector_space_id,chunk.embedding_rag_profile_hash,
+                  chunk.embedding_rag_profile_snapshot_provenance,
+                  case when chunk.embedding is null then null else vector_dims(chunk.embedding) end as dimensions,
+                  case when chunk.embedding is null then null
+                       else sqrt(greatest(0,-(chunk.embedding <#> chunk.embedding)))::double precision
                   end as norm,
-                  case when $4::boolean and embedding is not null
-                       then embedding::text else null end as vector_text
-             from source_chunks
-            where source_revision_id=$1
-              and ordinal>$2
-            order by ordinal
+                  case when $4::boolean and chunk.embedding is not null
+                       then chunk.embedding::text else null end as vector_text
+             from source_chunks chunk
+             left join source_html_blobs blob on blob.id=chunk.html_blob_id
+            where chunk.source_revision_id=$1
+              and ($5::uuid is null or chunk.id=$5::uuid)
+              and ($5::uuid is not null or chunk.ordinal>$2)
+            order by chunk.ordinal
             limit $3`,
-          [revision.id, afterOrdinal, limit + 1, includeVector],
+          [revision.id, afterOrdinal, limit + 1, includeVector, artifactId],
         ),
       ]);
-      const hasMore = chunks.rows.length > limit;
+      const hasMore = !artifactId && chunks.rows.length > limit;
       const rows = chunks.rows.slice(0, limit);
       return {
         kind,
@@ -282,6 +353,11 @@ export async function GET(
           kind: chunk.kind,
           html: chunk.html,
           content: chunk.content,
+          contentIncluded:includeContent,
+          contentAvailable:chunk.content_bytes > 0 || Boolean(chunk.html_bytes),
+          contentPreview:chunk.content_preview,
+          contentBytes:chunk.content_bytes,
+          htmlBytes:chunk.html_bytes,
           tokenCount: chunk.token_count,
           embedding: {
             model: chunk.embedding_model,

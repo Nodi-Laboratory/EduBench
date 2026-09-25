@@ -119,6 +119,33 @@ export async function POST(
           )`,
       [id],
     );
+    const reclassified = await client.query<{ ordinal:number }>(
+      `update generation_items
+          set retryable=true,
+              updated_at=now()
+        where generation_batch_id=$1
+          and state='FAILED'
+          and not retryable
+          and error_code='PARSE'
+          and error_message like '%finishReason=MAX_TOKENS%'
+        returning ordinal`,
+      [id],
+    );
+    for (const item of reclassified.rows) {
+      await client.query(
+        `insert into job_events(job_id,aggregate_type,aggregate_id,event_type,payload)
+         values(null,'generation',$1,'GENERATION_LEGACY_MAX_TOKENS_RECLASSIFIED',$2::jsonb)`,
+        [
+          id,
+          JSON.stringify({
+            ordinal:item.ordinal,
+            previousRetryable:false,
+            retryable:true,
+            reason:'LEGACY_GEMINI_MAX_TOKENS',
+          }),
+        ],
+      );
+    }
 
     const counts = await client.query<{
       total: number;

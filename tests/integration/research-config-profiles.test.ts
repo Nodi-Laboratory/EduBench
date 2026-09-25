@@ -8,14 +8,17 @@ import {
   POST as createProfileRoute,
 } from '@/app/api/settings/research-profiles/route';
 import {
+  benchmarkGenerationParameters,
   defaultResearchConfigDefinitions,
   documentParseResearchConfigSchema,
   embeddingRagResearchConfigSchema,
   hashResearchConfigDefinition,
   type ResearchConfigDefinition,
 } from '@/domain/research-config';
+import { POST as createRunRoute } from '@/app/api/runs/route';
 import { db } from '@/server/db/pool';
 import { migrate } from '@/server/db/migrate';
+import { createRealPublishedDataset } from './helpers/real-dataset';
 
 beforeAll(async () => {
   await migrate();
@@ -154,6 +157,153 @@ test('strict API validation rejects secrets, unknown fields, and invalid activat
   expect(invalidActivation.status).toBe(400);
 });
 
+test('database validation accepts legacy and OpenAI benchmark profiles but rejects an invalid OpenAI protocol', async () => {
+  const current = defaultResearchConfigDefinitions.find(
+    (profile) => profile.kind === 'benchmark_models',
+  )!;
+  const legacy = await db.query<{ definition:unknown }>(
+    `select definition from research_config_profiles
+     where version='benchmark-models-core-v2'`,
+  );
+  const invalidProtocol = structuredClone(current);
+  const openai = invalidProtocol.settings.models.find(
+    (model) => model.providerKey === 'openai',
+  )!;
+  openai.protocol = 'openai' as 'openai-responses';
+  const duplicateOpenai = structuredClone(current);
+  const duplicate = structuredClone(
+    duplicateOpenai.settings.models.find(
+      (model) => model.providerKey === 'openai',
+    )!,
+  );
+  duplicateOpenai.settings.models[1] = duplicate;
+
+  const result = await db.query<{
+    legacy_valid:boolean;
+    current_valid:boolean;
+    invalid_protocol_valid:boolean;
+    duplicate_openai_valid:boolean;
+  }>(
+    `select
+       valid_research_config_definition_v2('benchmark_models',$1::jsonb)
+         legacy_valid,
+       valid_research_config_definition_v2('benchmark_models',$2::jsonb)
+         current_valid,
+       valid_research_config_definition_v2('benchmark_models',$3::jsonb)
+         invalid_protocol_valid,
+       valid_research_config_definition_v2('benchmark_models',$4::jsonb)
+         duplicate_openai_valid`,
+    [
+      JSON.stringify(legacy.rows[0]!.definition),
+      JSON.stringify(current),
+      JSON.stringify(invalidProtocol),
+      JSON.stringify(duplicateOpenai),
+    ],
+  );
+  expect(result.rows[0]).toEqual({
+    legacy_valid:true,
+    current_valid:true,
+    invalid_protocol_valid:false,
+    duplicate_openai_valid:false,
+  });
+});
+
+test('activates the immutable OpenAI GPT-5.5 benchmark profile', async () => {
+  const active = await db.query<{
+    version:string;
+    definition: {
+      settings: {
+        models: Array<{
+          providerKey:string;
+          displayName:string;
+          modelId:string;
+          protocol:string;
+        }>;
+      };
+    };
+  }>(
+    `select profile.version,profile.definition
+       from research_config_active_profiles active
+       join research_config_profiles profile on profile.id=active.profile_id
+      where active.kind='benchmark_models'`,
+  );
+  const openai = active.rows[0]?.definition.settings.models.find(
+    (model) => model.providerKey === 'openai',
+  );
+  const gemini = active.rows[0]?.definition.settings.models.find(
+    (model) => model.providerKey === 'gemini',
+  );
+
+  expect(active.rows[0]?.version).toBe('benchmark-models-core-v6');
+  expect(gemini).toMatchObject({
+    displayName:'Gemini 3.5 Flash',
+    modelId:'gemini-3.5-flash',
+    protocol:'gemini',
+  });
+  expect(openai).toMatchObject({
+    displayName:'OpenAI GPT-5.5',
+    modelId:'gpt-5.5',
+    protocol:'openai-responses',
+  });
+});
+
+test('creates a real benchmark run from the active OpenAI model profile', async () => {
+  const definition = defaultResearchConfigDefinitions.find(
+    (profile) => profile.kind === 'benchmark_models',
+  )!;
+  const openai = definition.settings.models.find(
+    (model) => model.providerKey === 'openai',
+  )!;
+  const datasetVersionId = await createRealPublishedDataset(1);
+  const scoreProfile = await db.query<{ id:string }>(
+    `select id from score_profiles order by created_at limit 1`,
+  );
+  const previousMock = process.env.MOCK_PROVIDERS;
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  const previousModel = process.env.OPENAI_MODEL;
+  process.env.MOCK_PROVIDERS = 'false';
+  process.env.OPENAI_API_KEY = 'integration-openai-key';
+  process.env.OPENAI_MODEL = openai.modelId;
+  try {
+    const response = await createRunRoute(new Request(
+      'http://localhost/api/runs',
+      {
+        method:'POST',
+        headers:{ 'content-type':'application/json' },
+        body:JSON.stringify({
+          title:`OpenAI 프로필 실행 ${randomUUID().slice(0, 8)}`,
+          datasetVersionId,
+          scoreProfileId:scoreProfile.rows[0]!.id,
+          priceProfileVersion:'integration-openai-price',
+          systemPrompt:'교과서 근거에 따라 답하십시오.',
+          questionLimit:1,
+          models:[{
+            providerKey:openai.providerKey,
+            displayName:openai.displayName,
+            modelId:openai.modelId,
+            protocol:openai.protocol,
+            parameters:benchmarkGenerationParameters(openai),
+            concurrency:openai.concurrency,
+            requestIntervalMs:openai.requestIntervalMs,
+          }],
+        }),
+      },
+    ));
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({
+      state:'DRAFT',
+      totalItems:1,
+    });
+  } finally {
+    if (previousMock == null) delete process.env.MOCK_PROVIDERS;
+    else process.env.MOCK_PROVIDERS = previousMock;
+    if (previousApiKey == null) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousApiKey;
+    if (previousModel == null) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = previousModel;
+  }
+});
+
 test('0020 upgrades an existing 0019 schema without changing pre-existing application rows', async () => {
   const schema = `research_config_upgrade_${randomUUID().replaceAll('-', '')}`;
   if (!/^research_config_upgrade_[a-f0-9]+$/.test(schema)) {
@@ -237,5 +387,106 @@ test('0020 upgrades an existing 0019 schema without changing pre-existing applic
     await client.query('reset search_path');
     await client.query(`drop schema if exists "${schema}" cascade`);
     client.release();
+  }
+});
+
+test('0037 preserves operator-selected profiles and a custom Gemini provider model', async () => {
+  const active = await db.query<{
+    kind:'question_generation' | 'benchmark_models';
+    profile_id:string;
+  }>(
+    `select kind,profile_id
+       from research_config_active_profiles
+      where kind in ('question_generation','benchmark_models')
+      order by kind`,
+  );
+  const alternatives = await db.query<{
+    kind:'question_generation' | 'benchmark_models';
+    id:string;
+  }>(
+    `select distinct on(kind) kind,id
+       from research_config_profiles
+      where kind in ('question_generation','benchmark_models')
+        and id not in (
+          '30000000-0000-0000-0000-000000000005',
+          '30000000-0000-0000-0000-000000000010',
+          '30000000-0000-0000-0000-000000000011',
+          '30000000-0000-0000-0000-000000000012'
+        )
+      order by kind,created_at`,
+  );
+  expect(alternatives.rows).toHaveLength(2);
+  const previousProvider = await db.query<{
+    model_id:string | null;
+  }>(
+    "select model_id from provider_configs where provider_key='gemini'",
+  );
+  try {
+    for (const alternative of alternatives.rows) {
+      await db.query(
+        `update research_config_active_profiles
+            set profile_id=$2,activated_at=now()
+          where kind=$1`,
+        [alternative.kind, alternative.id],
+      );
+    }
+    await db.query(
+      `insert into provider_configs(
+         provider_key,display_name,protocol,model_id
+       ) values('gemini','Gemini','gemini','operator-custom-gemini')
+       on conflict(provider_key) do update set
+         model_id=excluded.model_id,updated_at=now()`,
+    );
+    await db.query(await readFile(
+      path.join(
+        process.cwd(),
+        'db',
+        'migrations',
+        '0037_gemini_3_5_profiles.sql',
+      ),
+      'utf8',
+    ));
+    const preservedActive = await db.query<{
+      kind:string;
+      profile_id:string;
+    }>(
+      `select kind,profile_id
+         from research_config_active_profiles
+        where kind in ('question_generation','benchmark_models')
+        order by kind`,
+    );
+    expect(preservedActive.rows).toEqual(
+      [...alternatives.rows].sort((left, right) =>
+        left.kind.localeCompare(right.kind),
+      ).map((profile) => ({
+        kind:profile.kind,
+        profile_id:profile.id,
+      })),
+    );
+    const preservedProvider = await db.query<{ model_id:string }>(
+      "select model_id from provider_configs where provider_key='gemini'",
+    );
+    expect(preservedProvider.rows[0]?.model_id)
+      .toBe('operator-custom-gemini');
+  } finally {
+    for (const previous of active.rows) {
+      await db.query(
+        `update research_config_active_profiles
+            set profile_id=$2,activated_at=now()
+          where kind=$1`,
+        [previous.kind, previous.profile_id],
+      );
+    }
+    if (previousProvider.rows[0]) {
+      await db.query(
+        `update provider_configs set model_id=$1,updated_at=now()
+          where provider_key='gemini'`,
+        [previousProvider.rows[0].model_id],
+      );
+    } else {
+      await db.query(
+        "delete from provider_configs where provider_key='gemini'",
+      );
+    }
   }
 });

@@ -59,6 +59,92 @@ test('creates the complete question × model execution matrix', async () => {
   expect(Number(matrix.rows[0]?.count)).toBe(10);
 });
 
+test('creates a comparable question × model × retrieval-mode matrix', async () => {
+  const batchId = randomUUID();
+  await db.query(
+    `insert into generation_batches(
+       id,requested_count,conditions,source_scope,
+       generation_model,prompt_version
+     ) values($1,2,'{}'::jsonb,'{}'::jsonb,'fixture','fixture')`,
+    [batchId],
+  );
+  const selectedQuestions = await db.query<{ question_id:string }>(
+    `select question_id
+       from dataset_questions
+      where dataset_version_id=$1
+      order by ordinal
+      limit 2`,
+    [datasetVersionId],
+  );
+  for (const [index, question] of selectedQuestions.rows.entries()) {
+    const itemId = randomUUID();
+    const revisionId = randomUUID();
+    const chunkId = randomUUID();
+    await db.query(
+      `insert into generation_items(
+         id,generation_batch_id,ordinal,state
+       ) values($1,$2,$3,'COMPLETED')`,
+      [itemId, batchId, index + 1],
+    );
+    await db.query(
+      `update questions set
+         generation_batch_id=$2,generation_item_id=$3
+       where id=$1`,
+      [question.question_id, batchId, itemId],
+    );
+    await db.query(
+      `insert into generation_retrievals(
+         generation_batch_id,generation_item_id,attempt,query_text,
+         embedding_model,candidate_scope,selected_chunks
+       ) values($1,$2,1,'fixture query','fixture embedding',$3::jsonb,$4::jsonb)`,
+      [
+        batchId,
+        itemId,
+        JSON.stringify({ sourceRevisionIds:[revisionId] }),
+        JSON.stringify([{
+          chunkId,
+          content:'검색 조건 행렬 생성용 감사 근거',
+        }]),
+      ],
+    );
+  }
+  const run = await createRun({
+    title: `검색 조건 비교 ${randomUUID().slice(0, 8)}`,
+    datasetVersionId,
+    scoreProfileId: '20000000-0000-0000-0000-000000000001',
+    priceProfileVersion: 'test-price-v1',
+    systemPrompt: '질문에 답하라.',
+    questionLimit: 2,
+    retrievalModes: ['NONE', 'VECTOR', 'PIKE'],
+    models: [
+      {
+        providerKey: 'gemini',
+        displayName: 'Gemini',
+        modelId: 'gemini-test',
+        protocol: 'gemini',
+      },
+    ],
+  });
+
+  expect(run).toMatchObject({ state: 'DRAFT', totalItems: 6 });
+  const matrix = await db.query<{
+    retrieval_mode:string;
+    count:string;
+  }>(
+    `select retrieval_mode,count(*)::text
+       from run_items
+      where benchmark_run_id=$1
+      group by retrieval_mode
+      order by retrieval_mode`,
+    [run.id],
+  );
+  expect(matrix.rows).toEqual([
+    { retrieval_mode:'NONE', count:'2' },
+    { retrieval_mode:'PIKE', count:'2' },
+    { retrieval_mode:'VECTOR', count:'2' },
+  ]);
+});
+
 test('pause prevents new claims, resume restores them, and failed items retry explicitly', async () => {
   const run = await createRun({
     title: `통제 테스트 ${randomUUID().slice(0, 8)}`,

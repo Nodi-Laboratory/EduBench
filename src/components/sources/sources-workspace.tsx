@@ -1,6 +1,13 @@
 'use client';
 
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { Ban, ChevronRight, CircleStop, FileText, LoaderCircle, RotateCcw, Trash2, Upload, X } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
@@ -41,6 +48,7 @@ type Activity = {
   };
 };
 type ArtifactKind = 'revision' | 'pages' | 'chunks' | 'toc';
+type RevisionContentView = 'markdown' | 'html' | 'reviewed';
 type ArtifactBase = {
   kind: ArtifactKind;
   source: { id: string; original_name: string };
@@ -54,11 +62,13 @@ type RevisionArtifacts = ArtifactBase & {
     parseModel: string | null;
     parseRequestId: string | null;
     rawResponse: unknown;
+    rawResponseIncluded?: boolean;
     rawHtml: string | null;
     rawMarkdown: string | null;
     reviewedHtml: string | null;
     reviewSummary: string | null;
     contentIncluded?: boolean;
+    contentView?: RevisionContentView | null;
     contentAvailable?: boolean;
     contentBytes?: {
       rawHtml:number | null;
@@ -82,7 +92,12 @@ type ChunkArtifacts = ArtifactBase & {
     pageEnd: number | null;
     kind: string;
     html: string | null;
-    content: string;
+    content: string | null;
+    contentIncluded?: boolean;
+    contentAvailable?: boolean;
+    contentPreview?: string | null;
+    contentBytes?: number | null;
+    htmlBytes?: number | null;
     tokenCount: number | null;
     embedding: {
       model: string | null;
@@ -114,8 +129,15 @@ type PageArtifacts = ArtifactBase & {
     requestConfig: unknown;
     rawResponse: unknown;
     rawResponseIncluded?: boolean;
-    rawHtml: string;
+    rawHtml: string | null;
     rawMarkdown: string | null;
+    contentIncluded?: boolean;
+    contentAvailable?: boolean;
+    contentPreview?: string | null;
+    contentBytes?: {
+      rawHtml:number | null;
+      rawMarkdown:number | null;
+    };
     createdAt: string;
   }>;
 };
@@ -173,6 +195,27 @@ const eventLabels: Record<string, string> = {
   EMBEDDING_BATCH_STARTED: '임베딩 배치 시작',
   PIPELINE_COMPLETED: '교과서 처리 완료', PIPELINE_FAILED: '교과서 처리 실패',
 };
+
+function LazyDisclosure({
+  summary,
+  children,
+  className,
+}: {
+  summary:ReactNode;
+  children:ReactNode;
+  className?:string;
+}) {
+  const [open, setOpen] = useState(false);
+  return <details
+    className={className}
+    open={open}
+    onToggle={(event) => setOpen(event.currentTarget.open)}
+  >
+    <summary>{summary}</summary>
+    {open ? children : null}
+  </details>;
+}
+
 const artifactInvalidationEvents = new Set([
   'DOCUMENT_PARSE_PERSISTED',
   'PIPELINE_COMPLETED',
@@ -198,6 +241,11 @@ const artifactTabs: readonly { kind: ArtifactKind; label: string }[] = [
   { kind: 'chunks', label: '청크·임베딩' },
   { kind: 'toc', label: '목차 매핑' },
 ];
+const artifactRetentionLimits = {
+  pages:20,
+  chunks:50,
+  toc:100,
+} as const;
 const stageThreshold: Record<SourceStageKey, number> = {
   parse: 2,
   html: 3,
@@ -260,18 +308,35 @@ function PageRawResponse({
   sourceId,
   revisionId,
   page,
+  expanded,
+  onExpandedChange,
 }: {
   sourceId:string;
   revisionId:string;
   page:PageArtifacts['items'][number];
+  expanded:boolean;
+  onExpandedChange:(open:boolean) => void;
 }) {
+  const initiallyLoaded = Boolean(page.rawResponseIncluded);
   const [rawResponse, setRawResponse] = useState(page.rawResponse);
-  const [loaded, setLoaded] = useState(Boolean(page.rawResponseIncluded));
+  const [loaded, setLoaded] = useState(initiallyLoaded);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const open = useRef(false);
 
-  async function load(open: boolean) {
-    if (!open || loaded || loading) return;
+  useEffect(() => () => {
+    generation.current += 1;
+    request.current?.abort();
+  }, []);
+
+  async function load(isOpen: boolean) {
+    if (!isOpen || loaded || loading) return;
+    request.current?.abort();
+    const abort = new AbortController();
+    request.current = abort;
+    const currentGeneration = ++generation.current;
     setLoading(true);
     setError(null);
     try {
@@ -284,7 +349,7 @@ function PageRawResponse({
       });
       const response = await fetch(
         `/api/sources/${sourceId}/artifacts?${query.toString()}`,
-        { cache:'no-store' },
+        { cache:'no-store', signal:abort.signal },
       );
       const body = await response.json() as PageArtifacts & {
         code?:string;
@@ -296,18 +361,50 @@ function PageRawResponse({
       if (!response.ok || body.revision?.id !== revisionId || !exact) {
         throw new Error(body.message ?? body.code ?? '페이지 원시 응답을 불러오지 못했습니다.');
       }
+      if (
+        abort.signal.aborted
+        || !open.current
+        || generation.current !== currentGeneration
+      ) return;
       setRawResponse(exact.rawResponse);
       setLoaded(true);
     } catch (loadError) {
+      if (abort.signal.aborted) return;
       setError(loadError instanceof Error
         ? loadError.message
         : '페이지 원시 응답을 불러오지 못했습니다.');
     } finally {
-      setLoading(false);
+      if (generation.current === currentGeneration) {
+        setLoading(false);
+        if (request.current === abort) request.current = null;
+      }
     }
   }
 
-  return <details onToggle={(event) => void load(event.currentTarget.open)}>
+  function toggle(isOpen:boolean) {
+    open.current = isOpen;
+    if (!isOpen) {
+      generation.current += 1;
+      request.current?.abort();
+      request.current = null;
+      setLoading(false);
+    }
+    if (!isOpen && !initiallyLoaded) {
+      setRawResponse(null);
+      setLoaded(false);
+      return;
+    }
+    void load(isOpen);
+  }
+
+  return <details
+    open={expanded}
+    onToggle={(event) => {
+      const isOpen = event.currentTarget.open;
+      if (isOpen !== expanded) onExpandedChange(isOpen);
+      toggle(isOpen);
+    }}
+  >
     <summary>Provider 원시 응답 {loaded ? '' : '· 펼칠 때 불러오기'}</summary>
     {loading
       ? <p>원시 응답을 불러오는 중…</p>
@@ -319,21 +416,402 @@ function PageRawResponse({
   </details>;
 }
 
+function RevisionRawResponse({
+  sourceId,
+  revisionId,
+  initialValue,
+  initiallyLoaded,
+  expanded,
+  onExpandedChange,
+}: {
+  sourceId:string;
+  revisionId:string;
+  initialValue:unknown;
+  initiallyLoaded:boolean;
+  expanded:boolean;
+  onExpandedChange:(open:boolean) => void;
+}) {
+  const initialLoaded = initiallyLoaded;
+  const [value, setValue] = useState(initialValue);
+  const [loaded, setLoaded] = useState(initialLoaded);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const open = useRef(false);
+
+  useEffect(() => () => {
+    generation.current += 1;
+    request.current?.abort();
+  }, []);
+
+  async function load(isOpen:boolean) {
+    if (!isOpen || loaded || loading) return;
+    request.current?.abort();
+    const abort = new AbortController();
+    request.current = abort;
+    const currentGeneration = ++generation.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const query = new URLSearchParams({
+        kind:'revision',
+        revisionId,
+        includeRaw:'1',
+      });
+      const response = await fetch(
+        `/api/sources/${sourceId}/artifacts?${query.toString()}`,
+        { cache:'no-store', signal:abort.signal },
+      );
+      const body = await response.json() as RevisionArtifacts & {
+        code?:string;
+        message?:string;
+      };
+      if (!response.ok || body.artifact?.id !== revisionId) {
+        throw new Error(body.message ?? body.code ?? 'revision 원시 응답을 불러오지 못했습니다.');
+      }
+      if (
+        abort.signal.aborted
+        || !open.current
+        || generation.current !== currentGeneration
+      ) return;
+      setValue(body.artifact.rawResponse);
+      setLoaded(true);
+    } catch (loadError) {
+      if (abort.signal.aborted) return;
+      setError(loadError instanceof Error
+        ? loadError.message
+        : 'revision 원시 응답을 불러오지 못했습니다.');
+    } finally {
+      if (generation.current === currentGeneration) {
+        setLoading(false);
+        if (request.current === abort) request.current = null;
+      }
+    }
+  }
+
+  function toggle(isOpen:boolean) {
+    open.current = isOpen;
+    if (!isOpen) {
+      generation.current += 1;
+      request.current?.abort();
+      request.current = null;
+      setLoading(false);
+    }
+    if (!isOpen && !initialLoaded) {
+      setValue(null);
+      setLoaded(false);
+      return;
+    }
+    void load(isOpen);
+  }
+
+  return <details
+    open={expanded}
+    onToggle={(event) => {
+      const isOpen = event.currentTarget.open;
+      if (isOpen !== expanded) onExpandedChange(isOpen);
+      toggle(isOpen);
+    }}
+  >
+    <summary>Provider revision 응답 {loaded ? '' : '· 펼칠 때 불러오기'}</summary>
+    {loading
+      ? <p>원시 응답을 불러오는 중…</p>
+      : error
+        ? <p className="result-warning">{error}</p>
+        : loaded
+          ? <JsonBlock value={value ?? '기록 없음'} />
+          : null}
+  </details>;
+}
+
+function PageContent({
+  sourceId,
+  revisionId,
+  page:summary,
+  expanded,
+  onExpandedChange,
+}: {
+  sourceId:string;
+  revisionId:string;
+  page:PageArtifacts['items'][number];
+  expanded:boolean;
+  onExpandedChange:(open:boolean) => void;
+}) {
+  const initiallyLoaded = Boolean(
+    summary.contentIncluded || summary.rawHtml || summary.rawMarkdown,
+  );
+  const [page, setPage] = useState(summary);
+  const [loaded, setLoaded] = useState(initiallyLoaded);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const open = useRef(false);
+
+  useEffect(() => () => {
+    generation.current += 1;
+    request.current?.abort();
+  }, []);
+
+  async function load(isOpen:boolean) {
+    if (!isOpen || loaded || loading) return;
+    request.current?.abort();
+    const abort = new AbortController();
+    request.current = abort;
+    const currentGeneration = ++generation.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const query = new URLSearchParams({
+        kind:'pages',
+        revisionId,
+        artifactId:summary.id,
+        includeContent:'1',
+      });
+      const response = await fetch(
+        `/api/sources/${sourceId}/artifacts?${query.toString()}`,
+        { cache:'no-store', signal:abort.signal },
+      );
+      const body = await response.json() as PageArtifacts & {
+        code?:string;
+        message?:string;
+      };
+      const exact = body.kind === 'pages'
+        ? body.items.find((entry) => entry.id === summary.id)
+        : null;
+      if (!response.ok || body.revision?.id !== revisionId || !exact) {
+        throw new Error(body.message ?? body.code ?? '페이지 본문을 불러오지 못했습니다.');
+      }
+      if (
+        abort.signal.aborted
+        || !open.current
+        || generation.current !== currentGeneration
+      ) return;
+      setPage(exact);
+      setLoaded(true);
+    } catch (loadError) {
+      if (abort.signal.aborted) return;
+      setError(loadError instanceof Error
+        ? loadError.message
+        : '페이지 본문을 불러오지 못했습니다.');
+    } finally {
+      if (generation.current === currentGeneration) {
+        setLoading(false);
+        if (request.current === abort) request.current = null;
+      }
+    }
+  }
+
+  function toggle(isOpen:boolean) {
+    open.current = isOpen;
+    if (!isOpen) {
+      generation.current += 1;
+      request.current?.abort();
+      request.current = null;
+      setLoading(false);
+    }
+    if (!isOpen && !initiallyLoaded) {
+      setPage(summary);
+      setLoaded(false);
+      return;
+    }
+    void load(isOpen);
+  }
+
+  return <details
+    open={expanded}
+    onToggle={(event) => {
+      const isOpen = event.currentTarget.open;
+      if (isOpen !== expanded) onExpandedChange(isOpen);
+      toggle(isOpen);
+    }}
+  >
+    <summary>페이지 본문·HTML {loaded ? '' : '· 펼칠 때 불러오기'}</summary>
+    {loading
+      ? <p>페이지 본문을 불러오는 중…</p>
+      : error
+        ? <p className="result-warning">{error}</p>
+        : loaded
+          ? <>
+              {page.rawMarkdown
+                ? <pre>{page.rawMarkdown}</pre>
+                : <pre>{page.rawHtml ?? '기록 없음'}</pre>}
+              <details><summary>페이지 HTML</summary><pre>{page.rawHtml ?? '기록 없음'}</pre></details>
+            </>
+          : null}
+  </details>;
+}
+
+function ChunkContent({
+  sourceId,
+  revisionId,
+  chunk:summary,
+  expanded,
+  onExpandedChange,
+}: {
+  sourceId:string;
+  revisionId:string;
+  chunk:ChunkArtifacts['items'][number];
+  expanded:boolean;
+  onExpandedChange:(open:boolean) => void;
+}) {
+  const initiallyLoaded = Boolean(
+    summary.contentIncluded || summary.content || summary.html,
+  );
+  const [chunk, setChunk] = useState(summary);
+  const [loaded, setLoaded] = useState(initiallyLoaded);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const open = useRef(false);
+
+  useEffect(() => () => {
+    generation.current += 1;
+    request.current?.abort();
+  }, []);
+
+  async function load(isOpen:boolean) {
+    if (!isOpen || loaded || loading) return;
+    request.current?.abort();
+    const abort = new AbortController();
+    request.current = abort;
+    const currentGeneration = ++generation.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const query = new URLSearchParams({
+        kind:'chunks',
+        revisionId,
+        artifactId:summary.id,
+        includeContent:'1',
+      });
+      const response = await fetch(
+        `/api/sources/${sourceId}/artifacts?${query.toString()}`,
+        { cache:'no-store', signal:abort.signal },
+      );
+      const body = await response.json() as ChunkArtifacts & {
+        code?:string;
+        message?:string;
+      };
+      const exact = body.kind === 'chunks'
+        ? body.items.find((entry) => entry.id === summary.id)
+        : null;
+      if (!response.ok || body.revision?.id !== revisionId || !exact) {
+        throw new Error(body.message ?? body.code ?? '청크 원문을 불러오지 못했습니다.');
+      }
+      if (
+        abort.signal.aborted
+        || !open.current
+        || generation.current !== currentGeneration
+      ) return;
+      setChunk(exact);
+      setLoaded(true);
+    } catch (loadError) {
+      if (abort.signal.aborted) return;
+      setError(loadError instanceof Error
+        ? loadError.message
+        : '청크 원문을 불러오지 못했습니다.');
+    } finally {
+      if (generation.current === currentGeneration) {
+        setLoading(false);
+        if (request.current === abort) request.current = null;
+      }
+    }
+  }
+
+  function toggle(isOpen:boolean) {
+    open.current = isOpen;
+    if (!isOpen) {
+      generation.current += 1;
+      request.current?.abort();
+      request.current = null;
+      setLoading(false);
+    }
+    if (!isOpen && !initiallyLoaded) {
+      setChunk(summary);
+      setLoaded(false);
+      return;
+    }
+    void load(isOpen);
+  }
+
+  return <details
+    open={expanded}
+    onToggle={(event) => {
+      const isOpen = event.currentTarget.open;
+      if (isOpen !== expanded) onExpandedChange(isOpen);
+      toggle(isOpen);
+    }}
+  >
+    <summary>청크 원문·HTML {loaded ? '' : '· 펼칠 때 불러오기'}</summary>
+    {loading
+      ? <p>청크 원문을 불러오는 중…</p>
+      : error
+        ? <p className="result-warning">{error}</p>
+        : loaded
+          ? <>
+              <p>{chunk.content ?? '기록 없음'}</p>
+              <details><summary>청크 HTML</summary><pre>{chunk.html ?? '기록 없음'}</pre></details>
+            </>
+          : null}
+  </details>;
+}
+
 function RevisionArtifactView({
   result,
-  artifact:initialArtifact,
+  artifact,
 }: {
   result:RevisionArtifacts;
   artifact:NonNullable<RevisionArtifacts['artifact']>;
 }) {
-  const [artifact, setArtifact] = useState(initialArtifact);
-  const [loaded, setLoaded] = useState(Boolean(initialArtifact.contentIncluded));
+  type DisplayView = 'readable' | 'html' | 'reviewed';
+  const readableView:RevisionContentView = artifact.rawMarkdown?.trim()
+    || (artifact.contentBytes?.rawMarkdown ?? 0) > 0
+    ? 'markdown'
+    : 'html';
+  const initialView:DisplayView = 'readable';
+  const initialRequestedView = readableView;
+  const initialContent = artifact.contentIncluded
+    || artifact.rawMarkdown
+    || artifact.rawHtml
+    || artifact.reviewedHtml
+    ? initialRequestedView === 'markdown'
+      ? artifact.rawMarkdown
+      : artifact.rawHtml
+    : null;
+  const [view, setView] = useState<DisplayView>(initialView);
+  const [content, setContent] = useState<string | null>(initialContent);
+  const [loadedView, setLoadedView] = useState<RevisionContentView | null>(
+    initialContent != null ? initialRequestedView : null,
+  );
+  const [activePanel, setActivePanel] = useState<'content' | 'raw' | null>(
+    initialContent != null ? 'content' : null,
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<'readable' | 'html' | 'reviewed'>('readable');
+  const contentRequest = useRef<AbortController | null>(null);
+  const contentRequestGeneration = useRef(0);
 
-  async function loadContent() {
-    if (loaded || loading) return;
+  useEffect(() => () => {
+    contentRequestGeneration.current += 1;
+    contentRequest.current?.abort();
+  }, []);
+
+  async function loadContent(nextView:DisplayView) {
+    const requestedView:RevisionContentView = nextView === 'readable'
+      ? readableView
+      : nextView;
+    setView(nextView);
+    setActivePanel('content');
+    if (loadedView === requestedView && content != null) return;
+    contentRequest.current?.abort();
+    const abort = new AbortController();
+    contentRequest.current = abort;
+    const generation = ++contentRequestGeneration.current;
+    setContent(null);
+    setLoadedView(null);
     setLoading(true);
     setError(null);
     try {
@@ -341,10 +819,11 @@ function RevisionArtifactView({
         kind:'revision',
         revisionId:artifact.id,
         includeContent:'1',
+        contentView:requestedView,
       });
       const response = await fetch(
         `/api/sources/${result.source.id}/artifacts?${query.toString()}`,
-        { cache:'no-store' },
+        { cache:'no-store', signal:abort.signal },
       );
       const body = await response.json() as RevisionArtifacts & {
         code?:string;
@@ -357,29 +836,47 @@ function RevisionArtifactView({
       ) {
         throw new Error(body.message ?? body.code ?? '파싱 본문을 불러오지 못했습니다.');
       }
-      setArtifact(body.artifact);
-      setLoaded(true);
+      const selectedContent = requestedView === 'markdown'
+        ? body.artifact.rawMarkdown
+        : requestedView === 'html'
+          ? body.artifact.rawHtml
+          : body.artifact.reviewedHtml;
+      if (
+        abort.signal.aborted
+        || contentRequestGeneration.current !== generation
+        || body.artifact.contentView !== requestedView
+      ) return;
+      setContent(selectedContent);
+      setLoadedView(requestedView);
     } catch (loadError) {
+      if (abort.signal.aborted) return;
       setError(loadError instanceof Error
         ? loadError.message
         : '파싱 본문을 불러오지 못했습니다.');
     } finally {
-      setLoading(false);
+      if (contentRequestGeneration.current === generation) {
+        setLoading(false);
+        if (contentRequest.current === abort) contentRequest.current = null;
+      }
     }
   }
 
-  const meaningfulMarkdown = artifact.rawMarkdown
-    ?.replace(/<!--\s*page:\d+\s*-->/g, '')
-    .trim()
-    ? artifact.rawMarkdown
-    : null;
-  const readable = meaningfulMarkdown ?? artifact.rawHtml;
-  const selectedContent = view === 'html'
-    ? artifact.rawHtml
-    : view === 'reviewed'
-      ? artifact.reviewedHtml
-      : readable;
   const bytes = artifact.contentBytes;
+
+  function setRawExpanded(isOpen:boolean) {
+    if (isOpen) {
+      contentRequestGeneration.current += 1;
+      contentRequest.current?.abort();
+      contentRequest.current = null;
+      setLoading(false);
+      setContent(null);
+      setLoadedView(null);
+      setError(null);
+      setActivePanel('raw');
+      return;
+    }
+    setActivePanel((current) => current === 'raw' ? null : current);
+  }
 
   return <article>
     <header><strong>Revision {artifact.revision}</strong><span>{result.completeness}</span></header>
@@ -388,24 +885,31 @@ function RevisionArtifactView({
       Markdown {bytes?.rawMarkdown ?? '—'} B · HTML {bytes?.rawHtml ?? '—'} B
       {' · '}검수 HTML {bytes?.reviewedHtml ?? '—'} B
     </p>
-    {!loaded && artifact.contentAvailable !== false && <button
+    {loadedView == null && artifact.contentAvailable !== false && <button
       className="button"
       type="button"
       disabled={loading}
-      onClick={() => void loadContent()}
+      onClick={() => void loadContent(view)}
     >{loading ? '본문 불러오는 중…' : '파싱 본문 불러오기'}</button>}
     {error && <p className="result-warning">{error}</p>}
-    {loaded && <>
+    {loadedView != null && <>
       <div className="heading-actions">
-        <button className="button" type="button" onClick={() => setView('readable')}>읽기 본문</button>
-        <button className="button" type="button" onClick={() => setView('html')}>원본 HTML</button>
-        <button className="button" type="button" onClick={() => setView('reviewed')}>검수 HTML</button>
+        <button className="button" type="button" onClick={() => void loadContent('readable')}>읽기 본문</button>
+        <button className="button" type="button" onClick={() => void loadContent('html')}>원본 HTML</button>
+        <button className="button" type="button" onClick={() => void loadContent('reviewed')}>검수 HTML</button>
       </div>
       <h4>{view === 'html' ? '원본 HTML' : view === 'reviewed' ? '검수 HTML' : '사람이 읽는 파싱 본문'}</h4>
-      <pre>{selectedContent ?? '기록 없음'}</pre>
+      <pre>{content ?? '기록 없음'}</pre>
     </>}
     <p>{artifact.reviewSummary ?? '검수 요약 기록 없음'}</p>
-    <details><summary>Provider revision 응답 요약</summary><JsonBlock value={artifact.rawResponse ?? '기록 없음'} /></details>
+    <RevisionRawResponse
+      sourceId={result.source.id}
+      revisionId={artifact.id}
+      initialValue={artifact.rawResponse}
+      initiallyLoaded={Boolean(artifact.rawResponseIncluded)}
+      expanded={activePanel === 'raw'}
+      onExpandedChange={setRawExpanded}
+    />
     <small className="mono">revision {artifact.id} · {artifact.createdAt}</small>
   </article>;
 }
@@ -419,6 +923,14 @@ function SourceArtifactView({
   loadingMore: boolean;
   onLoadMore: () => void;
 }) {
+  const [activeDetailKey, setActiveDetailKey] = useState<string | null>(null);
+  const setDetailExpanded = (key:string, open:boolean) => {
+    setActiveDetailKey((current) => open
+      ? key
+      : current === key
+        ? null
+        : current);
+  };
   if (result.completeness === 'NOT_AVAILABLE') {
     return <p>저장된 실제 산출물이 없습니다.</p>;
   }
@@ -443,15 +955,24 @@ function SourceArtifactView({
         <p className="run-meta mono">
           {page.mimeType} · {page.rasterWidth ?? '—'}×{page.rasterHeight ?? '—'}
           {' · '}model {page.parseModel ?? '기록 없음'}
+          {' · '}본문 {(page.contentBytes?.rawMarkdown ?? 0) + (page.contentBytes?.rawHtml ?? 0)} B
         </p>
-        {page.rawMarkdown
-          ? <pre>{page.rawMarkdown}</pre>
-          : <pre>{page.rawHtml}</pre>}
-        <details><summary>페이지 HTML</summary><pre>{page.rawHtml}</pre></details>
+        {!(page.contentIncluded || page.rawHtml || page.rawMarkdown) && (
+          <p>{page.contentPreview ?? '본문 미리보기 없음'}</p>
+        )}
+        <PageContent
+          sourceId={result.source.id}
+          revisionId={result.revision.id}
+          page={page}
+          expanded={activeDetailKey === `page-content:${page.id}`}
+          onExpandedChange={(open) => setDetailExpanded(`page-content:${page.id}`, open)}
+        />
         <PageRawResponse
           sourceId={result.source.id}
           revisionId={result.revision.id}
           page={page}
+          expanded={activeDetailKey === `page-raw:${page.id}`}
+          onExpandedChange={(open) => setDetailExpanded(`page-raw:${page.id}`, open)}
         />
         <small className="mono">page artifact {page.id} · request {page.parseRequestId ?? '기록 없음'}</small>
       </article>) : <p>저장된 페이지 artifact가 없습니다.</p>}
@@ -468,9 +989,12 @@ function SourceArtifactView({
       <p>{result.total}개 중 {result.items.length}개 청크를 표시합니다.</p>
       {result.items.length ? result.items.map((chunk) => <article key={chunk.id}>
         <header><strong>{chunk.ordinal}. {chunk.unit ?? chunk.chapter ?? '단원 기록 없음'}</strong><span>{chunk.kind}</span></header>
-        <p>{chunk.content}</p>
+        {!(chunk.contentIncluded || chunk.content || chunk.html) && (
+          <p>{chunk.contentPreview ?? '청크 미리보기 없음'}</p>
+        )}
         <p className="run-meta mono">
           page {chunk.pageStart ?? '—'}–{chunk.pageEnd ?? '—'} · token {chunk.tokenCount ?? '—'}
+          {' · '}본문 {chunk.contentBytes ?? '—'} B · HTML {chunk.htmlBytes ?? '—'} B
         </p>
         <dl>
           <div><dt>임베딩 모델</dt><dd>{chunk.embedding.model ?? '기록 없음'}</dd></div>
@@ -478,7 +1002,13 @@ function SourceArtifactView({
           <div><dt>차원 / norm</dt><dd className="mono">{chunk.embedding.dimensions ?? '—'} / {chunk.embedding.norm ?? '—'}</dd></div>
           <div><dt>프로필 해시</dt><dd className="mono">{chunk.embedding.profileHash ?? '기록 없음'}</dd></div>
         </dl>
-        <details><summary>청크 HTML</summary><pre>{chunk.html ?? '기록 없음'}</pre></details>
+        <ChunkContent
+          sourceId={result.source.id}
+          revisionId={result.revision.id}
+          chunk={chunk}
+          expanded={activeDetailKey === `chunk-content:${chunk.id}`}
+          onExpandedChange={(open) => setDetailExpanded(`chunk-content:${chunk.id}`, open)}
+        />
         <small className="mono">chunk {chunk.id} · provenance {chunk.embedding.provenance ?? '기록 없음'}</small>
       </article>) : <p>저장된 청크가 없습니다.</p>}
       {result.nextAfterOrdinal != null && <button
@@ -504,7 +1034,9 @@ function SourceArtifactView({
     {result.items.length ? result.items.map((entry) => <article key={entry.id}>
       <header><strong>{entry.ordinal}. {entry.title}</strong><span>{entry.mappingStatus}</span></header>
       <p className="run-meta mono">level {entry.level} · page {entry.printedPage ?? '—'} · confidence {entry.mappingConfidence ?? '—'}</p>
-      <details><summary>청크 매핑 {entry.mappings.length}건</summary><JsonBlock value={entry.mappings} /></details>
+      <LazyDisclosure summary={`청크 매핑 ${entry.mappings.length}건`}>
+        <JsonBlock value={entry.mappings} />
+      </LazyDisclosure>
       <small className="mono">toc {entry.id}</small>
     </article>) : <p>저장된 목차 매핑이 없습니다.</p>}
     {result.nextAfterOrdinal != null && <button
@@ -539,7 +1071,15 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     error: null,
     epoch: 0,
   });
+  const artifactRequest = useRef<AbortController | null>(null);
+  const artifactRequestGeneration = useRef(0);
+  const cancelArtifactRequest = useCallback(() => {
+    artifactRequestGeneration.current += 1;
+    artifactRequest.current?.abort();
+    artifactRequest.current = null;
+  }, []);
   const clearArtifactState = useCallback(() => {
+    cancelArtifactRequest();
     setArtifactState((current) => ({
       sourceId:null,
       activeKind:null,
@@ -548,7 +1088,9 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
       error:null,
       epoch:current.epoch + 1,
     }));
-  }, []);
+  }, [cancelArtifactRequest]);
+
+  useEffect(() => () => cancelArtifactRequest(), [cancelArtifactRequest]);
 
   const mergeSourceSnapshot = useCallback((snapshot: SourceListItem) => {
     setSources((current) => {
@@ -617,6 +1159,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     ),
     onEvent(event) {
       if (artifactInvalidationEvents.has(event.eventType)) {
+        cancelArtifactRequest();
         setArtifactState((current) => current.sourceId === event.aggregateId
           ? {
               sourceId:current.sourceId,
@@ -720,6 +1263,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
   async function showArtifact(kind: ArtifactKind) {
     if (!selectedId) return;
     const sourceId = selectedId;
+    cancelArtifactRequest();
     const scopedState = artifactState.sourceId === sourceId
       ? artifactState
       : {
@@ -731,24 +1275,33 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
           epoch: artifactState.epoch + 1,
         };
     const requestEpoch = scopedState.epoch;
+    const requestGeneration = artifactRequestGeneration.current;
     setArtifactState({
       ...scopedState,
       activeKind: kind,
+      cache:scopedState.cache[kind]
+        ? { [kind]:scopedState.cache[kind] }
+        : {},
       loadingKind: scopedState.cache[kind] ? null : kind,
       error: null,
     });
-    if (scopedState.cache[kind] || scopedState.loadingKind === kind) return;
+    if (scopedState.cache[kind]) return;
+    const abort = new AbortController();
+    artifactRequest.current = abort;
     try {
       const suffix = kind === 'revision'
         ? ''
         : `&limit=${kind === 'pages' ? 5 : 25}`;
       const response = await fetch(`/api/sources/${sourceId}/artifacts?kind=${kind}${suffix}`, {
         cache: 'no-store',
+        signal:abort.signal,
       });
       const body = await response.json() as SourceArtifacts & { code?: string; message?: string };
       if (!response.ok) {
         setArtifactState((current) => current.sourceId === sourceId
           && current.epoch === requestEpoch
+          && current.activeKind === kind
+          && artifactRequestGeneration.current === requestGeneration
           ? { ...current, error: body.message ?? body.code ?? '실제 산출물을 불러오지 못했습니다.' }
           : current);
         return;
@@ -756,19 +1309,27 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
       if (body.source?.id === sourceId) {
         setArtifactState((current) => current.sourceId === sourceId
           && current.epoch === requestEpoch
-          ? { ...current, cache: { ...current.cache, [kind]: body } }
+          && current.activeKind === kind
+          && artifactRequestGeneration.current === requestGeneration
+          ? { ...current, cache: { [kind]: body } }
           : current);
       }
     } catch {
+      if (abort.signal.aborted) return;
       setArtifactState((current) => current.sourceId === sourceId
         && current.epoch === requestEpoch
+        && current.activeKind === kind
+        && artifactRequestGeneration.current === requestGeneration
         ? { ...current, error: '실제 산출물을 불러오지 못했습니다.' }
         : current);
     } finally {
       setArtifactState((current) => current.sourceId === sourceId
         && current.epoch === requestEpoch
+        && current.activeKind === kind
+        && artifactRequestGeneration.current === requestGeneration
         ? { ...current, loadingKind: null }
         : current);
+      if (artifactRequest.current === abort) artifactRequest.current = null;
     }
   }
   async function loadMoreArtifact() {
@@ -786,15 +1347,20 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     const cursorQuery = cached.kind === 'pages'
       ? `afterPage=${cursor}`
       : `afterOrdinal=${cursor}`;
+    cancelArtifactRequest();
+    const requestGeneration = artifactRequestGeneration.current;
+    const abort = new AbortController();
+    artifactRequest.current = abort;
     setArtifactState((current) => current.sourceId === sourceId
       && current.epoch === requestEpoch
+      && current.activeKind === kind
       ? { ...current, loadingKind: kind, error: null }
       : current);
     try {
       const refreshLatest = async () => {
         const freshResponse = await fetch(
           `/api/sources/${sourceId}/artifacts?kind=${kind}&limit=${pageLimit}`,
-          { cache:'no-store' },
+          { cache:'no-store', signal:abort.signal },
         );
         const freshBody = await freshResponse.json() as SourceArtifacts & {
           code?:string;
@@ -805,16 +1371,18 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
         }
         setArtifactState((current) => current.sourceId === sourceId
           && current.epoch === requestEpoch
+          && current.activeKind === kind
+          && artifactRequestGeneration.current === requestGeneration
           ? {
               ...current,
               activeKind:kind,
-              cache:{ ...current.cache, [kind]:freshBody },
+              cache:{ [kind]:freshBody },
             }
           : current);
       };
       const response = await fetch(
         `/api/sources/${sourceId}/artifacts?kind=${kind}&limit=${pageLimit}&revisionId=${encodeURIComponent(cached.revision.id)}&${cursorQuery}`,
-        { cache: 'no-store' },
+        { cache:'no-store', signal:abort.signal },
       );
       const body = await response.json() as SourceArtifacts & {
         code?: string;
@@ -827,6 +1395,8 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
       if (!response.ok) {
         setArtifactState((current) => current.sourceId === sourceId
           && current.epoch === requestEpoch
+          && current.activeKind === kind
+          && artifactRequestGeneration.current === requestGeneration
           ? { ...current, error: body.message ?? body.code ?? '추가 산출물을 불러오지 못했습니다.' }
           : current);
         return;
@@ -843,29 +1413,49 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
         if (
           current.sourceId !== sourceId
           || current.epoch !== requestEpoch
+          || current.activeKind !== kind
+          || artifactRequestGeneration.current !== requestGeneration
           || body.source?.id !== sourceId
         ) return current;
         const existing = current.cache[kind];
         let merged: SourceArtifacts = body;
         if (existing?.kind === 'pages' && body.kind === 'pages') {
-          merged = { ...body, items: [...existing.items, ...body.items] };
+          merged = {
+            ...body,
+            items:[...existing.items, ...body.items]
+              .slice(-artifactRetentionLimits.pages),
+          };
         } else if (existing?.kind === 'chunks' && body.kind === 'chunks') {
-          merged = { ...body, items: [...existing.items, ...body.items] };
+          merged = {
+            ...body,
+            items:[...existing.items, ...body.items]
+              .slice(-artifactRetentionLimits.chunks),
+          };
         } else if (existing?.kind === 'toc' && body.kind === 'toc') {
-          merged = { ...body, items: [...existing.items, ...body.items] };
+          merged = {
+            ...body,
+            items:[...existing.items, ...body.items]
+              .slice(-artifactRetentionLimits.toc),
+          };
         }
-        return { ...current, cache: { ...current.cache, [kind]: merged } };
+        return { ...current, cache: { [kind]: merged } };
       });
     } catch {
+      if (abort.signal.aborted) return;
       setArtifactState((current) => current.sourceId === sourceId
         && current.epoch === requestEpoch
+        && current.activeKind === kind
+        && artifactRequestGeneration.current === requestGeneration
         ? { ...current, error: '추가 산출물을 불러오지 못했습니다.' }
         : current);
     } finally {
       setArtifactState((current) => current.sourceId === sourceId
         && current.epoch === requestEpoch
+        && current.activeKind === kind
+        && artifactRequestGeneration.current === requestGeneration
         ? { ...current, loadingKind: null }
         : current);
+      if (artifactRequest.current === abort) artifactRequest.current = null;
     }
   }
 
@@ -938,10 +1528,9 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
                 <div><dt>프로필 ID</dt><dd>{profile.profileId ?? '기존 기록 · 미확인'}</dd></div>
                 <div><dt>콘텐츠 해시</dt><dd className="mono">{profile.contentHash ?? '기존 기록 · 미확인'}</dd></div>
               </dl>
-              <details>
-                <summary>고정 설정 스냅샷</summary>
+              <LazyDisclosure summary="고정 설정 스냅샷">
                 <JsonBlock value={profile.definition} />
-              </details>
+              </LazyDisclosure>
             </article>)}
           </section>}
           <section className="source-profile-audit" aria-label="실제 산출물">
@@ -963,6 +1552,9 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
               {!artifactKind && <p>확인할 산출물 종류를 선택하세요.</p>}
               {artifactKind && artifactLoading === artifactKind && <p>실제 산출물을 불러오는 중입니다.</p>}
               {activeArtifact && <SourceArtifactView
+                key={activeArtifact.kind === 'revision'
+                  ? `revision:${activeArtifact.artifact?.id ?? 'none'}`
+                  : `${activeArtifact.kind}:${activeArtifact.revision.id}`}
                 result={activeArtifact}
                 loadingMore={artifactLoading === activeArtifact.kind}
                 onLoadMore={() => void loadMoreArtifact()}
@@ -971,10 +1563,13 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
           </section>
           <div className="source-event-log" aria-live="polite">
             {!activity && <div className="activity-loading"><LoaderCircle className="lab-spinner" size={18} /> 기록을 불러오는 중입니다.</div>}
-            {activity?.events.map((event, index) => <details key={event.id} className={`source-event event-${event.event_type}`}>
-              <summary><ChevronRight size={14} /><span className="event-sequence mono">{String(index + 1).padStart(2, '0')}</span><div><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></div></summary>
+            {activity?.events.map((event, index) => <LazyDisclosure
+              key={event.id}
+              className={`source-event event-${event.event_type}`}
+              summary={<><ChevronRight size={14} /><span className="event-sequence mono">{String(index + 1).padStart(2, '0')}</span><div><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><time>{new Date(event.created_at).toLocaleTimeString('ko-KR')}</time></div></>}
+            >
               <JsonBlock value={event.payload} />
-            </details>)}
+            </LazyDisclosure>)}
             {activity && activity.events.length === 0 && <div className="activity-loading"><Ban size={18} /> 아직 기록된 로그가 없습니다.</div>}
           </div>
         </aside>}

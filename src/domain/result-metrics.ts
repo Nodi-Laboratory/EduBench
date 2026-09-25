@@ -6,7 +6,6 @@ export const resultMetricLabels: Record<string, string> = {
   student_fit: '학생 수준 적합성',
   misconception: '오개념 대응',
   hallucination: '환각 억제',
-  exact_match: '완전 일치',
   response_present: '응답 존재',
   target_concept_correctness: '목표 개념 정확성',
   prerequisite_identification: '선수 개념 식별',

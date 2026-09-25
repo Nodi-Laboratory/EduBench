@@ -21,6 +21,10 @@ import { replaceSourceTocEntries } from '@/server/sources/toc';
 import { mapConcurrentOrdered } from '@/domain/parallel';
 import { resolveSourceExecutionPins } from '@/server/settings/execution-pins';
 import {
+  ensureSourceHtmlBlobs,
+  sourceHtmlContentHash,
+} from '@/server/documents/html-storage';
+import {
   effectiveDocumentParseConcurrency,
   DEFAULT_DOCUMENT_PARSE_PROVIDER_MAX_ATTEMPTS,
 } from '@/domain/document-parse-config';
@@ -560,10 +564,27 @@ export async function processDocument(
   });
   const tocAlignment = await withTransaction(async (client) => {
     const persistedChunks = [];
+    const htmlBlobIds = await ensureSourceHtmlBlobs(
+      client,
+      chunks.map((chunk) => chunk.html),
+    );
     for (const [index, chunk] of chunks.entries()) {
+      const htmlBlobId = htmlBlobIds.get(sourceHtmlContentHash(chunk.html));
+      if (!htmlBlobId) {
+        throw new Error(
+          'SOURCE_HTML_BLOB_INTEGRITY_ERROR: 청크 HTML 참조를 확인할 수 없습니다.',
+        );
+      }
       const inserted = await client.query<{ id: string }>(
-        `insert into source_chunks(source_file_id, source_revision_id, ordinal, subject, grade, chapter, unit, page_start, page_end, kind, html, content, token_count, embedding, embedding_model, embedding_version)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::vector,$15,$16)
+        `insert into source_chunks(
+           source_file_id,source_revision_id,ordinal,subject,grade,
+           chapter,unit,page_start,page_end,kind,html,html_blob_id,
+           content,token_count,embedding,embedding_model,embedding_version
+         )
+         values(
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,null,$16,
+           $11,$12,$13::vector,$14,$15
+         )
          returning id`,
         [
           sourceId,
@@ -576,12 +597,12 @@ export async function processDocument(
           chunk.pageStart,
           chunk.pageEnd,
           chunk.kind,
-          chunk.html,
           chunk.content,
           chunk.estimatedTokens,
           vectorLiteral(vectors[index]!),
           embeddingModel,
           embeddingSettings.vectorSpaceId,
+          htmlBlobId,
         ],
       );
       persistedChunks.push({ ...chunk, id: inserted.rows[0]!.id });

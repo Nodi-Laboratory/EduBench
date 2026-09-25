@@ -1,6 +1,6 @@
 import { prerequisiteMetricRubrics, prerequisiteScoreMetrics } from '@/domain/prerequisite-benchmark';
 
-export const scoringEngineVersion = 'edubench-scoring-v1' as const;
+export const scoringEngineVersion = 'edubench-scoring-v2' as const;
 export const scoringEngineReplacementRequiredMessage =
   '실행에 고정된 채점 엔진의 정의 또는 출처를 현재 코드로 검증할 수 없습니다. 현재 엔진으로 새 실행을 생성하십시오.';
 
@@ -58,21 +58,8 @@ export function isTerminalJudgeInvocationState(
 
 export const currentScoringEngineDefinition = {
   version:scoringEngineVersion,
-  title:'EduBench 선수관계 평가 엔진 v1',
+  title:'EduBench 선수관계 평가 엔진 v2',
   deterministic:{
-    exactMatch:{
-      implementationVersion:'normalize-korean-answer-v1',
-      normalization:[
-        'Unicode NFC normalization',
-        'CRLF to LF',
-        'collapse whitespace',
-        'trim',
-        'remove trailing . ! ? and ideographic full stop',
-        'Korean-locale lowercase',
-      ],
-      comparison:'normalized candidate equals any normalized accepted answer or reference answer',
-      range:[0, 1],
-    },
     responsePresent:{
       implementationVersion:'normalized-response-present-v1',
       rule:'normalized response length is greater than zero',
@@ -80,9 +67,9 @@ export const currentScoringEngineDefinition = {
     },
   },
   metricResolution:{
-    implementationVersion:'required-metrics-v1',
-    baseMetrics:['exact_match', 'response_present'],
-    profileMetrics:'append score profile metrics in stored order and deduplicate by first occurrence',
+    implementationVersion:'required-metrics-v2',
+    baseMetrics:['response_present'],
+    profileMetrics:'discard retired exact_match, then append score profile metrics in stored order and deduplicate by first occurrence',
     prerequisiteBenchmarkType:'PREREQUISITE_RELATIONSHIP',
     prerequisiteMetrics:[...prerequisiteScoreMetrics],
   },

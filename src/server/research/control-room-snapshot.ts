@@ -568,6 +568,7 @@ async function readScoreboard(queryable: Queryable) {
        join scores score
          on score.model_response_id=response.id
         and score.score_profile_id=run.score_profile_id
+        and score.metric_key <> 'exact_match'
       group by run.id,run.title,run.updated_at,model.id,model.display_name,
                score.metric_key
     )

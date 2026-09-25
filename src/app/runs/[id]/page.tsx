@@ -14,6 +14,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ id: 
     profile={details.profile}
     scoringEngine={details.scoringEngine}
     initialItems={details.items}
+    initialItemPagination={details.itemPagination}
+    initialCounters={details.counters}
+    initialItemFilters={details.itemFilters}
+    initialItemFilterOptions={details.itemFilterOptions}
+    initialProviderCooldowns={details.providerCooldowns}
     initialEvents={details.events}
     initialEventCursor={details.eventCursor}
   />;

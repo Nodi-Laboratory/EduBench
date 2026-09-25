@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import { ReviewWorkspace } from '@/components/review/review-workspace';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
@@ -65,6 +65,64 @@ function auditQuestion(): AuditQuestion {
     createdAt: '2026-07-27T00:00:00Z',
   };
 }
+
+function auditListPage(total = 1) {
+  const item = auditQuestion();
+  return {
+    items: [auditListItem(item)],
+    page: 1, pageSize: 20, total,
+  };
+}
+
+function auditListItem(item:AuditQuestion) {
+  return {
+    id: item.id, publicId: item.publicId, ordinal: item.ordinal, status: item.status,
+    subject: item.subject, grade: item.grade, chapter: item.chapter, unit: item.unit,
+    purpose: item.purpose, difficulty: item.difficulty, questionType: item.questionType,
+    evidenceMode: item.evidenceMode, revision: item.revision, currentRevision: item.currentRevision,
+    revisionDrift: item.revisionDrift, questionSummary: item.questionText,
+  };
+}
+
+function emptyAuditPage(total = 0) {
+  return { items: [], page: 1, pageSize: 20, total };
+}
+
+function deferred<T>() {
+  let resolve!: (value:T) => void;
+  const promise = new Promise<T>((resolver) => {
+    resolve = resolver;
+  });
+  return { promise, resolve };
+}
+
+test('dataset workspace keeps selected-set JSON export as a direct download', () => {
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: true,
+    json: async () => emptyAuditPage(),
+  })));
+
+  render(<DatasetWorkspace
+    questionSets={[{
+      id: 'set-1',
+      title: '내보낼 세트',
+      description: 'React에는 메타데이터만 전달',
+      questionCount: 125,
+      createdAt: '2026-07-27T00:00:00Z',
+      updatedAt: '2026-07-27T00:00:00Z',
+    }]}
+    versions={[]}
+  />);
+
+  const exportControl = screen.getByRole('link', {
+    name: '선택 세트 JSON',
+  });
+  expect(exportControl).toHaveAttribute(
+    'href',
+    '/api/question-sets/set-1/export',
+  );
+  expect(exportControl).toHaveAttribute('download');
+});
 
 test('review approval sends the selected question set with the review decision', async () => {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -152,6 +210,9 @@ test('review reports request failures and re-enables its actions', async () => {
 
 test('dataset workspace creates, deletes, and removes questions from editable sets', async () => {
   const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+    if (input.startsWith('/api/datasets/audit')) {
+      return { ok: true, json: async () => auditListPage(1) };
+    }
     if (input === '/api/question-sets' && init?.method === 'POST') {
       return {
         ok: true,
@@ -190,8 +251,8 @@ test('dataset workspace creates, deletes, and removes questions from editable se
   />);
 
   expect(screen.getByRole('heading', { name: '편집 가능한 질문 세트' })).toBeInTheDocument();
-  expect(screen.getByText(/Q-SET-1/)).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Q-SET-1 세트에서 제거' }));
+  expect(await screen.findByText(/Q-SET-1/)).toBeInTheDocument();
+  fireEvent.click(await screen.findByRole('button', { name: 'Q-SET-1 세트에서 제거' }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
     '/api/question-sets/set-1/questions/question-1',
     { method: 'DELETE' },
@@ -215,10 +276,12 @@ test('dataset workspace creates, deletes, and removes questions from editable se
 });
 
 test('removing a question keeps it classified while another active set contains it', async () => {
-  const fetchMock = vi.fn(async () => ({
-    ok: true,
-    json: async () => ({ ok: true }),
-  }));
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).startsWith('/api/datasets/audit')) {
+      return { ok: true, json: async () => auditListPage(0) };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  });
   vi.stubGlobal('fetch', fetchMock);
 
   render(<DatasetWorkspace
@@ -248,17 +311,79 @@ test('removing a question keeps it classified while another active set contains 
     versions={[]}
   />);
 
-  fireEvent.click(screen.getByRole('button', { name: 'Q-SET-1 세트에서 제거' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Q-SET-1 세트에서 제거' }));
 
   await screen.findByText('Q-SET-1 문항을 세트에서 제거했습니다.');
   expect(screen.getByRole('tab', { name: '미분류 승인 문항 (0)' })).toBeInTheDocument();
 });
 
+test('removing a question refreshes the current first page and totals', async () => {
+  let setPageReads = 0;
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('scope=set')) {
+      setPageReads += 1;
+      return {
+        ok: true,
+        json: async () => setPageReads === 1
+          ? auditListPage(1)
+          : emptyAuditPage(),
+      };
+    }
+    if (url.includes('scope=unassigned')) {
+      return { ok: true, json: async () => emptyAuditPage(1) };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<DatasetWorkspace
+    unassignedQuestionCount={0}
+    questionSets={[{
+      id: 'set-1',
+      title: '첫 페이지 세트',
+      description: null,
+      questionCount: 1,
+      createdAt: '2026-07-27T00:00:00Z',
+      updatedAt: '2026-07-27T00:00:00Z',
+    }]}
+    versions={[]}
+  />);
+
+  fireEvent.click(await screen.findByRole(
+    'button',
+    { name: 'Q-SET-1 세트에서 제거' },
+  ));
+
+  await screen.findByText('Q-SET-1 문항을 세트에서 제거했습니다.');
+  await waitFor(() => {
+    expect(screen.queryByRole(
+      'button',
+      { name: 'Q-SET-1 세트에서 제거' },
+    )).not.toBeInTheDocument();
+  });
+  expect(screen.getByRole(
+    'tab',
+    { name: '현재 질문 세트 (0)' },
+  )).toBeInTheDocument();
+  expect(screen.getByRole(
+    'tab',
+    { name: '미분류 승인 문항 (1)' },
+  )).toBeInTheDocument();
+  expect(screen.getByText('1 / 1 · 0문항')).toBeInTheDocument();
+});
+
 test('deleting a set keeps shared questions classified by remaining active sets', async () => {
-  const fetchMock = vi.fn(async () => ({
-    ok: true,
-    json: async () => ({ ok: true }),
-  }));
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('scope=unassigned')) {
+      return { ok: true, json: async () => emptyAuditPage() };
+    }
+    if (url.startsWith('/api/datasets/audit')) {
+      return { ok: true, json: async () => auditListPage(1) };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  });
   vi.stubGlobal('fetch', fetchMock);
   vi.stubGlobal('confirm', vi.fn(() => true));
 
@@ -296,6 +421,70 @@ test('deleting a set keeps shared questions classified by remaining active sets'
   expect(screen.getByText(/Q-SET-1/)).toBeInTheDocument();
 });
 
+test('deleting another set refreshes the current scope and unassigned total', async () => {
+  let setPageReads = 0;
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('scope=set')) {
+      setPageReads += 1;
+      return {
+        ok: true,
+        json: async () => setPageReads === 1
+          ? auditListPage(1)
+          : emptyAuditPage(),
+      };
+    }
+    if (url.includes('scope=unassigned')) {
+      return { ok: true, json: async () => emptyAuditPage(2) };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  vi.stubGlobal('confirm', vi.fn(() => true));
+
+  render(<DatasetWorkspace
+    unassignedQuestionCount={0}
+    questionSets={[
+      {
+        id: 'set-1',
+        title: '현재 세트',
+        description: null,
+        questionCount: 1,
+        createdAt: '2026-07-27T00:00:00Z',
+        updatedAt: '2026-07-27T00:00:00Z',
+      },
+      {
+        id: 'set-2',
+        title: '삭제할 다른 세트',
+        description: null,
+        questionCount: 1,
+        createdAt: '2026-07-27T00:00:00Z',
+        updatedAt: '2026-07-27T00:00:00Z',
+      },
+    ]}
+    versions={[]}
+  />);
+
+  await screen.findByText(/Q-SET-1/);
+  fireEvent.click(screen.getByRole(
+    'button',
+    { name: '삭제할 다른 세트 삭제' },
+  ));
+
+  await screen.findByText('질문 세트 “삭제할 다른 세트”을 삭제했습니다.');
+  await waitFor(() => {
+    expect(screen.queryByRole(
+      'button',
+      { name: 'Q-SET-1 세트에서 제거' },
+    )).not.toBeInTheDocument();
+  });
+  expect(screen.getByRole(
+    'tab',
+    { name: '미분류 승인 문항 (2)' },
+  )).toBeInTheDocument();
+  expect(screen.getByText('1 / 1 · 0문항')).toBeInTheDocument();
+});
+
 test('dataset reports response parsing failures and re-enables set creation', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => ({
     ok: true,
@@ -322,6 +511,215 @@ test('dataset reports response parsing failures and re-enables set creation', as
     /질문 세트를 만들지 못했습니다/,
   );
   expect(createButton).not.toBeDisabled();
+});
+
+test('switching and closing dataset question details aborts stale requests and evicts prior detail', async () => {
+  const firstQuestion = {
+    ...auditQuestion(),
+    questionText:'첫 문항 요약',
+  };
+  const secondQuestion = {
+    ...auditQuestion(),
+    id:'question-2',
+    publicId:'Q-SET-2',
+    ordinal:2,
+    questionText:'둘째 문항 요약',
+  };
+  const listPage = {
+    items:[auditListItem(firstQuestion), auditListItem(secondQuestion)],
+    page:1,
+    pageSize:20,
+    total:2,
+  };
+  const firstRequest = deferred<{
+    ok:boolean;
+    json:() => Promise<{ item:AuditQuestion }>;
+  }>();
+  const secondRequest = deferred<{
+    ok:boolean;
+    json:() => Promise<{ item:AuditQuestion }>;
+  }>();
+  let secondDetailCalls = 0;
+  const fetchMock = vi.fn((
+    input:RequestInfo | URL,
+    init?:RequestInit,
+  ) => {
+    const url = String(input);
+    if (url.includes('questionId=question-1')) return firstRequest.promise;
+    if (url.includes('questionId=question-2')) {
+      secondDetailCalls += 1;
+      return secondDetailCalls === 1
+        ? secondRequest.promise
+        : Promise.resolve({
+          ok:true,
+          json:async () => ({
+            item:{ ...secondQuestion, questionText:'FRESH-DATASET-DETAIL' },
+          }),
+        });
+    }
+    void init;
+    return Promise.resolve({ ok:true, json:async () => listPage });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<DatasetWorkspace
+    questionSets={[{
+      id:'set-1',
+      title:'감사 세트',
+      description:null,
+      questionCount:2,
+      createdAt:'2026-07-27T00:00:00Z',
+      updatedAt:'2026-07-27T00:00:00Z',
+    }]}
+    versions={[]}
+  />);
+
+  await screen.findByText(/Q-SET-1/);
+  fireEvent.click(screen.getByText(/Q-SET-1/));
+  await waitFor(() => expect(fetchMock.mock.calls.some(
+    ([url]) => String(url).includes('questionId=question-1'),
+  )).toBe(true));
+  const firstCall = fetchMock.mock.calls.find(
+    ([url]) => String(url).includes('questionId=question-1'),
+  )!;
+  const firstSignal = firstCall[1]?.signal as AbortSignal | undefined;
+  expect(firstSignal).toBeInstanceOf(AbortSignal);
+
+  fireEvent.click(screen.getByText(/Q-SET-2/));
+  await waitFor(() => expect(secondDetailCalls).toBe(1));
+  expect(firstSignal?.aborted).toBe(true);
+  const secondCall = fetchMock.mock.calls.find(
+    ([url]) => String(url).includes('questionId=question-2'),
+  )!;
+  const secondSignal = secondCall[1]?.signal as AbortSignal | undefined;
+  expect(secondSignal).toBeInstanceOf(AbortSignal);
+
+  fireEvent.click(screen.getByText(/Q-SET-2/));
+  await waitFor(() => expect(secondSignal?.aborted).toBe(true));
+
+  await act(async () => {
+    firstRequest.resolve({
+      ok:true,
+      json:async () => ({
+        item:{ ...firstQuestion, questionText:'STALE-FIRST-DETAIL' },
+      }),
+    });
+    secondRequest.resolve({
+      ok:true,
+      json:async () => ({
+        item:{ ...secondQuestion, questionText:'STALE-SECOND-DETAIL' },
+      }),
+    });
+    await Promise.resolve();
+  });
+  expect(screen.queryByText('STALE-FIRST-DETAIL')).not.toBeInTheDocument();
+  expect(screen.queryByText('STALE-SECOND-DETAIL')).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByText(/Q-SET-2/));
+  expect(await screen.findByText('FRESH-DATASET-DETAIL')).toBeInTheDocument();
+  expect(secondDetailCalls).toBe(2);
+});
+
+test.each(['page', 'filter'] as const)(
+  'changing the dataset %s aborts the active question detail request',
+  async (change) => {
+    const question = auditQuestion();
+    const detailRequest = deferred<{
+      ok:boolean;
+      json:() => Promise<{ item:AuditQuestion }>;
+    }>();
+    const listPage = {
+      items:[auditListItem(question)],
+      page:1,
+      pageSize:20,
+      total:21,
+    };
+    const fetchMock = vi.fn((
+      input:RequestInfo | URL,
+      init?:RequestInit,
+    ) => {
+      void init;
+      if (String(input).includes('questionId=question-1')) {
+        return detailRequest.promise;
+      }
+      return Promise.resolve({ ok:true, json:async () => listPage });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<DatasetWorkspace
+      questionSets={[{
+        id:'set-1',
+        title:'감사 세트',
+        description:null,
+        questionCount:21,
+        createdAt:'2026-07-27T00:00:00Z',
+        updatedAt:'2026-07-27T00:00:00Z',
+      }]}
+      versions={[]}
+    />);
+    await screen.findByText(/Q-SET-1/);
+    fireEvent.click(screen.getByText(/Q-SET-1/));
+    await waitFor(() => expect(fetchMock.mock.calls.some(
+      ([url]) => String(url).includes('questionId=question-1'),
+    )).toBe(true));
+    const detailCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).includes('questionId=question-1'),
+    )!;
+    const signal = detailCall[1]?.signal as AbortSignal | undefined;
+    expect(signal).toBeInstanceOf(AbortSignal);
+
+    if (change === 'page') {
+      fireEvent.click(screen.getByRole('button', { name:'다음' }));
+    } else {
+      fireEvent.change(screen.getByLabelText('문항 검색'), {
+        target:{ value:'새 필터' },
+      });
+    }
+    await waitFor(() => expect(signal?.aborted).toBe(true));
+  },
+);
+
+test('unmounting the dataset workspace aborts the active question detail request', async () => {
+  const detailRequest = deferred<{
+    ok:boolean;
+    json:() => Promise<{ item:AuditQuestion }>;
+  }>();
+  const fetchMock = vi.fn((
+    input:RequestInfo | URL,
+    init?:RequestInit,
+  ) => {
+    void init;
+    if (String(input).includes('questionId=question-1')) {
+      return detailRequest.promise;
+    }
+    return Promise.resolve({ ok:true, json:async () => auditListPage() });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  const { unmount } = render(<DatasetWorkspace
+    questionSets={[{
+      id:'set-1',
+      title:'감사 세트',
+      description:null,
+      questionCount:1,
+      createdAt:'2026-07-27T00:00:00Z',
+      updatedAt:'2026-07-27T00:00:00Z',
+    }]}
+    versions={[]}
+  />);
+  await screen.findByText(/Q-SET-1/);
+  fireEvent.click(screen.getByText(/Q-SET-1/));
+  await waitFor(() => expect(fetchMock.mock.calls.some(
+    ([url]) => String(url).includes('questionId=question-1'),
+  )).toBe(true));
+  const detailCall = fetchMock.mock.calls.find(
+    ([url]) => String(url).includes('questionId=question-1'),
+  )!;
+  const signal = detailCall[1]?.signal as AbortSignal | undefined;
+  expect(signal).toBeInstanceOf(AbortSignal);
+
+  unmount();
+  expect(signal?.aborted).toBe(true);
 });
 
 test('run setup updates the question limit and manifest when another dataset is selected', () => {

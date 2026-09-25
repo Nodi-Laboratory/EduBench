@@ -1,5 +1,9 @@
 import { expect, test } from 'vitest';
-import { parseGeneratedQuestionResponse, validateGeneratedQuestionForType } from '@/server/questions/response';
+import {
+  generatedQuestionResponseJsonSchema,
+  parseGeneratedQuestionResponse,
+  validateGeneratedQuestionForType,
+} from '@/server/questions/response';
 
 const chunkId = '11111111-1111-4111-8111-111111111111';
 
@@ -45,4 +49,14 @@ test('rejects a benchmark design whose prerequisite relation does not reach the 
     designSummary: '', evidenceSummary: '', evidenceChunkIds: [chunkId],
     benchmarkDesign: { ...benchmarkDesign, prerequisiteRelations: [{ ...benchmarkDesign.prerequisiteRelations[0], toConcept: '힘' }] },
   }))).toThrow('GENERATION_PARSE_FAILED');
+});
+
+test('describes the target-link equality rule inside the provider JSON schema', () => {
+  const benchmarkDesignProperty = (
+    generatedQuestionResponseJsonSchema.properties.benchmarkDesign.properties
+  );
+  expect(benchmarkDesignProperty.targetConcept.description)
+    .toContain('정확히 동일');
+  expect(benchmarkDesignProperty.prerequisiteRelations.description)
+    .toContain('toConcept');
 });

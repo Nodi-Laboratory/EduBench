@@ -1,4 +1,5 @@
 export const algorithmicMetricKeys = ['exact_match', 'response_present'] as const;
+export const retiredScoreMetricKeys = ['exact_match'] as const;
 export const legacyJudgeProvenanceSentinels = [
   'legacy-environment-default-unrecorded',
   'legacy-provider-unrecorded',
@@ -27,6 +28,16 @@ export type ScoreProfileSnapshot = ScoreProfileDefinition & {
   id: string;
   contentHash: string;
 };
+
+export function isRetiredScoreMetric(metric: string): boolean {
+  return retiredScoreMetricKeys.includes(
+    metric as (typeof retiredScoreMetricKeys)[number],
+  );
+}
+
+export function activeScoreMetrics(metrics: string[]): string[] {
+  return [...new Set(metrics.filter((metric) => !isRetiredScoreMetric(metric)))];
+}
 
 export function hasJudgeMetrics(metrics: string[]): boolean {
   return metrics.some(

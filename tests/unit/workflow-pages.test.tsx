@@ -12,6 +12,7 @@ import { RunController } from '@/components/runs/run-controller';
 import { SettingsWorkspace } from '@/components/settings/settings-workspace';
 import { RunWorkspace } from '@/components/runs/run-workspace';
 import { ResultAnalyticsDashboard } from '@/components/results/result-analytics-dashboard';
+import { buildResultAnalytics } from '@/server/results/analytics';
 
 afterEach(() => {
   cleanup();
@@ -233,13 +234,56 @@ test('run detail exposes exact prompts, responses, failures, scores, and the eva
     initialRun={{ id:'run-1', public_id:'RUN-1', title:'실행', state:'RUNNING', total_items:1, completed_items:1, failed_items:0, dataset_version:'actual-v1', score_version:'score-v1', price_profile_version:'price-v1', created_at:'2026-07-22T00:00:00Z' }}
     models={[{ id:'model-1', display_name:'Gemini', blind_id:'M01', model_id:'gemini-test', protocol:'gemini', concurrency:1 }]}
     profile={{ version:'score-v1', title:'선수관계 평가', metrics:['accuracy'], rubricPrompt:'절대평가한다.', judgeProvider:'gemini', judgeModel:'gemini-test', contentHash:'abc123', dynamicMetrics:['prerequisite_relation_accuracy'], snapshotProvenance:'LEGACY_BACKFILL_UNVERIFIED' }}
-    initialItems={[{ id:'item-1', state:'SUCCEEDED', attempts:1, errorCode:null, errorMessage:null, questionPublicId:'Q-1', questionText:'질문', providerKey:'gemini', displayName:'Gemini', modelId:'gemini-test', blindId:'M01', request:{ system:'시스템 지시', prompt:'실제 질문 입력' }, response:{ text:'모델 답변', raw:{ id:'raw' }, requestId:'req-1', retryHistory:[] }, scores:[{ metricKey:'accuracy', value:0.8, label:'GOOD', rationale:'근거에 부합', evidence:[] }] }]}
+    initialItems={[{ id:'item-1', state:'SUCCEEDED', attempts:1, errorCode:null, errorMessage:null, questionPublicId:'Q-1', questionText:'질문', providerKey:'gemini', displayName:'Gemini', modelId:'gemini-test', blindId:'M01', retrievalMode:'PIKE', retrieval:{ configSnapshot:{ strategy:'generation-pipeline-graph-snapshot' } }, request:{ system:'시스템 지시', prompt:'실제 질문 입력' }, response:{ text:'모델 답변', raw:{ id:'raw' }, requestId:'req-1', retryHistory:[] }, scores:[{ metricKey:'accuracy', value:0.8, label:'GOOD', rationale:'근거에 부합', evidence:[] }] }]}
   />);
   expect(screen.getByText('평가 프로필')).toBeInTheDocument();
   expect(screen.getByText('실제 전송 프롬프트')).toBeInTheDocument();
   expect(screen.getByText('모델 응답')).toBeInTheDocument();
   expect(screen.getByText('점수와 판정 근거')).toBeInTheDocument();
   expect(screen.getByText(/생성 시점 스냅샷 출처가 검증되지 않았습니다/)).toBeInTheDocument();
+  const retrievalAudit = screen.getByRole(
+    'heading',
+    { name:'검색·RAG 감사' },
+  ).closest('section');
+  expect(retrievalAudit).not.toBeNull();
+  expect(within(retrievalAudit!).getByText(
+    'Pike-inspired · 생성 그래프 스냅샷',
+  )).toBeInTheDocument();
+  expect(within(retrievalAudit!).getByText(
+    /그래프가 새 검색을 수행하지 않습니다/,
+  )).toBeInTheDocument();
+});
+
+test('run detail exposes an active provider quota cooldown and its automatic resume time', () => {
+  class EventSourceStub { addEventListener() {} removeEventListener() {} close() {} }
+  vi.stubGlobal('EventSource', EventSourceStub);
+  render(<RunController
+    initialRun={{ id:'run-rate-limit', public_id:'RUN-RATE', title:'호출 제한 실행', state:'RUNNING', total_items:2, completed_items:0, failed_items:0, dataset_version:'actual-v1', score_version:'score-v1', price_profile_version:'price-v1', created_at:'2026-07-27T00:00:00Z' }}
+    models={[{ id:'model-1', provider_key:'gemini', display_name:'Gemini', blind_id:'M01', model_id:'gemini-test', protocol:'gemini', concurrency:2 }]}
+    profile={{ version:'score-v1', title:'평가', metrics:['accuracy'], rubricPrompt:'평가', judgeProvider:'gemini', judgeModel:'gemini-test', contentHash:'hash', dynamicMetrics:[] }}
+    initialItems={[]}
+    initialProviderCooldowns={[{
+      providerKey:'gemini',
+      active:true,
+      rateLimitDimension:'RPD',
+      blockedUntil:'2026-07-27T09:15:00.000Z',
+      sourcePhase:'MODEL_RESPONSE',
+      sourceModelId:'gemini-test',
+      retryAfterMs:900_000,
+      hitCount:1,
+      lastErrorMessage:'RATE_LIMIT: 일일 요청 한도',
+      requestId:'rate-request-1',
+      activatedAt:'2026-07-27T09:00:00.000Z',
+      updatedAt:'2026-07-27T09:00:00.000Z',
+    }]}
+  />);
+
+  const region = screen.getByRole('region', { name:'공급자 호출 제한 자동 대기' });
+  expect(region).toHaveTextContent('Gemini');
+  expect(region).toHaveTextContent('RPD');
+  expect(region).toHaveTextContent('자동 재개 예정');
+  expect(region).toHaveTextContent('다른 공급자의 실행은 계속됩니다');
+  expect(region).toHaveTextContent('rate-request-1');
 });
 
 test('run detail separates execution completion from scoring coverage', () => {
@@ -321,6 +365,12 @@ test('run setup excludes unresolved score profiles and explains why', () => {
   expect(screen.getByText(/출처가 확인되지 않은 채점 프로필 1개를 실행 선택에서 제외/)).toBeInTheDocument();
   expect(screen.queryByRole('option', { name:/legacy-v0/ })).not.toBeInTheDocument();
   expect(screen.getByRole('option', { name:/score-v2/ })).toBeInTheDocument();
+  expect(screen.getByText(
+    'Pike-inspired · 생성 그래프 스냅샷',
+  )).toBeInTheDocument();
+  expect(screen.getByText(
+    /완전한 Microsoft PIKE-RAG 구현이 아닙니다/,
+  )).toBeInTheDocument();
 });
 
 test('benchmark run preserves provider request pacing in the execution spec', async () => {
@@ -342,20 +392,41 @@ test('benchmark run preserves provider request pacing in the execution spec', as
   const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
   const body = JSON.parse(String(request.body));
   expect(body.models[0]).toMatchObject({ providerKey:'exaone', requestIntervalMs:20000 });
+  expect(body.retrievalModes).toEqual(['NONE', 'VECTOR', 'PIKE']);
 });
 
-test('result analytics renders comprehensive charts and filters models', () => {
-  render(<ResultAnalyticsDashboard analytics={{
+test('result analytics renders comprehensive charts and fetches only the selected heatmap page', async () => {
+  const analytics = buildResultAnalytics({
     models:[
-      { blindId:'M01', displayName:'Gemini', modelId:'gemini-test', responses:10, avgLatencyMs:900, costKrw:12, compositeScore:0.82, scoreCount:150 },
-      { blindId:'M02', displayName:'EXAONE', modelId:'exaone-test', responses:10, avgLatencyMs:1500, costKrw:null, compositeScore:0.74, scoreCount:150 },
+      { blindId:'M01', displayName:'Gemini', modelId:'gemini-test', responses:10, avgLatencyMs:900, costKrw:12 },
+      { blindId:'M02', displayName:'EXAONE', modelId:'exaone-test', responses:10, avgLatencyMs:1500, costKrw:null },
     ],
-    metricRows:[{ metricKey:'accuracy', label:'정확성', scores:{ M01:0.8, M02:0.7 }, counts:{ M01:10, M02:10 } }],
-    purposeRows:[{ purpose:'선수 관계', scores:{ M01:0.8, M02:0.7 }, counts:{ M01:5, M02:5 } }],
-    prerequisiteRows:[{ metricKey:'prerequisite_relation_accuracy', label:'선수 관계 방향 정확성', scores:{ M01:0.75, M02:0.65 }, counts:{ M01:10, M02:10 } }],
-    questionRows:[{ questionId:'q1', publicId:'Q-1', questionText:'선수 개념을 적용하라.', purpose:'선수 관계', scores:{ M01:0.8, M02:0.7 } }],
-    distributions:[{ blindId:'M01', bins:[0,1,2,3,4] }, { blindId:'M02', bins:[1,2,3,3,1] }],
-  }} />);
+    scores:[
+      { blindId:'M01', questionId:'q1', questionPublicId:'Q-1', questionText:'선수 개념을 적용하라.', purpose:'선수 관계', metricKey:'accuracy', value:0.8 },
+      { blindId:'M01', questionId:'q1', questionPublicId:'Q-1', questionText:'선수 개념을 적용하라.', purpose:'선수 관계', metricKey:'prerequisite_relation_accuracy', value:0.75 },
+      { blindId:'M02', questionId:'q1', questionPublicId:'Q-1', questionText:'선수 개념을 적용하라.', purpose:'선수 관계', metricKey:'accuracy', value:0.7 },
+      { blindId:'M02', questionId:'q1', questionPublicId:'Q-1', questionText:'선수 개념을 적용하라.', purpose:'선수 관계', metricKey:'prerequisite_relation_accuracy', value:0.65 },
+      { blindId:'M01', questionId:'q2', questionPublicId:'Q-2', questionText:'새 상황에 적용하라.', purpose:'개념 적용', metricKey:'accuracy', value:0.2 },
+      { blindId:'M02', questionId:'q2', questionPublicId:'Q-2', questionText:'새 상황에 적용하라.', purpose:'개념 적용', metricKey:'accuracy', value:0.9 },
+    ],
+  });
+  const fetchMock = vi.fn(async (input: string) => ({
+    ok:true,
+    json:async () => ({
+      page:1,
+      pageSize:25,
+      total:input.includes('purpose=') ? 1 : 2,
+      rows:input.includes('purpose=') ? [{
+        questionId:'q2', publicId:'Q-2', questionText:'새 상황에 적용하라.',
+        purpose:'개념 적용', scores:{ M01:0.2, M02:0.9 },
+      }] : [{
+        questionId:'q1', publicId:'Q-1', questionText:'선수 개념을 적용하라.',
+        purpose:'선수 관계', scores:{ M01:0.8, M02:0.7 },
+      }],
+    }),
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+  render(<ResultAnalyticsDashboard analytics={analytics} runId="run-1" />);
   expect(screen.getByRole('heading', { name:'종합 성능 비교' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name:'평가 지표 레이더' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name:'선수관계 역량' })).toBeInTheDocument();
@@ -363,10 +434,80 @@ test('result analytics renders comprehensive charts and filters models', () => {
   expect(screen.getByRole('heading', { name:'문항별 히트맵' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name:'점수 분포' })).toBeInTheDocument();
   expect(screen.getByText('왼쪽 위에 가까울수록 빠르면서 종합점수가 높습니다.')).toBeInTheDocument();
+  expect(screen.getByText(/목적을 선택하면 실행 전체 통계가 아니라/)).toBeInTheDocument();
+  const purposeSelect = screen.getByLabelText('질문 목적');
+  expect(within(purposeSelect).getAllByRole('option').map((option) => option.textContent))
+    .toEqual(['전체 질문 목적', '개념 적용', '선수 관계']);
+  expect(screen.getAllByRole('checkbox', { name:/모델 표시/ }).map((input) => input.getAttribute('aria-label')))
+    .toEqual(['M01 모델 표시', 'M02 모델 표시']);
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    '/api/results/run-1/heatmap?page=1&pageSize=25',
+    expect.objectContaining({ cache:'no-store' }),
+  ));
+  expect(await screen.findByText('Q-1')).toBeInTheDocument();
+
+  fireEvent.change(purposeSelect, {
+    target:{ value:'개념 적용' },
+  });
+  expect(screen.getAllByTestId(/^ranking-/).map((row) => row.dataset.testid))
+    .toEqual(['ranking-M02', 'ranking-M01']);
+  expect(screen.getByTestId('ranking-M01')).toHaveTextContent('20.0%');
+  expect(await screen.findByText('Q-2')).toBeInTheDocument();
+  expect(screen.queryByText('Q-1')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('checkbox', { name:/모델 표시/ }).map((input) => input.getAttribute('aria-label')))
+    .toEqual(['M01 모델 표시', 'M02 모델 표시']);
+
   const exaone = screen.getByLabelText('M02 모델 표시');
   fireEvent.click(exaone);
   expect(exaone).not.toBeChecked();
   expect(screen.queryByTestId('ranking-M02')).not.toBeInTheDocument();
+});
+
+test('result analytics toggles 일반, RAG, and Pike independently or together', () => {
+  const analytics = buildResultAnalytics({
+    models:['NONE', 'VECTOR', 'PIKE'].map((retrievalMode) => ({
+      blindId:'M01',
+      retrievalMode:retrievalMode as 'NONE' | 'VECTOR' | 'PIKE',
+      displayName:'Gemini',
+      modelId:'gemini-test',
+      responses:1,
+      avgLatencyMs:100,
+      costKrw:1,
+    })),
+    scores:[
+      ['NONE', 0.2],
+      ['VECTOR', 0.6],
+      ['PIKE', 0.9],
+    ].map(([retrievalMode, value]) => ({
+      blindId:'M01',
+      retrievalMode:retrievalMode as 'NONE' | 'VECTOR' | 'PIKE',
+      questionId:'q1',
+      questionPublicId:'Q-1',
+      questionText:'질문',
+      purpose:'선수 관계',
+      metricKey:'accuracy',
+      value:value as number,
+    })),
+  });
+  render(<ResultAnalyticsDashboard analytics={analytics} />);
+
+  const normal = screen.getByRole('button', { name:'일반 결과 표시' });
+  const rag = screen.getByRole('button', { name:'RAG 결과 표시' });
+  const pike = screen.getByRole('button', { name:'Pike 결과 표시' });
+  expect(normal).toHaveAttribute('aria-pressed', 'true');
+  expect(rag).toHaveAttribute('aria-pressed', 'true');
+  expect(pike).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getAllByTestId(/^ranking-/)).toHaveLength(3);
+
+  fireEvent.click(rag);
+  expect(rag).toHaveAttribute('aria-pressed', 'false');
+  expect(screen.getAllByTestId(/^ranking-/)).toHaveLength(2);
+  expect(screen.queryByTestId('ranking-M01-VECTOR')).not.toBeInTheDocument();
+
+  fireEvent.click(normal);
+  expect(screen.getAllByTestId(/^ranking-/)).toHaveLength(1);
+  expect(screen.getByTestId('ranking-M01-PIKE')).toHaveTextContent('90.0%');
 });
 
 test('source workspace opens live expandable logs and exposes cancellation', async () => {
@@ -390,7 +531,7 @@ test('source workspace opens live expandable logs and exposes cancellation', asy
   expect(await screen.findByRole('complementary', { name: '교과서 처리 기록' })).toBeInTheDocument();
   expect(await screen.findByText('Upstage Document Parse 시작')).toBeInTheDocument();
   fireEvent.click(screen.getByText('Upstage Document Parse 시작'));
-  expect(screen.getByText(/"provider": "upstage"/)).toBeInTheDocument();
+  expect(await screen.findByText(/"provider": "upstage"/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '작업 중단' }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/sources/source-12345678/cancel', { method: 'POST' }));
 });
@@ -412,14 +553,22 @@ test('source activity exposes the immutable document and embedding execution pro
           profileId: '11111111-1111-4111-8111-111111111111',
           contentHash: 'a'.repeat(64),
           provenance: 'AT_CREATION_VERIFIED',
-          definition: { kind: 'document_parse', version: 'document-parse-v1' },
+          definition: {
+            kind: 'document_parse',
+            version: 'document-parse-v1',
+            rawMarker: 'DOCUMENT-PROFILE-RAW',
+          },
         },
         embeddingRag: {
           kind: 'embedding_rag',
           profileId: '22222222-2222-4222-8222-222222222222',
           contentHash: 'b'.repeat(64),
           provenance: 'AT_CREATION_VERIFIED',
-          definition: { kind: 'embedding_rag', version: 'embedding-rag-v1' },
+          definition: {
+            kind: 'embedding_rag',
+            version: 'embedding-rag-v1',
+            rawMarker: 'EMBEDDING-PROFILE-RAW',
+          },
         },
       },
     }) };
@@ -437,6 +586,14 @@ test('source activity exposes the immutable document and embedding execution pro
   expect(within(audit).getByText('11111111-1111-4111-8111-111111111111')).toBeInTheDocument();
   expect(within(audit).getByText('a'.repeat(64))).toBeInTheDocument();
   expect(within(audit).getAllByText('AT_CREATION_VERIFIED')).toHaveLength(2);
+  expect(within(audit).queryByText(/DOCUMENT-PROFILE-RAW/)).not.toBeInTheDocument();
+  expect(within(audit).queryByText(/EMBEDDING-PROFILE-RAW/)).not.toBeInTheDocument();
+  const profileSnapshots = within(audit).getAllByText('고정 설정 스냅샷');
+  fireEvent.click(profileSnapshots[0]!);
+  expect(await within(audit).findByText(/DOCUMENT-PROFILE-RAW/)).toBeInTheDocument();
+  expect(within(audit).queryByText(/EMBEDDING-PROFILE-RAW/)).not.toBeInTheDocument();
+  fireEvent.click(profileSnapshots[1]!);
+  expect(await within(audit).findByText(/EMBEDDING-PROFILE-RAW/)).toBeInTheDocument();
 });
 
 test('question generation exposes source scope and observable generation stages', () => {
@@ -589,24 +746,38 @@ test('question generation lazily loads full retrieval and provider audit with pa
   itemDetails.open = true;
   fireEvent(itemDetails, new Event('toggle'));
 
+  expect(await screen.findByText('검색 감사 상세')).toBeInTheDocument();
+  expect(screen.queryByText('운동과 에너지')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('검색 감사 상세'));
   expect(await screen.findByText('운동과 에너지')).toBeInTheDocument();
   expect(screen.getByText('p.12')).toBeInTheDocument();
   expect(screen.getByText('chunk-hidden-123')).toBeInTheDocument();
   expect(screen.getByText('실제 방향성 프롬프트')).toBeInTheDocument();
-  expect(screen.getByText('선수관계 방향을 설계하라.')).toBeInTheDocument();
+  expect(screen.queryByText('선수관계 방향을 설계하라.')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('실제 방향성 프롬프트'));
+  expect(await screen.findByText('선수관계 방향을 설계하라.')).toBeInTheDocument();
   expect(screen.getByText('1번 문항 검색 방향을 JSON으로 반환하라.')).toBeInTheDocument();
   expect(screen.getByText('{"searchQuery":"속력과 가속도"}')).toBeInTheDocument();
   expect(screen.getByText('Provider 원시 응답')).toBeInTheDocument();
   expect(fetchMock).toHaveBeenCalledWith(
     `/api/generation/${batchId}/items/item-1/audit?limit=20&offset=0`,
-    { cache:'no-store' },
+    expect.objectContaining({
+      cache:'no-store',
+      signal:expect.any(AbortSignal),
+    }),
   );
 
   fireEvent.click(screen.getByRole('button', { name:'모델 호출 더 보기' }));
+  const questionInvocation = await screen.findByText('실제 질문 생성 프롬프트');
+  expect(screen.queryByText('실제 문항을 생성하라.')).not.toBeInTheDocument();
+  fireEvent.click(questionInvocation);
   expect(await screen.findByText('실제 문항을 생성하라.')).toBeInTheDocument();
   expect(fetchMock).toHaveBeenCalledWith(
     `/api/generation/${batchId}/items/item-1/audit?limit=20&offset=20`,
-    { cache:'no-store' },
+    expect.objectContaining({
+      cache:'no-store',
+      signal:expect.any(AbortSignal),
+    }),
   );
 });
 
@@ -689,6 +860,9 @@ test('question generation ignores an old audit response after switching A to B a
   const currentItem = screen.getByText('1번 문항', { selector:'strong' }).closest('details')!;
   currentItem.open = true;
   fireEvent(currentItem, new Event('toggle'));
+  const freshInvocation = await screen.findByText('실제 방향성 프롬프트');
+  expect(screen.queryByText('FRESH_A_PROMPT')).not.toBeInTheDocument();
+  fireEvent.click(freshInvocation);
   expect(await screen.findByText('FRESH_A_PROMPT')).toBeInTheDocument();
 
   resolveOldAudit({ ok:true, json:async () => auditPage('STALE_A_PROMPT') });
@@ -698,7 +872,7 @@ test('question generation ignores an old audit response after switching A to B a
   expect(screen.getByText('FRESH_A_PROMPT')).toBeInTheDocument();
 });
 
-test('question generation selects every textbook unit and submits parallel mode', async () => {
+test('question generation selects only mapped textbook units and submits parallel mode', async () => {
   const sourceId = '11111111-1111-4111-8111-111111111111';
   const tocIds = ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'];
   const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -709,14 +883,22 @@ test('question generation selects every textbook unit and submits parallel mode'
   render(<GenerationWorkspace sources={[{
     id: sourceId, original_name: 'science.pdf', subject: '과학', grade: '중학교 2학년',
     tocEntries: [
-      { id: tocIds[0]!, source_file_id: sourceId, title: '물질의 구성', level: 1, printed_page: 12 },
-      { id: tocIds[1]!, source_file_id: sourceId, title: '전기와 자기', level: 1, printed_page: 44 },
+      {
+        id: tocIds[0]!, source_file_id: sourceId, title: '물질의 구성', level: 1, printed_page: 12,
+        mapping_status: 'MAPPED', mapped_chunk_count: 18, mapping_confidence: 0.95,
+      },
+      {
+        id: tocIds[1]!, source_file_id: sourceId, title: '전기와 자기', level: 1, printed_page: 44,
+        mapping_status: 'UNMAPPED', mapped_chunk_count: 0, mapping_confidence: null,
+      },
     ],
   }]} batches={[]} />);
 
   fireEvent.click(screen.getByLabelText('science.pdf 전체 단원 선택'));
   expect(screen.getByLabelText('물질의 구성')).toBeChecked();
-  expect(screen.getByLabelText('전기와 자기')).toBeChecked();
+  expect(screen.getByLabelText('전기와 자기')).toBeDisabled();
+  expect(screen.getByLabelText('전기와 자기')).not.toBeChecked();
+  expect(screen.getByText('매핑 없음')).toBeInTheDocument();
   expect(screen.getByLabelText('교과서 science.pdf')).toBeChecked();
   expect(screen.getByLabelText('생성 방식')).toHaveValue('parallel');
   fireEvent.click(screen.getByRole('button', { name: '문항 생성 시작' }));
@@ -724,7 +906,7 @@ test('question generation selects every textbook unit and submits parallel mode'
   await waitFor(() => expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true));
   const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')!;
   const body = JSON.parse(String(post[1]?.body));
-  expect(body).toMatchObject({ sourceFileIds: [sourceId], tocEntryIds: tocIds, executionMode: 'parallel' });
+  expect(body).toMatchObject({ sourceFileIds: [sourceId], tocEntryIds: [tocIds[0]], executionMode: 'parallel' });
 });
 
 test('question generation exposes durable item errors and resumes only unfinished work', async () => {

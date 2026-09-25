@@ -10,7 +10,7 @@ import {
   isCurrentScoringEngineSnapshot,
   scoringEngineReplacementRequiredMessage,
 } from '@/domain/scoring-engine';
-import { exactMatch, judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, requiredMetricsForQuestion, selectJudgeScore, tokenCost } from "@/domain/scoring";
+import { judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, requiredMetricsForQuestion, selectJudgeScore, tokenCost } from "@/domain/scoring";
 import { db } from "@/server/db/pool";
 import { withTransaction } from "@/server/db/transaction";
 import { createProviderForModel } from "@/server/providers/registry";
@@ -20,6 +20,12 @@ import type {
   NormalizedGeneration,
 } from '@/server/providers/types';
 import { ProviderError } from '@/server/providers/types';
+import {
+  ActiveBenchmarkProviderCooldownError,
+  findActiveBenchmarkProviderCooldown,
+  markExpiredProviderCooldownsResumedForRun,
+  registerBenchmarkProviderRateLimitWithClient,
+} from '@/server/runs/provider-cooldown';
 import {
   commitJudgeParse,
   commitJudgeResponse,
@@ -100,6 +106,7 @@ function judgeFailureDetails(
 
 const defaultJudgeTimeoutMs = 180_000;
 const scoringControlPollMs = 200;
+const maxJudgeResponseAttempts = 3;
 
 function judgeTimeoutMs(): number {
   const configured = Number(process.env.JUDGE_TIMEOUT_MS ?? defaultJudgeTimeoutMs);
@@ -345,6 +352,24 @@ async function executeJudgeInvocation(input: {
     );
   }
   if (reservation.nextAction === 'CALL_PROVIDER') {
+    const activeCooldown = await findActiveBenchmarkProviderCooldown(
+      input.judge.key,
+    );
+    if (activeCooldown) {
+      const cooldownError =
+        new ActiveBenchmarkProviderCooldownError(activeCooldown);
+      try {
+        await failJudgeInvocationAndRecordRun({
+          invocationId:invocation.id,
+          errorCode:'RATE_LIMIT',
+          errorMessage:cooldownError.message,
+          errorStage:'REQUEST',
+        });
+      } catch {
+        // Preserve the active provider cooldown as the actionable outcome.
+      }
+      throw cooldownError;
+    }
     let response: NormalizedGeneration;
     try {
       response = await generateJudgeWithTimeout({
@@ -354,7 +379,10 @@ async function executeJudgeInvocation(input: {
         timeoutMs:request.requestTimeoutMs,
       });
     } catch (error) {
-      const failure = judgeFailureDetails(error, 'JUDGE_PROVIDER_FAILED');
+      const failure =
+        error instanceof ProviderError && error.kind === 'RATE_LIMIT'
+          ? { code:'RATE_LIMIT', message:error.message }
+          : judgeFailureDetails(error, 'JUDGE_PROVIDER_FAILED');
       try {
         await failJudgeInvocationAndRecordRun({
           invocationId:invocation.id,
@@ -515,6 +543,164 @@ async function persistedFallbackParents(input: {
   return result;
 }
 
+async function terminalJudgeMetricKeys(input: {
+  runId:string;
+  responseId:string;
+  scoreProfileId:string;
+  scoringEngineVersionId:string;
+}): Promise<Set<string>> {
+  const terminal = await db.query<{ metric_key:string }>(
+    `with latest as (
+       select distinct on (invocation.logical_key)
+         invocation.logical_key,
+         invocation.state,
+         invocation.error_code,
+         invocation.requested_metric_keys
+       from judge_invocations invocation
+       where invocation.benchmark_run_id=$1
+         and invocation.model_response_id=$2
+         and invocation.score_profile_id=$3
+         and invocation.scoring_engine_version_id=$4
+       order by invocation.logical_key,invocation.attempt desc
+     ),
+     chargeable_failures as (
+       select invocation.logical_key,count(*)::int attempts
+       from judge_invocations invocation
+       where invocation.benchmark_run_id=$1
+         and invocation.model_response_id=$2
+         and invocation.score_profile_id=$3
+         and invocation.scoring_engine_version_id=$4
+         and invocation.state='FAILED'
+         and invocation.error_code <> 'RATE_LIMIT'
+       group by invocation.logical_key
+     )
+     select distinct unnest(latest.requested_metric_keys) metric_key
+       from latest
+       join chargeable_failures
+         on chargeable_failures.logical_key=latest.logical_key
+      where latest.state='FAILED'
+        and latest.error_code <> 'RATE_LIMIT'
+        and chargeable_failures.attempts >= $5`,
+    [
+      input.runId,
+      input.responseId,
+      input.scoreProfileId,
+      input.scoringEngineVersionId,
+      maxJudgeResponseAttempts,
+    ],
+  );
+  return new Set(terminal.rows.map((row) => row.metric_key));
+}
+
+async function recordJudgeResponseFailure(input: {
+  runId:string;
+  responseId:string;
+  scoreProfileId:string;
+  scoringEngineVersionId:string;
+}): Promise<{ terminalMetricKeys: Set<string> } | null> {
+  const failed = await db.query<{
+    id:string;
+    attempt:number;
+    failure_attempt:number;
+    requested_metric_keys:string[];
+    error_code:string | null;
+  }>(
+    `select invocation.id,invocation.attempt,
+       invocation.requested_metric_keys,invocation.error_code,
+       (
+         select count(*)::int
+         from judge_invocations failure
+         where failure.benchmark_run_id=invocation.benchmark_run_id
+           and failure.model_response_id=invocation.model_response_id
+           and failure.score_profile_id=invocation.score_profile_id
+           and failure.scoring_engine_version_id=invocation.scoring_engine_version_id
+           and failure.logical_key=invocation.logical_key
+           and failure.state='FAILED'
+           and failure.error_code <> 'RATE_LIMIT'
+       ) failure_attempt
+       from judge_invocations invocation
+      where invocation.benchmark_run_id=$1
+        and invocation.model_response_id=$2
+        and invocation.score_profile_id=$3
+        and invocation.scoring_engine_version_id=$4
+        and invocation.state='FAILED'
+      order by invocation.failed_at desc,invocation.id desc
+      limit 1`,
+    [
+      input.runId,
+      input.responseId,
+      input.scoreProfileId,
+      input.scoringEngineVersionId,
+    ],
+  );
+  const invocation = failed.rows[0];
+  if (!invocation) return null;
+
+  const terminal =
+    invocation.failure_attempt >= maxJudgeResponseAttempts;
+  const retryDelayMs = terminal
+    ? null
+    : Math.min(
+      2_000 * (2 ** (Math.max(invocation.failure_attempt, 1) - 1)),
+      30_000,
+    );
+  const retryAt = retryDelayMs === null
+    ? null
+    : new Date(Date.now() + retryDelayMs).toISOString();
+  const eventType = terminal
+    ? 'RUN_SCORE_RESPONSE_TERMINAL_FAILED'
+    : 'RUN_SCORE_RESPONSE_RETRY_SCHEDULED';
+  await withTransaction(async (client) => {
+    const run = await client.query<{ state:string }>(
+      'select state from benchmark_runs where id=$1 for update',
+      [input.runId],
+    );
+    if (run.rows[0]?.state !== 'SCORING') return;
+    if (!terminal) {
+      await client.query(
+        `update benchmark_runs
+            set last_scoring_error=$2::jsonb,updated_at=now()
+          where id=$1`,
+        [input.runId, JSON.stringify({
+          code:invocation.error_code ?? 'JUDGE_RESPONSE_FAILED',
+          attempts:0,
+          retryable:true,
+          retryDelayMs,
+          retryAt,
+          modelResponseId:input.responseId,
+          judgeInvocationId:invocation.id,
+          at:new Date().toISOString(),
+        })],
+      );
+    }
+    await client.query(
+      `insert into job_events(aggregate_type,aggregate_id,event_type,payload)
+       select 'benchmark_run',$1,$2,$3::jsonb
+       where not exists(
+         select 1 from job_events
+          where aggregate_type='benchmark_run'
+            and aggregate_id=$1
+            and event_type=$2
+            and payload->>'judgeInvocationId'=$4
+       )`,
+      [input.runId, eventType, JSON.stringify({
+        modelResponseId:input.responseId,
+        judgeInvocationId:invocation.id,
+        attempt:invocation.failure_attempt,
+        invocationAttempt:invocation.attempt,
+        metricKeys:invocation.requested_metric_keys,
+        code:invocation.error_code ?? 'JUDGE_RESPONSE_FAILED',
+        ...(terminal ? {} : { retryDelayMs, retryAt }),
+      }), invocation.id],
+    );
+  });
+  return {
+    terminalMetricKeys:terminal
+      ? new Set(invocation.requested_metric_keys)
+      : new Set(),
+  };
+}
+
 async function scoreClaimedRun(
   runId: string,
   signal?: AbortSignal,
@@ -535,11 +721,8 @@ async function scoreClaimedRun(
     join questions q on q.id=ri.question_id join question_revisions qr on qr.question_id=ri.question_id and qr.revision=ri.question_revision where br.id=$1`,
     [runId],
   );
-  const expectedScorePairs = rows.rows.reduce((total, row) => {
-    const profileMetrics = Array.isArray(row.metrics) ? row.metrics.map(String) : [];
-    return total + requiredMetricsForQuestion(profileMetrics, row.quality_scores).length;
-  }, 0);
   let scoredResponses = 0;
+  let retryScheduled = false;
   for (const row of rows.rows) {
     throwIfAborted(signal);
     const profileMetrics = Array.isArray(row.metrics)
@@ -561,25 +744,6 @@ async function scoreClaimedRun(
       : [];
     accepted.push(row.answer_text);
     await withTransaction(async (client) => {
-      if (missing.has("exact_match")) {
-        const value = exactMatch(row.response_text, accepted);
-        await client.query(
-          `insert into scores(
-             model_response_id,score_profile_id,metric_key,value,label,
-             rationale,provenance
-           ) values(
-             $1,$2,'exact_match',$3,$4,
-             '정규화된 응답을 승인 답안 및 모범 답안과 완전 일치 비교',
-             'DETERMINISTIC_ENGINE_VERIFIED'
-           ) on conflict do nothing`,
-          [
-            row.response_id,
-            row.score_profile_id,
-            value,
-            value ? "MATCH" : "NO_MATCH",
-          ],
-        );
-      }
       if (missing.has("response_present")) {
         const value =
           normalizeKoreanAnswer(row.response_text).length > 0 ? 1 : 0;
@@ -600,10 +764,18 @@ async function scoreClaimedRun(
         );
       }
     });
+    let terminalMetrics = await terminalJudgeMetricKeys({
+      runId,
+      responseId:row.response_id,
+      scoreProfileId:row.score_profile_id,
+      scoringEngineVersionId:row.scoring_engine_version_id,
+    });
+    let responseRetryScheduled = false;
     const judgeMetrics = required.filter(
       (metric) =>
         missing.has(metric) &&
-        !["exact_match", "response_present"].includes(metric),
+        metric !== "response_present" &&
+        !terminalMetrics.has(metric),
     );
     if (judgeMetrics.length) {
       if (!row.judge_provider || !row.judge_model)
@@ -615,38 +787,14 @@ async function scoreClaimedRun(
         throw new Error(
           `SCORING_JUDGE_NOT_CONFIGURED: ${row.judge_provider} 환경변수가 필요합니다.`,
         );
-      const priorParents = await persistedFallbackParents({
-        responseId:row.response_id,
-        scoreProfileId:row.score_profile_id,
-        scoringEngineVersionId:row.scoring_engine_version_id,
-        metrics:judgeMetrics,
-      });
-      for (const [metric, parentInvocationId] of priorParents) {
-        await executeJudgeInvocation({
-          runId,
-          row,
-          judge,
-          acceptedAnswers:accepted,
-          metrics:[metric],
-          invocationKind:'FALLBACK',
-          parentInvocationId,
-          signal,
+      try {
+        const priorParents = await persistedFallbackParents({
+          responseId:row.response_id,
+          scoreProfileId:row.score_profile_id,
+          scoringEngineVersionId:row.scoring_engine_version_id,
+          metrics:judgeMetrics,
         });
-      }
-      const primaryMetrics = judgeMetrics.filter(
-        (metric) => !priorParents.has(metric),
-      );
-      for (const metrics of judgeMetricBatches(primaryMetrics)) {
-        const primary = await executeJudgeInvocation({
-          runId,
-          row,
-          judge,
-          acceptedAnswers:accepted,
-          metrics,
-          invocationKind:'PRIMARY',
-          signal,
-        });
-        for (const metric of primary.missingMetricKeys) {
+        for (const [metric, parentInvocationId] of priorParents) {
           await executeJudgeInvocation({
             runId,
             row,
@@ -654,10 +802,55 @@ async function scoreClaimedRun(
             acceptedAnswers:accepted,
             metrics:[metric],
             invocationKind:'FALLBACK',
-            parentInvocationId:primary.id,
+            parentInvocationId,
             signal,
           });
         }
+        const primaryMetrics = judgeMetrics.filter(
+          (metric) => !priorParents.has(metric),
+        );
+        for (const metrics of judgeMetricBatches(primaryMetrics)) {
+          const primary = await executeJudgeInvocation({
+            runId,
+            row,
+            judge,
+            acceptedAnswers:accepted,
+            metrics,
+            invocationKind:'PRIMARY',
+            signal,
+          });
+          for (const metric of primary.missingMetricKeys) {
+            await executeJudgeInvocation({
+              runId,
+              row,
+              judge,
+              acceptedAnswers:accepted,
+              metrics:[metric],
+              invocationKind:'FALLBACK',
+              parentInvocationId:primary.id,
+              signal,
+            });
+          }
+        }
+      } catch (error) {
+        throwIfAborted(signal);
+        if (
+          error instanceof ActiveBenchmarkProviderCooldownError
+          || (error instanceof ProviderError && error.kind === 'RATE_LIMIT')
+        ) throw error;
+        const recorded = await recordJudgeResponseFailure({
+          runId,
+          responseId:row.response_id,
+          scoreProfileId:row.score_profile_id,
+          scoringEngineVersionId:row.scoring_engine_version_id,
+        });
+        if (!recorded) throw error;
+        terminalMetrics = new Set([
+          ...terminalMetrics,
+          ...recorded.terminalMetricKeys,
+        ]);
+        responseRetryScheduled = recorded.terminalMetricKeys.size === 0;
+        retryScheduled ||= responseRetryScheduled;
       }
     }
     const price = await db.query<{
@@ -692,6 +885,7 @@ async function scoreClaimedRun(
         ],
       );
     }
+    if (responseRetryScheduled) continue;
     await withTransaction(async (client) => {
       const scoreSet = await client.query<{ metric_key:string }>(
         `select metric_key
@@ -700,41 +894,65 @@ async function scoreClaimedRun(
         [row.response_id, row.score_profile_id],
       );
       const stored = new Set(scoreSet.rows.map((score) => score.metric_key));
-      if (!required.every((metric) => stored.has(metric))) {
+      const incompleteMetrics = required.filter(
+        (metric) => !stored.has(metric) && !terminalMetrics.has(metric),
+      );
+      if (incompleteMetrics.length > 0) {
         throw new DomainError(
           'SCORING_INCOMPLETE',
           '응답의 필수 채점 지표가 모두 저장되지 않았습니다.',
           { modelResponseId:row.response_id },
         );
       }
-      await client.query(
-        `insert into job_events(
-           aggregate_type,aggregate_id,event_type,payload
-         )
-         select 'benchmark_run',$1,'RUN_SCORE_UPDATED',$2::jsonb
-         where not exists (
-           select 1 from job_events
-           where aggregate_type='benchmark_run'
-             and aggregate_id=$1
-             and event_type='RUN_SCORE_UPDATED'
-             and payload->>'modelResponseId'=$3
-             and payload->>'responseComplete'='true'
-         )`,
-        [
-          runId,
-          JSON.stringify({
-            modelResponseId:row.response_id,
-            responseComplete:true,
-            metricKeys:required,
-            scoreCount:required.length,
-          }),
-          row.response_id,
-        ],
-      );
+      const responseComplete = required.every((metric) => stored.has(metric));
+      if (responseComplete) {
+        await client.query(
+          `insert into job_events(
+             aggregate_type,aggregate_id,event_type,payload
+           )
+           select 'benchmark_run',$1,'RUN_SCORE_UPDATED',$2::jsonb
+           where not exists (
+             select 1 from job_events
+             where aggregate_type='benchmark_run'
+               and aggregate_id=$1
+               and event_type='RUN_SCORE_UPDATED'
+               and payload->>'modelResponseId'=$3
+               and payload->>'responseComplete'='true'
+           )`,
+          [
+            runId,
+            JSON.stringify({
+              modelResponseId:row.response_id,
+              responseComplete:true,
+              metricKeys:required,
+              scoreCount:scoreSet.rows.length,
+            }),
+            row.response_id,
+          ],
+        );
+      }
     });
-    scoredResponses += 1;
+    if (required.every((metric) => !terminalMetrics.has(metric))) {
+      scoredResponses += 1;
+    }
   }
   throwIfAborted(signal);
+  if (retryScheduled) return { scoredResponses };
+  const terminalMetricsByResponse = new Map<string, Set<string>>();
+  for (const row of rows.rows) {
+    terminalMetricsByResponse.set(row.response_id, await terminalJudgeMetricKeys({
+      runId,
+      responseId:row.response_id,
+      scoreProfileId:row.score_profile_id,
+      scoringEngineVersionId:row.scoring_engine_version_id,
+    }));
+  }
+  const expectedScorePairs = rows.rows.reduce((total, row) => {
+    const profileMetrics = Array.isArray(row.metrics) ? row.metrics.map(String) : [];
+    const required = requiredMetricsForQuestion(profileMetrics, row.quality_scores);
+    const terminalMetrics = terminalMetricsByResponse.get(row.response_id) ?? new Set();
+    return total + required.filter((metric) => !terminalMetrics.has(metric)).length;
+  }, 0);
   await withTransaction(async (client) => {
     const locked = await client.query<{
       state: string;
@@ -747,7 +965,9 @@ async function scoreClaimedRun(
         from scores s
         join eligible_model_responses mr on mr.id=s.model_response_id
         join run_items ri on ri.id=mr.run_item_id
-        where ri.benchmark_run_id=br.id and s.score_profile_id=br.score_profile_id)::text score_pairs
+        where ri.benchmark_run_id=br.id
+          and s.score_profile_id=br.score_profile_id
+          and s.metric_key <> 'exact_match')::text score_pairs
        from benchmark_runs br where br.id=$1 for update of br`,
       [runId],
     );
@@ -837,6 +1057,20 @@ export async function scoreRun(
     if (run.rows[0]?.state !== 'SCORING') {
       return { scoredResponses:0, claimed:false };
     }
+    await withTransaction(async (client) => {
+      await markExpiredProviderCooldownsResumedForRun(client, runId);
+    });
+    const judgeProvider =
+      run.rows[0].score_profile_snapshot?.judgeProvider ?? null;
+    if (
+      judgeProvider
+      && await findActiveBenchmarkProviderCooldown(
+        judgeProvider,
+        lockClient,
+      )
+    ) {
+      return { scoredResponses:0, claimed:false };
+    }
     const control = startScoringControlMonitor(runId);
     try {
       const signal = parentSignal
@@ -845,12 +1079,24 @@ export async function scoreRun(
       const result = await scoreClaimedRun(runId, signal);
       return { ...result, claimed:true };
     } catch (error) {
+      if (error instanceof ActiveBenchmarkProviderCooldownError) {
+        return { scoredResponses:0, claimed:false };
+      }
+      const rateLimited =
+        error instanceof ProviderError
+        && error.kind === 'RATE_LIMIT';
+      if (rateLimited) {
+        await recordScoringFailure(runId, error);
+      }
       if (parentSignal?.aborted) {
         return { scoredResponses:0, claimed:true };
       }
       if (
-        !(error instanceof DomainError)
-        || error.code !== 'RUN_SCORING_CONTROL_REQUESTED'
+        !rateLimited
+        && (
+          !(error instanceof DomainError)
+          || error.code !== 'RUN_SCORING_CONTROL_REQUESTED'
+        )
       ) {
         await recordScoringFailure(runId, error);
       }
@@ -935,13 +1181,72 @@ export async function recordScoringFailure(runId: string, error: unknown): Promi
   const message = (error instanceof Error ? error.message : '알 수 없는 채점 오류').slice(0, 1000);
   const code = judgeFailureDetails(error, 'SCORING_FAILED').code;
   return withTransaction(async (client) => {
-    const locked = await client.query<{ state: string; last_scoring_error: { attempts?: number } | null }>(
-      'select state,last_scoring_error from benchmark_runs where id=$1 for update', [runId],
+    const locked = await client.query<{
+      state:string;
+      last_scoring_error:{ attempts?:number } | null;
+      score_profile_snapshot:{
+        judgeProvider?:string | null;
+        judgeModel?:string | null;
+      };
+    }>(
+      `select state,last_scoring_error,score_profile_snapshot
+         from benchmark_runs where id=$1 for update`,
+      [runId],
     );
     if (!locked.rows[0]) throw new DomainError('RUN_NOT_FOUND', '실행을 찾을 수 없습니다.');
     const previous = Number(locked.rows[0]?.last_scoring_error?.attempts ?? 0);
+    const rateLimited =
+      error instanceof ProviderError
+      && error.kind === 'RATE_LIMIT';
+    const judgeProvider =
+      locked.rows[0].score_profile_snapshot?.judgeProvider ?? null;
+    const judgeModel =
+      locked.rows[0].score_profile_snapshot?.judgeModel ?? null;
+    const cooldown = rateLimited && judgeProvider
+      ? await registerBenchmarkProviderRateLimitWithClient(client, {
+        providerKey:judgeProvider,
+        error,
+        sourceRunId:runId,
+        sourcePhase:'SCORING_JUDGE',
+        sourceModelId:judgeModel,
+      })
+      : null;
     if (locked.rows[0].state !== 'SCORING') {
       return { attempts:previous, state:locked.rows[0].state };
+    }
+    if (cooldown) {
+      const failure = {
+        code:'RATE_LIMIT',
+        message,
+        attempts:previous,
+        retryable:true,
+        retryDelayMs:cooldown.retryAfterMs,
+        retryAt:cooldown.blockedUntil.toISOString(),
+        rateLimitDimension:cooldown.rateLimitDimension,
+        rateLimitScope:cooldown.rateLimitScope,
+        affectedScope:'PROVIDER_GLOBAL',
+        providerKey:cooldown.providerKey,
+        requestId:cooldown.requestId,
+        automaticResume:true,
+        at:new Date().toISOString(),
+      };
+      await client.query(
+        `update benchmark_runs set
+           state='SCORING',
+           last_scoring_error=$2::jsonb,
+           updated_at=now()
+         where id=$1`,
+        [runId, JSON.stringify(failure)],
+      );
+      await client.query(
+        `insert into job_events(
+           aggregate_type,aggregate_id,event_type,payload
+         ) values(
+           'benchmark_run',$1,'RUN_SCORING_RATE_LIMITED',$2::jsonb
+         )`,
+        [runId, JSON.stringify({ ...failure, state:'SCORING' })],
+      );
+      return { attempts:previous, state:'SCORING' };
     }
     const attempts = previous + 1;
     const state = attempts >= 3 ? 'FAILED' : 'SCORING';

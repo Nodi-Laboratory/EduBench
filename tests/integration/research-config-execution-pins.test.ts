@@ -210,7 +210,7 @@ test('new execution records pin the active full definitions and chunks inherit t
   );
   expect(resolvedRun.definition.settings.models.map(
     (model) => model.providerKey,
-  )).toEqual(['gemini', 'upstage', 'exaone']);
+  )).toEqual(['gemini', 'upstage', 'exaone', 'openai']);
 
   expect(() => verifyResearchConfigPin('document_parse', {
     ...resolvedSource.documentParse,

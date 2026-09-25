@@ -10,6 +10,7 @@ export const dynamic = 'force-dynamic';
 const providerEnv: Record<string, string[]> = {
   exaone:['EXAONE_API_KEY', 'EXAONE_BASE_URL'],
   gemini:['GOOGLE_API_KEY'],
+  openai:['OPENAI_API_KEY', 'OPENAI_MODEL'],
   upstage:['UPSTAGE_API_KEY'],
 };
 
@@ -31,10 +32,11 @@ export default async function RunsPage() {
        where status = 'PUBLISHED'
        order by published_at desc`,
     ),
-    db.query<{ id:string; version:string; title:string; provenance_unresolved:boolean }>(
+    db.query<{ id:string; version:string; title:string; provenance_unresolved:boolean; retired_metric:boolean }>(
       `select id,version,title,
          not score_profile_definition_usable(metrics,judge_provider,judge_model)
-           provenance_unresolved
+           provenance_unresolved,
+         metrics @> '["exact_match"]'::jsonb retired_metric
        from score_profiles
        order by created_at desc`,
     ),

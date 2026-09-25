@@ -3,13 +3,19 @@ import { afterAll, beforeAll, expect, test, vi } from 'vitest';
 import { db } from '@/server/db/pool';
 import { migrate } from '@/server/db/migrate';
 import { withTransaction } from '@/server/db/transaction';
-import { generateQuestions } from '@/server/questions/generator';
+import {
+  GenerationProviderRateLimitError,
+  generateQuestions,
+} from '@/server/questions/generator';
+import { ProviderError } from '@/server/providers/types';
+import { ActiveBenchmarkProviderCooldownError } from '@/server/runs/provider-cooldown';
 import { backfillMissingSourceTocEntries, replaceSourceTocEntries } from '@/server/sources/toc';
 import { GET as getGenerationActivity } from '@/app/api/generation/[id]/activity/route';
 import { GET as getGenerationItemAudit } from '@/app/api/generation/[id]/items/[itemId]/audit/route';
 import { beginGenerationProviderInvocation } from '@/server/questions/provider-invocations';
 import {
   claimJobs,
+  deferJobForProviderCooldown,
   enqueueJob,
   failJob,
   recoverExpiredLeases,
@@ -101,6 +107,7 @@ afterAll(async () => {
     await db.query(`delete from question_evidence where question_id in (select id from questions where generation_batch_id=$1)`, [batchId]);
     await db.query(`delete from question_revisions where question_id in (select id from questions where generation_batch_id=$1)`, [batchId]);
     await db.query(`delete from questions where generation_batch_id=$1`, [batchId]);
+    await db.query(`delete from generation_provider_invocations where generation_batch_id=$1`, [batchId]);
     await db.query(`delete from generation_retrievals where generation_batch_id=$1`, [batchId]);
     await db.query(`delete from generation_items where generation_batch_id=$1`, [batchId]);
     await db.query(`delete from job_events where job_id in (select id from jobs where kind='question.generate' and payload->>'batchId'=$1)`, [batchId]);
@@ -142,7 +149,7 @@ test('runs direction, retrieval, and generation independently for every question
   await db.query(
     `insert into generation_batches(id,requested_count,conditions,source_scope,generation_model,prompt_version)
      values($1,2,$2::jsonb,$3::jsonb,'mock-gemini','test')`,
-    [batchId, JSON.stringify({ subject: '과학', grade: '고등학교 1학년', units: ['역학'], purpose: '개념 적용·문제풀이', questionType: '구조화 서술형', difficulty: '상', direction: '선수관계를 측정', chunkCount: 2, executionMode: 'parallel' }), JSON.stringify({ sourceFileIds: [sourceId] })],
+    [batchId, JSON.stringify({ subject: '과학', grade: '고등학교 1학년', units: ['역학', '전기'], purpose: '개념 적용·문제풀이', questionType: '구조화 서술형', difficulty: '상', direction: '선수관계를 측정', chunkCount: 2, executionMode: 'parallel', crossUnit:true }), JSON.stringify({ sourceFileIds: [sourceId] })],
   );
 
   const lease = await claimGenerationLease(batchId, `worker-${batchId}`);
@@ -156,6 +163,19 @@ test('runs direction, retrieval, and generation independently for every question
   expect(retrievals.rows.map((row) => row.candidate_scope.ordinal)).toEqual([1, 2]);
   expect(new Set(retrievals.rows.map((row) => row.query_text)).size).toBe(2);
   expect(retrievals.rows.every((row) => row.query_text === row.candidate_scope.questionDirection.searchQuery)).toBe(true);
+
+  const generatedUnits = await db.query<{ ordinal:number; unit:string | null }>(
+    `select item.ordinal,question.unit
+       from questions question
+       join generation_items item on item.id=question.generation_item_id
+      where question.generation_batch_id=$1
+      order by item.ordinal`,
+    [batchId],
+  );
+  expect(generatedUnits.rows).toEqual([
+    { ordinal:1, unit:'역학 / 전기' },
+    { ordinal:2, unit:'전기 / 역학' },
+  ]);
 
   const events = await db.query<{
     event_type: string;
@@ -184,6 +204,75 @@ test('runs direction, retrieval, and generation independently for every question
     expect(JSON.stringify(event.payload)).not.toContain('"content"');
     expect(event.payload).not.toHaveProperty('selectedChunks');
   }
+});
+
+test('reclaims a cooldown-deferred generation item with a new monotonic audit attempt', async () => {
+  const { batchId } = await createBasicGenerationBatch({ requestedCount:1 });
+  const firstLease = await claimGenerationLease(batchId, `cooldown-first-${batchId}`);
+  const cooldown = {
+    providerKey:'gemini', blockedUntil:new Date(Date.now() + 60_000),
+    rateLimitDimension:'RPM' as const, rateLimitScope:null, retryAfterMs:60_000,
+    sourceRunId:null, sourceRunItemId:null, sourcePhase:'QUESTION_GENERATION' as const,
+    sourceModelId:'mock-gemini', requestId:null, lastErrorMessage:'rate limited', hitCount:1,
+    activatedAt:new Date(), resumedAt:null, updatedAt:new Date(),
+  };
+  await expect(generateQuestions(batchId, {
+    lease:firstLease,
+    testHooks:{
+      afterRetrievalPersisted:() => {
+        throw new GenerationProviderRateLimitError(
+          new ProviderError({ kind:'RATE_LIMIT', message:'test rate limit', retryable:true }),
+          cooldown,
+        );
+      },
+    },
+  })).rejects.toBeInstanceOf(GenerationProviderRateLimitError);
+  await deferJobForProviderCooldown(firstLease, cooldown);
+
+  const deferred = await db.query<{ attempts:number; state:string }>(
+    'select attempts,state from generation_items where generation_batch_id=$1',
+    [batchId],
+  );
+  expect(deferred.rows[0]).toEqual({ attempts:1, state:'PENDING' });
+  await db.query('update jobs set available_at=now() where id=$1', [firstLease.jobId]);
+  const reclaimed = await claimJobs(`cooldown-second-${batchId}`, 1, 60_000, ['question.generate']);
+  const job = reclaimed.find((candidate) => candidate.id === firstLease.jobId);
+  expect(job).toBeTruthy();
+  await expect(generateQuestions(batchId, {
+    lease:{ jobId:job!.id, workerId:`cooldown-second-${batchId}`, attempt:job!.attempts },
+  })).resolves.toEqual({ questions:1 });
+
+  const retrievalAttempts = await db.query<{ attempt:number }>(
+    `select attempt from generation_retrievals
+      where generation_batch_id=$1
+      order by attempt`,
+    [batchId],
+  );
+  expect(retrievalAttempts.rows).toEqual([{ attempt:1 }, { attempt:2 }]);
+});
+
+test('does not persist an active provider cooldown as a generation-item failure', async () => {
+  const { batchId } = await createBasicGenerationBatch({ requestedCount:1 });
+  const lease = await claimGenerationLease(batchId, `active-cooldown-${batchId}`);
+  const cooldown = {
+    providerKey:'gemini', blockedUntil:new Date(Date.now() + 60_000),
+    rateLimitDimension:'RPM' as const, rateLimitScope:null, retryAfterMs:60_000,
+    sourceRunId:null, sourceRunItemId:null, sourcePhase:'QUESTION_GENERATION' as const,
+    sourceModelId:'mock-gemini', requestId:null, lastErrorMessage:'rate limited', hitCount:1,
+    activatedAt:new Date(), resumedAt:null, updatedAt:new Date(),
+  };
+
+  await expect(generateQuestions(batchId, {
+    lease,
+    testHooks:{
+      afterRetrievalPersisted:() => { throw new ActiveBenchmarkProviderCooldownError(cooldown); },
+    },
+  })).rejects.toBeInstanceOf(ActiveBenchmarkProviderCooldownError);
+  const item = await db.query<{ state:string; error_code:string | null }>(
+    'select state,error_code from generation_items where generation_batch_id=$1',
+    [batchId],
+  );
+  expect(item.rows[0]).toEqual({ state:'RUNNING', error_code:null });
 });
 
 test('persists successful ordinals, retries only failed items, and keeps replay idempotent', async () => {
@@ -624,6 +713,47 @@ test('rejects a stale worker after lease recovery and lets only the reclaimed at
   });
 });
 
+test('pins a legacy TOC scope to concrete chunks before generation starts', async () => {
+  const { sourceId, revisionId, batchId } = await createBasicGenerationBatch({
+    requestedCount: 1,
+  });
+  const tocEntryId = randomUUID();
+  const chunks = await db.query<{ id: string }>(
+    `select id
+       from source_chunks
+      where source_revision_id=$1
+      order by ordinal`,
+    [revisionId],
+  );
+  const selectedChunkId = chunks.rows[0]!.id;
+  await db.query(
+    `insert into source_toc_entries(
+       id,source_file_id,source_revision_id,ordinal,title,level,mapping_status,mapping_confidence
+     ) values($1,$2,$3,1,'역학',1,'MAPPED',1)`,
+    [tocEntryId, sourceId, revisionId],
+  );
+  await db.query(
+    `insert into source_chunk_toc_entries(
+       source_chunk_id,source_toc_entry_id,source_revision_id,relation,confidence
+     ) values($1,$2,$3,'DIRECT',1)`,
+    [selectedChunkId, tocEntryId, revisionId],
+  );
+  await db.query(
+    `update generation_batches
+        set source_scope=jsonb_set(source_scope,'{tocEntryIds}',$2::jsonb,true)
+      where id=$1`,
+    [batchId, JSON.stringify([tocEntryId])],
+  );
+
+  const lease = await claimGenerationLease(batchId, `worker-${batchId}`);
+  await expect(generateQuestions(batchId, { lease })).resolves.toEqual({ questions: 1 });
+
+  const stored = await db.query<{
+    source_scope: { resolvedChunkIds?: string[] };
+  }>('select source_scope from generation_batches where id=$1', [batchId]);
+  expect(stored.rows[0]?.source_scope.resolvedChunkIds).toEqual([selectedChunkId]);
+});
+
 test('keeps semantic and preceding evidence inside the pinned revision and selected TOC branch', async () => {
   const sourceId = randomUUID();
   const historicalRevisionId = randomUUID();
@@ -694,8 +824,20 @@ test('keeps semantic and preceding evidence inside the pinned revision and selec
         sourceFileIds: [sourceId],
         sourceRevisionIds: [pinnedRevisionId],
         tocEntryIds: [selectedTocId],
+        resolvedChunkIds: [selectedBranchChunk1, selectedBranchChunk2],
       }),
     ],
+  );
+  await db.query(
+    `delete from source_chunk_toc_entries
+      where source_toc_entry_id=$1 and source_revision_id=$2`,
+    [selectedTocId, pinnedRevisionId],
+  );
+  await db.query(
+    `insert into source_chunk_toc_entries(
+       source_chunk_id,source_toc_entry_id,source_revision_id,relation,confidence
+     ) values($1,$2,$3,'DIRECT',1)`,
+    [otherBranchChunk, selectedTocId, pinnedRevisionId],
   );
 
   const lease = await claimGenerationLease(batchId, `worker-${batchId}`);
@@ -817,12 +959,14 @@ test('atomically pins a legacy empty-TOC batch and keeps retries on that revisio
     .not.toContain(newerChunkId);
 });
 
-test('rebuilds TOC mappings without changing an existing revision entry ID', async () => {
+test('rebuilds TOC mappings without changing an existing entry ID and pins a legacy batch scope', async () => {
   const sourceId = randomUUID();
   const revisionId = randomUUID();
   const chunkId = randomUUID();
   const tocEntryId = randomUUID();
+  const batchId = randomUUID();
   testSourceIds.push(sourceId);
+  testBatchIds.push(batchId);
 
   await db.query(
     `insert into source_files(id,sha256,original_name,storage_path,mime_type,byte_size,status)
@@ -850,6 +994,15 @@ test('rebuilds TOC mappings without changing an existing revision entry ID', asy
        source_chunk_id,source_toc_entry_id,source_revision_id,relation,confidence
      ) values($1,$2,$3,'DIRECT',1)`,
     [chunkId, tocEntryId, revisionId],
+  );
+  await db.query(
+    `insert into generation_batches(
+       id,state,requested_count,conditions,source_scope,generation_model,prompt_version
+     ) values($1,'FAILED',1,'{}'::jsonb,$2::jsonb,'mock-gemini','test')`,
+    [batchId, JSON.stringify({
+      sourceFileIds: [sourceId],
+      tocEntryIds: [tocEntryId],
+    })],
   );
 
   await withTransaction((client) => replaceSourceTocEntries(
@@ -887,6 +1040,14 @@ test('rebuilds TOC mappings without changing an existing revision entry ID', asy
     [chunkId],
   );
   expect(mappings.rows).toEqual([{ source_toc_entry_id: tocEntryId, source_revision_id: revisionId }]);
+  const batch = await db.query<{
+    source_scope: { sourceRevisionIds?: string[]; resolvedChunkIds?: string[] };
+  }>(
+    'select source_scope from generation_batches where id=$1',
+    [batchId],
+  );
+  expect(batch.rows[0]?.source_scope.sourceRevisionIds).toEqual([revisionId]);
+  expect(batch.rows[0]?.source_scope.resolvedChunkIds).toEqual([chunkId]);
 });
 
 test('rolls back a new revision, chunk, and TOC when mapping integrity fails', async () => {
@@ -1060,6 +1221,139 @@ test('records an empty TOC alignment once and does not retry it on later renders
     [revisionId],
   );
   expect(secondAttempt.rows[0]).toEqual(firstAttempt.rows[0]);
+});
+
+test('retries a completed v1 TOC alignment and promotes the revision to v2', async () => {
+  const sourceId = randomUUID();
+  const revisionId = randomUUID();
+  const tocId = randomUUID();
+  const chunkId = randomUUID();
+  testSourceIds.push(sourceId);
+
+  await db.query(
+    `insert into source_files(id,sha256,original_name,storage_path,mime_type,byte_size,status)
+     values($1,$2,'legacy-v1-toc.pdf','fixture','application/pdf',10,'READY')`,
+    [sourceId, randomUUID().replaceAll('-', '')],
+  );
+  await db.query(
+    `insert into source_revisions(
+       id,source_file_id,revision,parse_model,raw_html,toc_alignment_attempted_at
+     ) values($1,$2,1,'test','',now())`,
+    [revisionId, sourceId],
+  );
+  await db.query(
+    `insert into source_chunks(
+       id,source_file_id,source_revision_id,ordinal,content,page_start,chapter
+     ) values($1,$2,$3,1,'역학 단원 본문',1,'역학')`,
+    [chunkId, sourceId, revisionId],
+  );
+  await db.query(
+    `insert into source_toc_entries(
+       id,source_file_id,source_revision_id,ordinal,title,level,mapping_status
+     ) values($1,$2,$3,1,'역학',1,'UNMAPPED')`,
+    [tocId, sourceId, revisionId],
+  );
+
+  await backfillMissingSourceTocEntries([sourceId]);
+
+  const revision = await db.query<{
+    toc_alignment_version: number;
+    mapping_status: string;
+    mapping_count: number;
+  }>(
+    `select revision.toc_alignment_version,
+            entry.mapping_status,
+            (select count(*)::int
+               from source_chunk_toc_entries mapping
+              where mapping.source_revision_id=revision.id) as mapping_count
+       from source_revisions revision
+       join source_toc_entries entry on entry.source_revision_id=revision.id
+      where revision.id=$1`,
+    [revisionId],
+  );
+  expect(revision.rows[0]).toEqual({
+    toc_alignment_version: 2,
+    mapping_status: 'MAPPED',
+    mapping_count: 1,
+  });
+});
+
+test('backfill wires stored page-artifact footers into non-monotonic TOC alignment', async () => {
+  const sourceId = randomUUID();
+  const revisionId = randomUUID();
+  testSourceIds.push(sourceId);
+
+  await db.query(
+    `insert into source_files(id,sha256,original_name,storage_path,mime_type,byte_size,status)
+     values($1,$2,'spread-footer-toc.pdf','fixture','application/pdf',10,'READY')`,
+    [sourceId, randomUUID().replaceAll('-', '')],
+  );
+  await db.query(
+    `insert into source_revisions(
+       id,source_file_id,revision,parse_model,raw_html,toc_alignment_attempted_at
+     ) values($1,$2,1,'test','',now())`,
+    [revisionId, sourceId],
+  );
+  await db.query(
+    `insert into source_chunks(
+       source_file_id,source_revision_id,ordinal,content,page_start,page_end
+     ) values
+       ($1,$2,1,'14쪽 본문',8,8),
+       ($1,$2,2,'26쪽 본문',14,14),
+       ($1,$2,3,'114쪽 본문',58,58)`,
+    [sourceId, revisionId],
+  );
+  await db.query(
+    `insert into source_toc_entries(
+       source_file_id,source_revision_id,ordinal,title,level,printed_page,mapping_status
+     ) values
+       ($1,$2,1,'우주 초기에 만들어진 원소',1,14,'UNMAPPED'),
+       ($1,$2,2,'지구 시스템의 구성',1,114,'UNMAPPED'),
+       ($1,$2,3,'원소의 주기성',1,26,'UNMAPPED')`,
+    [sourceId, revisionId],
+  );
+  for (const [pageNumber, printedPage] of [[7, 12], [8, 14], [14, 26], [58, 114]]) {
+    await db.query(
+      `insert into source_revision_page_artifacts(
+         source_revision_id,page_number,filename,mime_type,raw_response,raw_html
+       ) values($1,$2,$3,'image/png',$4::jsonb,'')`,
+      [
+        revisionId,
+        pageNumber,
+        `page-${pageNumber}.png`,
+        JSON.stringify({
+          elements: [{
+            category: 'footer',
+            coordinates: [{ x: 0.04 }, { x: 0.12 }],
+            content: { html: `<footer>${printedPage} 교과서</footer>` },
+          }],
+        }),
+      ],
+    );
+  }
+
+  await backfillMissingSourceTocEntries([sourceId]);
+
+  const mappings = await db.query<{
+    toc_ordinal: number;
+    chunk_page: number;
+    relation: string;
+  }>(
+    `select entry.ordinal as toc_ordinal,
+            chunk.page_start as chunk_page,
+            mapping.relation
+       from source_chunk_toc_entries mapping
+       join source_toc_entries entry on entry.id=mapping.source_toc_entry_id
+       join source_chunks chunk on chunk.id=mapping.source_chunk_id
+      where mapping.source_revision_id=$1
+      order by entry.ordinal`,
+    [revisionId],
+  );
+  expect(mappings.rows).toEqual([
+    { toc_ordinal: 1, chunk_page: 8, relation: 'DIRECT' },
+    { toc_ordinal: 2, chunk_page: 58, relation: 'DIRECT' },
+    { toc_ordinal: 3, chunk_page: 14, relation: 'DIRECT' },
+  ]);
 });
 
 test('backfill keeps legacy null-heading continuations inside their unit and stops at the next positive heading', async () => {

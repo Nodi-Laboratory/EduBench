@@ -58,6 +58,39 @@ test('accepts and forwards only bounded persisted generation parameters', async 
   expect(vi.mocked(createRun).mock.calls[0]?.[0].models[0]?.parameters).toEqual(parameters);
 });
 
+test('accepts and forwards all three benchmark retrieval conditions', async () => {
+  const response = await POST(new Request('http://localhost/api/runs', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body:JSON.stringify({
+      ...validRun,
+      retrievalModes:['NONE', 'VECTOR', 'PIKE'],
+    }),
+  }));
+
+  expect(response.status).toBe(201);
+  expect(vi.mocked(createRun).mock.calls[0]?.[0].retrievalModes).toEqual([
+    'NONE',
+    'VECTOR',
+    'PIKE',
+  ]);
+});
+
+test.each([
+  ['an empty retrieval condition list', []],
+  ['a duplicate retrieval condition', ['NONE', 'NONE']],
+  ['an unknown retrieval condition', ['NONE', 'GRAPH']],
+])('rejects %s before creating a run', async (_label, retrievalModes) => {
+  const response = await POST(new Request('http://localhost/api/runs', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body:JSON.stringify({ ...validRun, retrievalModes }),
+  }));
+
+  expect(response.status).toBe(400);
+  expect(createRun).not.toHaveBeenCalled();
+});
+
 test.each([
   ['a forbidden prompt override', { prompt: '요청을 바꾼다.' }],
   ['an excessive output limit', { maxOutputTokens: 131_073 }],

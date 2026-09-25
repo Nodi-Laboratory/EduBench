@@ -3,8 +3,8 @@ import { describeScoreMetric, describeScoreMetrics } from '@/domain/score-metric
 
 describe('score metric research definitions', () => {
   test('describes deterministic, judge, prerequisite, and unknown metrics', () => {
-    expect(describeScoreMetric('exact_match')).toMatchObject({
-      label: '완전 일치', method: 'deterministic', range: '0 또는 1', direction: '높을수록 좋음',
+    expect(describeScoreMetric('response_present')).toMatchObject({
+      label: '응답 존재', method: 'deterministic', range: '0 또는 1', direction: '높을수록 좋음',
     });
     expect(describeScoreMetric('faithfulness')).toMatchObject({
       label: '교과서 충실성', method: 'judge', range: '0~1', direction: '높을수록 좋음',
@@ -19,7 +19,7 @@ describe('score metric research definitions', () => {
   });
 
   test('deduplicates metrics while retaining requested order', () => {
-    expect(describeScoreMetrics(['accuracy', 'exact_match', 'accuracy']).map((metric) => metric.key))
-      .toEqual(['accuracy', 'exact_match']);
+    expect(describeScoreMetrics(['accuracy', 'exact_match', 'accuracy', 'response_present']).map((metric) => metric.key))
+      .toEqual(['accuracy', 'response_present']);
   });
 });

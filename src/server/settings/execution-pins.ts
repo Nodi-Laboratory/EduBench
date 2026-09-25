@@ -160,11 +160,12 @@ export async function resolveSourceExecutionPins(sourceFileId: string): Promise<
 
 export async function resolveGenerationExecutionPins(
   generationBatchId: string,
+  queryable:Pick<typeof db, 'query'> = db,
 ): Promise<{
   questionGeneration:VerifiedResearchConfigPin<'question_generation'>;
   embeddingRag:VerifiedResearchConfigPin<'embedding_rag'>;
 }> {
-  const result = await db.query<GenerationPinRow>(
+  const result = await queryable.query<GenerationPinRow>(
     `select
        question_generation_profile_id,
        question_generation_profile_snapshot,

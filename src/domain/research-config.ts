@@ -170,17 +170,22 @@ const benchmarkModelSchema = z.discriminatedUnion('providerKey', [
     protocol:z.literal('openai-compatible'),
     ...benchmarkModelRuntimeFields,
   }).strict(),
+  z.object({
+    providerKey:z.literal('openai'),
+    protocol:z.literal('openai-responses'),
+    ...benchmarkModelRuntimeFields,
+  }).strict(),
 ]);
 
 export const benchmarkModelsResearchConfigSchema = z.object({
   ...commonDefinitionFields,
   kind:z.literal('benchmark_models'),
   settings:z.object({
-    models:z.array(benchmarkModelSchema).length(3),
+    models:z.array(benchmarkModelSchema).min(3).max(4),
   }).strict().superRefine((settings, context) => {
     const providers = new Set(settings.models.map((model) => model.providerKey));
     if (
-      providers.size !== 3
+      providers.size !== settings.models.length
       || !['gemini', 'upstage', 'exaone'].every((provider) => providers.has(
         provider as 'gemini' | 'upstage' | 'exaone',
       ))
@@ -188,7 +193,7 @@ export const benchmarkModelsResearchConfigSchema = z.object({
       context.addIssue({
         code:'custom',
         path:['models'],
-        message:'Gemini, Upstage, EXAONE 설정을 각각 한 개씩 포함해야 합니다.',
+        message:'Gemini, Upstage, EXAONE은 각각 한 개씩 포함하고 OpenAI는 최대 한 개만 추가할 수 있습니다.',
       });
     }
   }),
@@ -290,15 +295,15 @@ export const defaultResearchConfigDefinitions: ResearchConfigDefinition[] = [
   {
     schemaVersion:1,
     kind:'question_generation',
-    version:'question-generation-gemini-3.6-flash-v1',
-    title:'Gemini 3.6 Flash 문항 생성 기본값',
-    description:'Gemini 3.6 Flash의 구조화 출력과 고수준 사고를 사용해 각 문항의 방향 생성·근거 검색·문항 생성을 독립적으로 수행합니다.',
+    version:'question-generation-gemini-3.5-flash-v3',
+    title:'Gemini 3.5 Flash 문항 생성 8,192 토큰 방향성 기본값',
+    description:'Gemini 3.5 Flash의 구조화 출력과 고수준 사고를 사용해 더 넉넉한 방향성 출력 한도로 각 문항의 방향 생성·근거 검색·문항 생성을 독립적으로 수행합니다.',
     applyScope:'활성화 이후 새로 만드는 질문 생성 배치에만 적용되며 이미 생성 중이거나 완료된 배치의 설정은 바뀌지 않습니다.',
     reprocessingImpact:'기존 교과서 임베딩은 그대로 사용할 수 있지만 변경된 생성 결과를 비교하려면 새 질문 배치를 만들어야 합니다.',
     settings:{
       provider:'gemini',
-      model:'gemini-3.6-flash',
-      directionMaxOutputTokens:2_048,
+      model:'gemini-3.5-flash',
+      directionMaxOutputTokens:8_192,
       questionMaxOutputTokens:16_384,
       thinkingLevel:'HIGH',
       structuredOutput:true,
@@ -310,19 +315,19 @@ export const defaultResearchConfigDefinitions: ResearchConfigDefinition[] = [
   {
     schemaVersion:1,
     kind:'benchmark_models',
-    version:'benchmark-models-core-v2',
-    title:'Gemini 3.6·Solar Pro 3·K-EXAONE 비교 기본값',
-    description:'동일한 데이터셋을 Gemini 3.6 Flash, Upstage Solar Pro 3, K-EXAONE 236B A23B의 고정 모델 식별자와 재현 가능한 생성 파라미터로 비교합니다.',
+    version:'benchmark-models-core-v6',
+    title:'Gemini·Solar·K-EXAONE·OpenAI 비교 기본값',
+    description:'동일한 데이터셋을 Gemini 3.5 Flash, Upstage Solar Pro 3, K-EXAONE 236B A23B, OpenAI GPT-5.5 일반 모델 별칭으로 비교합니다.',
     applyScope:'활성화 이후 새로 생성하는 벤치마크 실행의 모델 선택과 요청 파라미터 기본값에만 적용됩니다.',
     reprocessingImpact:'교과서나 질문을 다시 처리할 필요는 없지만 기존 실행에는 소급 적용되지 않으므로 비교하려면 새 실행을 만들어야 합니다.',
     settings:{
       models:[
         {
           providerKey:'gemini',
-          displayName:'Gemini 3.6 Flash',
+          displayName:'Gemini 3.5 Flash',
           protocol:'gemini',
           enabled:true,
-          modelId:'gemini-3.6-flash',
+          modelId:'gemini-3.5-flash',
           concurrency:4,
           requestIntervalMs:0,
           requestTimeoutMs:180_000,
@@ -382,6 +387,29 @@ export const defaultResearchConfigDefinitions: ResearchConfigDefinition[] = [
             enableThinking:true,
             omitTemperature:false,
             omitTopP:false,
+            stopSequences:[],
+            seed:null,
+          },
+        },
+        {
+          providerKey:'openai',
+          displayName:'OpenAI GPT-5.5',
+          protocol:'openai-responses',
+          enabled:true,
+          modelId:'gpt-5.5',
+          concurrency:2,
+          requestIntervalMs:0,
+          requestTimeoutMs:180_000,
+          generation:{
+            maxOutputTokens:16_384,
+            temperature:null,
+            topP:null,
+            presencePenalty:null,
+            frequencyPenalty:null,
+            thinkingLevel:null,
+            enableThinking:null,
+            omitTemperature:true,
+            omitTopP:true,
             stopSequences:[],
             seed:null,
           },

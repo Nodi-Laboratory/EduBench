@@ -1,23 +1,40 @@
 import { DomainError } from '@/domain/errors';
 import {
+  buildBenchmarkAnswerPrompt,
+  type StoredBenchmarkRetrievalMode,
+} from '@/domain/benchmark-retrieval';
+import {
   generationParametersSchema,
   type GenerationParameters,
   type GenerationRequest,
   type ModelProvider,
-  type ProviderError,
+  ProviderError,
 } from '@/server/providers/types';
 import { benchmarkGenerationParameters } from '@/domain/research-config';
 import { resolveBenchmarkExecutionPin } from '@/server/settings/execution-pins';
 import { withProviderRetry } from '@/server/providers/retry';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
-import { interruptRunItem, renewRunItemLease, type RunItemRecord } from './service';
+import {
+  deferRunItemForProviderCooldown,
+  interruptRunItem,
+  renewRunItemLease,
+  type RunItemRecord,
+} from './service';
+import {
+  ActiveBenchmarkProviderCooldownError,
+  findActiveBenchmarkProviderCooldown,
+  providerCooldownDominatesObservation,
+  registerBenchmarkProviderRateLimit,
+} from './provider-cooldown';
+import { resolveRunItemRetrieval } from './retrieval';
 
 type ExecutionContext = {
   id: string; attempts: number; benchmark_run_id: string; state: string; lease_owner: string | null;
   system_prompt: string; run_state: string; provider_key: string; model_id: string;
   parameters: unknown;
-  question_text: string; answer_options: unknown; evidence_mode: string;
+  question_text: string; answer_options: unknown;
+  retrieval_mode: StoredBenchmarkRetrievalMode;
 };
 
 function normalizeResponse(text: string): string {
@@ -49,11 +66,12 @@ function effectiveGenerationParameters(parameters: GenerationParameters): Omit<G
   };
 }
 
-async function loadContext(itemId: string): Promise<{ context: ExecutionContext; evidence: string[] }> {
+async function loadContext(itemId: string): Promise<ExecutionContext> {
   const item = await db.query<ExecutionContext>(
     `select ri.id, ri.attempts, ri.benchmark_run_id, ri.state, ri.lease_owner,
+       ri.retrieval_mode,
        br.system_prompt, br.state as run_state, rm.provider_key, rm.model_id, rm.parameters,
-       qr.question_text, qr.answer_options, q.evidence_mode
+       qr.question_text, qr.answer_options
      from run_items ri join benchmark_runs br on br.id = ri.benchmark_run_id
      join run_models rm on rm.id = ri.run_model_id
      join questions q on q.id = ri.question_id
@@ -61,17 +79,7 @@ async function loadContext(itemId: string): Promise<{ context: ExecutionContext;
      where ri.id = $1`, [itemId],
   );
   if (!item.rows[0]) throw new DomainError('RUN_ITEM_NOT_FOUND', '실행 항목을 찾을 수 없습니다.');
-  const evidence = await db.query<{ content: string; quote_text: string | null; page_start: number | null }>(
-    `select sc.content, qe.quote_text, sc.page_start from question_evidence qe
-     join source_chunks sc on sc.id = qe.source_chunk_id
-     where qe.question_id = (select question_id from run_items where id = $1)
-       and qe.question_revision = (select question_revision from run_items where id = $1)
-     order by qe.ordinal`, [itemId],
-  );
-  return {
-    context: item.rows[0],
-    evidence: evidence.rows.map((row, index) => `[근거 ${index + 1}${row.page_start ? ` · p.${row.page_start}` : ''}]\n${row.quote_text ?? row.content}`),
-  };
+  return item.rows[0];
 }
 
 export async function executeRunItem(
@@ -80,7 +88,7 @@ export async function executeRunItem(
   provider: ModelProvider,
   executionOptions: { signal?:AbortSignal } = {},
 ): Promise<void> {
-  const { context, evidence } = await loadContext(item.id);
+  const context = await loadContext(item.id);
   if (context.state !== 'LEASED' || context.lease_owner !== workerId) {
     throw new DomainError('RUN_ITEM_LEASE_MISMATCH', '해당 워커가 임대한 실행 항목이 아닙니다.');
   }
@@ -90,11 +98,98 @@ export async function executeRunItem(
       `실행 항목에 고정된 ${context.provider_key} / ${context.model_id} 모델과 전달된 공급자가 일치하지 않습니다.`,
     );
   }
-  const options = Array.isArray(context.answer_options) && context.answer_options.length
-    ? `\n\n선택지:\n${context.answer_options.map((option, index) => `${index + 1}. ${String(option)}`).join('\n')}` : '';
-  const evidenceBlock = evidence.length
-    ? `다음 근거만 사용하십시오.\n\n${evidence.join('\n\n')}`
-    : context.evidence_mode === 'GROUNDED' ? '연결된 교과서 근거가 없습니다. 근거 부족을 명시하십시오.' : '외부 검색 없이 답하십시오.';
+  if (context.retrieval_mode === 'VECTOR') {
+    const embeddingCooldown = await findActiveBenchmarkProviderCooldown(
+      'gemini',
+    );
+    if (embeddingCooldown) {
+      await deferRunItemForProviderCooldown(
+        item.id,
+        workerId,
+        embeddingCooldown,
+      );
+      return;
+    }
+  }
+  const leaseMs = 150_000;
+  const leaseAbort = new AbortController();
+  const controlAbort = new AbortController();
+  const lifecycleSignal = AbortSignal.any([
+    leaseAbort.signal,
+    controlAbort.signal,
+    ...(executionOptions.signal ? [executionOptions.signal] : []),
+  ]);
+  const heartbeat = setInterval(() => {
+    renewRunItemLease(item.id, workerId, leaseMs)
+      .then((renewed) => {
+        if (!renewed) {
+          leaseAbort.abort(new Error('RUN_ITEM_LEASE_LOST'));
+        }
+      })
+      .catch(() => {
+        leaseAbort.abort(new Error('RUN_ITEM_LEASE_RENEWAL_FAILED'));
+      });
+  }, 30_000);
+  const controlPoll = setInterval(() => {
+    db.query<{ state: string }>(
+      'select state from benchmark_runs where id=$1',
+      [context.benchmark_run_id],
+    )
+      .then((result) => {
+        if (result.rows[0]?.state === 'STOPPING') {
+          controlAbort.abort(new Error('RUN_STOP_REQUESTED'));
+        }
+      })
+      .catch(() => undefined);
+  }, 500);
+  try {
+  let retrieval;
+  try {
+    retrieval = await resolveRunItemRetrieval(
+      item.id,
+      lifecycleSignal,
+    );
+  } catch (error) {
+    if (
+      context.retrieval_mode === 'VECTOR'
+      && error instanceof ProviderError
+      && error.kind === 'RATE_LIMIT'
+    ) {
+      const cooldown = await findActiveBenchmarkProviderCooldown(
+        'gemini',
+      );
+      const effectiveCooldown = cooldown
+        && providerCooldownDominatesObservation(cooldown, error)
+        ? cooldown
+        : await registerBenchmarkProviderRateLimit({
+          providerKey:'gemini',
+          error,
+          sourceRunId:context.benchmark_run_id,
+          sourceRunItemId:item.id,
+          sourcePhase:'ANSWER_RETRIEVAL_EMBEDDING',
+          sourceModelId:null,
+        });
+      await deferRunItemForProviderCooldown(
+        item.id,
+        workerId,
+        effectiveCooldown,
+      );
+      return;
+    }
+    if (executionOptions.signal?.aborted) {
+      await interruptRunItem(item.id, workerId);
+      return;
+    }
+    const state = await db.query<{ state:string }>(
+      'select state from benchmark_runs where id=$1',
+      [context.benchmark_run_id],
+    );
+    if (state.rows[0]?.state === 'STOPPING') {
+      await interruptRunItem(item.id, workerId);
+      return;
+    }
+    throw error;
+  }
   const retryHistory: Array<Record<string, unknown>> = [];
   const persistedParameters = parseRunModelParameters(context.parameters);
   const benchmarkPin = await resolveBenchmarkExecutionPin(
@@ -128,10 +223,17 @@ export async function executeRunItem(
     ?? Number(process.env.PROVIDER_TIMEOUT_MS ?? 90_000);
   const request: GenerationRequest = {
     system: context.system_prompt,
-    prompt: `${evidenceBlock}\n\n[질문]\n${context.question_text}${options}`,
+    prompt:buildBenchmarkAnswerPrompt({
+      retrievalMode:context.retrieval_mode,
+      questionText:context.question_text,
+      answerOptions:context.answer_options,
+      evidence:retrieval.renderedContext
+        ? [retrieval.renderedContext]
+        : [],
+    }),
     ...effectiveGenerationParameters(persistedParameters),
   };
-  await db.query(
+  const snapshotUpdate = await db.query(
     `update run_items set request_snapshot=$3::jsonb
      where id=$1 and state='LEASED' and lease_owner=$2`,
     [item.id, workerId, JSON.stringify({
@@ -140,32 +242,48 @@ export async function executeRunItem(
       benchmarkModelsProfileId:benchmarkPin.profileId,
       benchmarkModelsProfileHash:benchmarkPin.contentHash,
       requestTimeoutMs,
-      attempt: context.attempts, evidence, question: context.question_text, options: context.answer_options,
+      attempt:context.attempts,
+      retrievalMode:retrieval.mode,
+      retrievalAuditId:retrieval.id,
+      retrievalConfigHash:retrieval.configHash,
+      retrievalContextHash:retrieval.contextHash,
+      retrievalQuery:retrieval.queryText,
+      retrievalSelectedChunkIds:retrieval.selectedChunks.map(
+        (chunk) => chunk.chunkId,
+      ),
+      evidence:retrieval.renderedContext,
+      question:context.question_text,
+      options:context.answer_options,
     })],
   );
-  const leaseMs = 150_000; const leaseAbort = new AbortController();
-  const controlAbort = new AbortController();
+  if (!snapshotUpdate.rowCount) {
+    throw new DomainError(
+      'RUN_ITEM_LEASE_MISMATCH',
+      '요청 저장 전에 실행 임대가 만료되었거나 변경되었습니다.',
+    );
+  }
   const signal = AbortSignal.any([
-    leaseAbort.signal,
-    controlAbort.signal,
+    lifecycleSignal,
     AbortSignal.timeout(requestTimeoutMs),
-    ...(executionOptions.signal ? [executionOptions.signal] : []),
   ]);
-  const heartbeat = setInterval(() => { renewRunItemLease(item.id, workerId, leaseMs).then((renewed) => { if (!renewed) leaseAbort.abort(new Error('RUN_ITEM_LEASE_LOST')); }).catch(() => leaseAbort.abort(new Error('RUN_ITEM_LEASE_RENEWAL_FAILED'))); }, 30_000);
-  const controlPoll = setInterval(() => {
-    db.query<{ state: string }>('select state from benchmark_runs where id=$1', [context.benchmark_run_id])
-      .then((result) => { if (result.rows[0]?.state === 'STOPPING') controlAbort.abort(new Error('RUN_STOP_REQUESTED')); })
-      .catch(() => undefined);
-  }, 500);
   let generated;
   try {
     signal.throwIfAborted();
-    generated = await withProviderRetry(() => provider.generate(request, signal), {
+    generated = await withProviderRetry(async () => {
+      const activeCooldown = await findActiveBenchmarkProviderCooldown(
+        context.provider_key,
+      );
+      if (activeCooldown) {
+        throw new ActiveBenchmarkProviderCooldownError(activeCooldown);
+      }
+      return provider.generate(request, signal);
+    }, {
       maxAttempts: 3,
       baseDelayMs: provider.key === 'exaone'
         ? Number(process.env.EXAONE_RETRY_BASE_DELAY_MS ?? 15_000)
         : 500,
       signal,
+      shouldRetry:(error) => error.kind !== 'RATE_LIMIT',
       onRetry: ({ attempt, delayMs, error }) => {
         retryHistory.push({
           attempt,
@@ -178,6 +296,53 @@ export async function executeRunItem(
     });
     signal.throwIfAborted();
   } catch (error) {
+    if (
+      error instanceof ProviderError
+      && error.kind === 'RATE_LIMIT'
+    ) {
+      const cooldown = await registerBenchmarkProviderRateLimit({
+        providerKey:context.provider_key,
+        error,
+        sourceRunId:context.benchmark_run_id,
+        sourceRunItemId:item.id,
+        sourcePhase:'MODEL_RESPONSE',
+        sourceModelId:context.model_id,
+      });
+      if (executionOptions.signal?.aborted) {
+        await interruptRunItem(item.id, workerId);
+        return;
+      }
+      const state = await db.query<{ state:string }>(
+        'select state from benchmark_runs where id=$1',
+        [context.benchmark_run_id],
+      );
+      if (state.rows[0]?.state === 'STOPPING') {
+        await interruptRunItem(item.id, workerId);
+        return;
+      }
+      await deferRunItemForProviderCooldown(item.id, workerId, cooldown);
+      return;
+    }
+    if (error instanceof ActiveBenchmarkProviderCooldownError) {
+      if (executionOptions.signal?.aborted) {
+        await interruptRunItem(item.id, workerId);
+        return;
+      }
+      const state = await db.query<{ state:string }>(
+        'select state from benchmark_runs where id=$1',
+        [context.benchmark_run_id],
+      );
+      if (state.rows[0]?.state === 'STOPPING') {
+        await interruptRunItem(item.id, workerId);
+        return;
+      }
+      await deferRunItemForProviderCooldown(
+        item.id,
+        workerId,
+        error.cooldown,
+      );
+      return;
+    }
     if (executionOptions.signal?.aborted) {
       await interruptRunItem(item.id, workerId);
       return;
@@ -188,7 +353,7 @@ export async function executeRunItem(
       return;
     }
     throw error;
-  } finally { clearInterval(heartbeat); clearInterval(controlPoll); }
+  }
 
   await withTransaction(async (client) => {
     const locked = await client.query<{ benchmark_run_id: string; attempts: number; state: string; lease_owner: string | null; run_state: string }>(
@@ -226,7 +391,7 @@ export async function executeRunItem(
     );
     await client.query(
       `update run_items set state = 'SUCCEEDED', lease_owner = null, lease_expires_at = null,
-         completed_at = now() where id = $1`, [item.id],
+         error_code=null,error_message=null,completed_at = now() where id = $1`, [item.id],
     );
     const counters = await client.query<{ completed_items: number; failed_items: number; total_items: number }>(
       `update benchmark_runs set completed_items = completed_items + 1, updated_at = now()
@@ -237,12 +402,17 @@ export async function executeRunItem(
        values ('benchmark_run', $1, 'RUN_ITEM_COMPLETED', $2::jsonb)`,
       [current.benchmark_run_id, JSON.stringify({
         itemId: item.id, providerKey: context.provider_key, latencyMs: generated.latencyMs,
+        retrievalMode:context.retrieval_mode,
         completedItems: counters.rows[0]?.completed_items,
         failedItems: counters.rows[0]?.failed_items,
         totalItems: counters.rows[0]?.total_items,
       })],
     );
   });
+  } finally {
+    clearInterval(heartbeat);
+    clearInterval(controlPoll);
+  }
 }
 
 export function providerErrorDetails(error: unknown): { code: string; message: string } {

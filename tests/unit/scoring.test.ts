@@ -1,12 +1,10 @@
 import { expect, test } from 'vitest';
-import { exactMatch, judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, selectJudgeScore, tokenCost } from '@/domain/scoring';
+import { judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, normalizeJudgeText, normalizeKoreanAnswer, selectJudgeScore, tokenCost } from '@/domain/scoring';
 import { requiredMetricsForQuestion } from '@/domain/scoring';
 import { mcnemar, pairedBootstrap } from '@/domain/statistics';
 
 test('normalizes Korean answers without destroying meaningful internal spacing', () => {
   expect(normalizeKoreanAnswer('  정답은   물의 순환입니다。\r\n')).toBe('정답은 물의 순환입니다');
-  expect(exactMatch('②', ['2', '②'])).toBe(1);
-  expect(exactMatch('광합성', ['호흡'])).toBe(0);
 });
 
 test('calculates a versioned token cost', () => {
@@ -36,7 +34,8 @@ test('adds prerequisite metrics only for prerequisite benchmark questions', () =
   expect(required).toContain('accuracy');
   expect(required).toContain('prerequisite_relation_accuracy');
   expect(required).toContain('reasoning_chain_completeness');
-  expect(requiredMetricsForQuestion(['accuracy'], {})).toEqual(['exact_match', 'response_present', 'accuracy']);
+  expect(requiredMetricsForQuestion(['accuracy'], {})).toEqual(['response_present', 'accuracy']);
+  expect(requiredMetricsForQuestion(['exact_match', 'accuracy'], {})).toEqual(['response_present', 'accuracy']);
 });
 
 test('starts with one efficient judge batch and rejects a mislabeled score', () => {

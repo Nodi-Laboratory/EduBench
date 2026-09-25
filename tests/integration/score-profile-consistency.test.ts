@@ -5,7 +5,7 @@ import { GET as exportResult, summarizeExportRun } from '@/app/api/results/[id]/
 import { db } from '@/server/db/pool';
 import { migrate } from '@/server/db/migrate';
 import { executeRunItem } from '@/server/runs/executor';
-import { getRunDetails } from '@/server/runs/details';
+import { getRunDetails, getRunItemDetails } from '@/server/runs/details';
 import { MockProvider } from '@/server/providers/mock';
 import { getResultAnalytics } from '@/server/results/analytics';
 import { scoreRun } from '@/server/scoring/service';
@@ -67,6 +67,20 @@ test('validates weights and requires the complete Judge provider/model pair', as
     }),
   }));
   expect(unsupportedProvider.status).toBe(400);
+
+  const retiredMetric = await createProfile(new Request('http://localhost/api/settings/profiles', {
+    method:'POST',
+    headers:{ 'content-type':'application/json' },
+    body:JSON.stringify({
+      kind:'score', version:`retired-metric-${randomUUID()}`, title:'폐기 지표',
+      metrics:['exact_match'], weights:{ exact_match:1 },
+    }),
+  }));
+  expect(retiredMetric.status).toBe(400);
+  expect(await retiredMetric.json()).toMatchObject({
+    code:'INVALID_PROFILE',
+    issues:[expect.objectContaining({ path:['metrics'] })],
+  });
 });
 
 test('rejects legacy Judge provenance and missing exact Judge configuration before creating a run', async () => {
@@ -134,8 +148,8 @@ test('database inserts always receive an atomic score profile snapshot', async (
       kind:'score',
       version,
       title:'DB 자동 스냅샷',
-      metrics:['exact_match'],
-      weights:{ exact_match:2 },
+      metrics:['response_present'],
+      weights:{ response_present:2 },
     }),
   }));
   expect(created.status).toBe(201);
@@ -154,8 +168,8 @@ test('database inserts always receive an atomic score profile snapshot', async (
   expect(inserted.rows[0]?.score_profile_snapshot).toMatchObject({
     id:profile.rows[0]!.id,
     version,
-    metrics:['exact_match'],
-    weights:{ exact_match:2 },
+    metrics:['response_present'],
+    weights:{ response_present:2 },
     contentHash:profile.rows[0]!.content_hash,
   });
 });
@@ -170,8 +184,8 @@ test('direct run insert locks the profile until commit and a concurrent profile 
       kind:'score',
       version,
       title:'동시성 스냅샷',
-      metrics:['exact_match'],
-      weights:{ exact_match:1 },
+      metrics:['response_present'],
+      weights:{ response_present:1 },
     }),
   }));
   expect(created.status).toBe(201);
@@ -372,8 +386,12 @@ test('scores only eligible responses and persists the exact snapshotted Judge mo
   expect(analytics.models[0]?.responses).toBe(1);
   const details = await getRunDetails(run.id);
   expect(details?.items).toHaveLength(2);
-  expect(details?.items.find((entry) => entry.id === item!.id)?.response?.text).not.toBe('취소 후 응답');
-  expect(details?.items.find((entry) => entry.id === failedItem!.id)?.response).toBeNull();
+  const [completedDetail, failedDetail] = await Promise.all([
+    getRunItemDetails(run.id, item!.id),
+    getRunItemDetails(run.id, failedItem!.id),
+  ]);
+  expect(completedDetail?.item.response?.text).not.toBe('취소 후 응답');
+  expect(failedDetail?.item.response).toBeNull();
 
   const json = await exportResult(
     new Request(`http://localhost/api/results/${run.id}/export?format=json`),

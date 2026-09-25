@@ -10,6 +10,7 @@ import {
   parseResearchConfigDefinition,
 } from '@/domain/research-config';
 import { DomainError } from '@/domain/errors';
+import { backfillMissingSourceTocEntries } from '@/server/sources/toc';
 
 const generationSchema = z.object({
   subject: z.string().trim().min(1),
@@ -28,16 +29,17 @@ const generationSchema = z.object({
 
 export async function GET() {
   const result = await db.query(
-    `select id, state, requested_count, conditions, source_scope, generation_model,
-       prompt_version, progress,
-       question_generation_profile_id,question_generation_profile_hash,
-       question_generation_profile_snapshot,
-       question_generation_profile_snapshot_provenance,
-       embedding_rag_profile_id,embedding_rag_profile_hash,
-       embedding_rag_profile_snapshot,
-       embedding_rag_profile_snapshot_provenance,
+    `select id,state,requested_count,
+       jsonb_build_object(
+         'executionMode',conditions->>'executionMode'
+       ) conditions,
+       jsonb_build_object(
+         'completedQuestions',progress->'completedQuestions',
+         'failedQuestions',progress->'failedQuestions',
+         'error',progress->'error'
+       ) progress,
        created_at,updated_at
-     from generation_batches order by created_at desc limit 100`,
+     from generation_batches order by created_at desc limit 20`,
   );
   return NextResponse.json({ items: result.rows });
 }
@@ -61,6 +63,7 @@ export async function POST(request: Request) {
   if (sources.rowCount !== input.sourceFileIds.length || sources.rows.some((source) => source.status !== 'READY')) {
     return NextResponse.json({ code: 'SOURCE_NOT_READY', message: '처리가 완료된 교과서만 질문 생성에 사용할 수 있습니다.' }, { status: 409 });
   }
+  await backfillMissingSourceTocEntries(input.sourceFileIds);
   const revisions = await db.query<{ id: string; source_file_id: string; revision: number }>(
     `select distinct on (source_file_id) id, source_file_id, revision
        from source_revisions
@@ -104,6 +107,19 @@ export async function POST(request: Request) {
       message: '선택한 목차가 현재 교과서 리비전의 청크에 연결되지 않았습니다. 목차 매핑을 확인해 주세요.',
     }, { status: 409 });
   }
+  const resolvedChunkIds = input.tocEntryIds.length
+    ? (await db.query<{ id: string }>(
+      `select distinct chunk.id
+         from source_chunks chunk
+         join source_chunk_toc_entries mapping
+           on mapping.source_chunk_id=chunk.id
+          and mapping.source_revision_id=chunk.source_revision_id
+        where mapping.source_toc_entry_id=any($1::uuid[])
+          and chunk.source_revision_id=any($2::uuid[])
+        order by chunk.id`,
+      [input.tocEntryIds, sourceRevisionIds],
+    )).rows.map((chunk) => chunk.id)
+    : [];
 
   const id = randomUUID();
   const progress = {
@@ -205,6 +221,7 @@ export async function POST(request: Request) {
             sourceFileIds:input.sourceFileIds,
             sourceRevisionIds,
             tocEntryIds:input.tocEntryIds,
+            ...(input.tocEntryIds.length ? { resolvedChunkIds } : {}),
           }),
           generationDefinition.settings.model,
           JSON.stringify(progress),

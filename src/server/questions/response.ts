@@ -1,5 +1,36 @@
 import { z } from 'zod';
 
+export type GeneratedQuestionValidationIssue = {
+  code: string;
+  message: string;
+  path: Array<string | number>;
+};
+
+export class GeneratedQuestionResponseError extends Error {
+  readonly code = 'GENERATION_PARSE_FAILED';
+  readonly validationIssues: GeneratedQuestionValidationIssue[];
+
+  constructor(error: unknown) {
+    const validationIssues = error instanceof z.ZodError
+      ? error.issues.map((issue) => ({
+        code: issue.code,
+        message: issue.message,
+        path: issue.path.map((part) => typeof part === 'symbol' ? String(part) : part),
+      }))
+      : [{
+        code: 'invalid_json',
+        message: error instanceof Error ? error.message : 'JSON 파싱 오류',
+        path: [],
+      }];
+    super(
+      `GENERATION_PARSE_FAILED: Gemini 구조화 응답이 올바르지 않습니다. ${JSON.stringify(validationIssues)}`,
+      { cause: error },
+    );
+    this.name = 'GeneratedQuestionResponseError';
+    this.validationIssues = validationIssues;
+  }
+}
+
 const prerequisiteRelationSchema = z.object({
   fromConcept: z.string().min(1),
   toConcept: z.string().min(1),
@@ -53,9 +84,28 @@ export const generatedQuestionResponseJsonSchema = {
       properties: {
         benchmarkType: { type: 'string', enum: ['PREREQUISITE_RELATIONSHIP'] },
         taskType: { type: 'string', enum: ['dependency_application', 'missing_prerequisite_diagnosis', 'cross_unit_transfer', 'relation_direction_discrimination', 'prerequisite_chain_completion'] },
-        targetConcept: { type: 'string' },
+        targetConcept: {
+          type: 'string',
+          description: '선수 관계가 최종적으로 도달하는 하나의 간결한 교과서 개념 또는 원리명. 분석·계산 같은 수행 과제 문장이나 여러 목표의 결합이 아니어야 하며, 적어도 한 prerequisiteRelations 항목의 toConcept와 글자 단위로 정확히 동일해야 한다.',
+        },
         prerequisiteConcepts: { type: 'array', minItems: 1, items: { type: 'object', properties: { concept: { type: 'string' }, role: { type: 'string' }, evidenceChunkIds: { type: 'array', minItems: 1, items: { type: 'string' } } }, required: ['concept', 'role', 'evidenceChunkIds'], additionalProperties: false } },
-        prerequisiteRelations: { type: 'array', minItems: 1, items: { type: 'object', properties: { fromConcept: { type: 'string' }, toConcept: { type: 'string' }, relationType: { type: 'string', enum: ['REQUIRES', 'BUILDS_ON', 'APPLIES', 'DISTINGUISHES'] }, explanation: { type: 'string' }, evidenceChunkIds: { type: 'array', minItems: 1, items: { type: 'string' } } }, required: ['fromConcept', 'toConcept', 'relationType', 'explanation', 'evidenceChunkIds'], additionalProperties: false } },
+        prerequisiteRelations: {
+          type: 'array',
+          description: '방향성 있는 선수 관계 목록. 적어도 한 항목은 toConcept에 benchmarkDesign.targetConcept 문자열을 그대로 복사해 목표 개념으로 연결해야 한다.',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              fromConcept: { type: 'string', description: '선행하는 선수 개념' },
+              toConcept: { type: 'string', description: '관계가 도달하는 개념. 최종 관계에서는 targetConcept와 글자 단위로 정확히 동일해야 한다.' },
+              relationType: { type: 'string', enum: ['REQUIRES', 'BUILDS_ON', 'APPLIES', 'DISTINGUISHES'] },
+              explanation: { type: 'string' },
+              evidenceChunkIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+            },
+            required: ['fromConcept', 'toConcept', 'relationType', 'explanation', 'evidenceChunkIds'],
+            additionalProperties: false,
+          },
+        },
         requiredReasoningSteps: { type: 'array', minItems: 2, items: { type: 'string' } },
         failureSignals: { type: 'array', minItems: 1, items: { type: 'string' } },
       },
@@ -70,8 +120,7 @@ export function parseGeneratedQuestionResponse(text: string): GeneratedQuestion 
   try {
     return generatedQuestionSchema.parse(JSON.parse(text.trim()));
   } catch (error) {
-    const detail = error instanceof Error ? error.message : 'JSON 파싱 오류';
-    throw new Error(`GENERATION_PARSE_FAILED: Gemini 구조화 응답이 올바르지 않습니다. ${detail}`);
+    throw new GeneratedQuestionResponseError(error);
   }
 }
 

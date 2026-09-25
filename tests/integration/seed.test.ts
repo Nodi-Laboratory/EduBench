@@ -15,7 +15,15 @@ test('bootstraps runtime configuration without inserting sample questions, datas
   await seedDatabase();
   await seedDatabase();
 
-  const providers = await db.query<{ count: string }>('select count(*) from provider_configs');
+  const providers = await db.query<{
+    provider_key:string;
+    display_name:string;
+    protocol:string;
+    model_id:string | null;
+  }>(
+    `select provider_key,display_name,protocol,model_id
+     from provider_configs order by provider_key`,
+  );
   const questions = await db.query<{ count: string }>(
     `select count(*) from questions where public_id like 'SAMPLE-Q-%'`,
   );
@@ -25,7 +33,32 @@ test('bootstraps runtime configuration without inserting sample questions, datas
   );
   const scoreProfiles = await db.query<{ count: string }>('select count(*) from score_profiles');
 
-  expect(Number(providers.rows[0]?.count)).toBe(3);
+  expect(providers.rows).toEqual([
+    {
+      provider_key:'exaone',
+      display_name:'EXAONE',
+      protocol:'openai-compatible',
+      model_id:'LGAI-EXAONE/K-EXAONE-236B-A23B',
+    },
+    {
+      provider_key:'gemini',
+      display_name:'Gemini',
+      protocol:'gemini',
+      model_id:'gemini-3.5-flash',
+    },
+    {
+      provider_key:'openai',
+      display_name:'OpenAI',
+      protocol:'openai-responses',
+      model_id:process.env.OPENAI_MODEL || 'gpt-5.5',
+    },
+    {
+      provider_key:'upstage',
+      display_name:'Upstage',
+      protocol:'openai-compatible',
+      model_id:'solar-pro3',
+    },
+  ]);
   expect(Number(scoreProfiles.rows[0]?.count)).toBeGreaterThanOrEqual(1);
   expect(Number(questions.rows[0]?.count)).toBe(0);
   expect(Number(datasets.rows[0]?.count)).toBe(0);

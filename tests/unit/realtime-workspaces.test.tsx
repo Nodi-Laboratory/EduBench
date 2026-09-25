@@ -356,6 +356,7 @@ test('a delayed source deletion cannot close a newly selected source', async () 
 test('source replaces full-history polling with one activity stream and preserves logs across coalesced refresh', async () => {
   vi.stubGlobal('EventSource', EventSourceStub);
   const intervalSpy = vi.spyOn(window, 'setInterval');
+  const serializePayload = vi.fn(() => ({ marker: 'SOURCE-PAYLOAD' }));
   const source = {
     id: 'source-a',
     original_name: 'science.pdf',
@@ -512,7 +513,7 @@ test('source replaces full-history polling with one activity stream and preserve
           events: [{
             id: '10',
             event_type: 'DOCUMENT_PARSE_STARTED',
-            payload: {},
+            payload: { toJSON: serializePayload },
             created_at: source.created_at,
           }],
         }),
@@ -525,6 +526,10 @@ test('source replaces full-history polling with one activity stream and preserve
 
   fireEvent.click(screen.getByText('science.pdf'));
   await screen.findByText('Upstage Document Parse 시작');
+  expect(serializePayload).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByText('Upstage Document Parse 시작'));
+  await waitFor(() => expect(serializePayload).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText(/SOURCE-PAYLOAD/)).toBeInTheDocument();
   expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/artifacts?'))).toBe(false);
   fireEvent.click(screen.getByRole('tab', { name: '파싱 원문' }));
   expect(await screen.findByText('# 교과서 사람이 읽는 원문')).toBeInTheDocument();
@@ -535,7 +540,7 @@ test('source replaces full-history polling with one activity stream and preserve
   expect(await screen.findByText('둘째 페이지')).toBeInTheDocument();
   expect(fetchMock).toHaveBeenCalledWith(
     '/api/sources/source-a/artifacts?kind=pages&limit=5&revisionId=revision-1&afterPage=1',
-    { cache: 'no-store' },
+    expect.objectContaining({ cache: 'no-store' }),
   );
   fireEvent.click(screen.getByRole('button', { name: '페이지 더 보기' }));
   expect(await screen.findByText('새 revision 페이지')).toBeInTheDocument();
@@ -586,6 +591,7 @@ test('source replaces full-history polling with one activity stream and preserve
 test('generation uses one generic activity event and coalesces snapshot refresh without clearing history', async () => {
   vi.stubGlobal('EventSource', EventSourceStub);
   const intervalSpy = vi.spyOn(window, 'setInterval');
+  const serializePayload = vi.fn(() => ({ marker: 'GENERATION-PAYLOAD' }));
   const batchId = 'batch-a';
   const activity = {
     batch: {
@@ -600,7 +606,7 @@ test('generation uses one generic activity event and coalesces snapshot refresh 
     events: [{
       id: '20',
       event_type: 'GENERATION_STARTED',
-      payload: {},
+      payload: { toJSON: serializePayload },
       created_at: '2026-07-26T00:00:00.000Z',
     }],
     questions: [],
@@ -648,6 +654,10 @@ test('generation uses one generic activity event and coalesces snapshot refresh 
   }]} />);
 
   await screen.findByText('생성 배치 시작');
+  expect(serializePayload).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByText('생성 배치 시작'));
+  await waitFor(() => expect(serializePayload).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText(/GENERATION-PAYLOAD/)).toBeInTheDocument();
   await waitFor(() => expect(EventSourceStub.instances).toHaveLength(1));
   expect(EventSourceStub.instances[0]!.url).toBe('/api/events/generation/batch-a?after=20');
   expect(intervalSpy.mock.calls.some(([, delay]) => delay === 1_000 || delay === 1_500)).toBe(false);
@@ -673,6 +683,7 @@ test('generation uses one generic activity event and coalesces snapshot refresh 
 
 test('run starts after its atomic snapshot cursor and displays an unknown event without a whitelist', async () => {
   vi.stubGlobal('EventSource', EventSourceStub);
+  const serializePayload = vi.fn(() => ({ marker: 'RUN-PAYLOAD' }));
   const fetchMock = vi.fn(async () => ({
     ok: true,
     json: async () => ({
@@ -702,7 +713,7 @@ test('run starts after its atomic snapshot cursor and displays an unknown event 
     initialEvents={[{
       id: '30',
       event_type: 'RUN_STARTED',
-      payload: { state: 'RUNNING' },
+      payload: { state: 'RUNNING', toJSON: serializePayload },
       created_at: '2026-07-26T00:00:00.000Z',
     }]}
     initialEventCursor="30"
@@ -711,6 +722,10 @@ test('run starts after its atomic snapshot cursor and displays an unknown event 
   await waitFor(() => expect(EventSourceStub.instances).toHaveLength(1));
   expect(EventSourceStub.instances[0]!.url).toBe('/api/events/benchmark_run/run-a?after=30');
   expect(screen.getByText('RUN_STARTED')).toBeInTheDocument();
+  expect(serializePayload).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByText('RUN_STARTED'));
+  await waitFor(() => expect(serializePayload).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText(/RUN-PAYLOAD/)).toBeInTheDocument();
   act(() => {
     EventSourceStub.instances[0]!.emitOpen();
     EventSourceStub.instances[0]!.emitActivity({

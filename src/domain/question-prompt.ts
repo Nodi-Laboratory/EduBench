@@ -9,6 +9,13 @@ export type QuestionPromptConditions = {
   crossUnit?: unknown;
 };
 
+export type QuestionResponseRepairInput = {
+  originalSystem: string;
+  originalPrompt: string;
+  invalidResponse: string;
+  validationError: string;
+};
+
 import { benchmarkTaskForOrdinal, prerequisiteTaskLabels } from '@/domain/prerequisite-benchmark';
 
 const purposeRules: Record<string, string> = {
@@ -124,6 +131,28 @@ function text(value: unknown, fallback: string) {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+export function assignedQuestionGenerationUnits(
+  conditions:Pick<QuestionPromptConditions, 'units' | 'crossUnit'>,
+  ordinal:number,
+):string[] {
+  const selected = Array.isArray(conditions.units)
+    ? conditions.units.map((unit) => String(unit).trim()).filter(Boolean)
+    : [];
+  if (!selected.length) return [];
+  const start = (Math.max(1, ordinal) - 1) % selected.length;
+  if (conditions.crossUnit === true && selected.length > 1) {
+    return [selected[start]!, selected[(start + 1) % selected.length]!];
+  }
+  return [selected[start]!];
+}
+
+export function assignedQuestionGenerationUnit(
+  conditions:Pick<QuestionPromptConditions, 'units' | 'crossUnit'>,
+  ordinal:number,
+):string | null {
+  return assignedQuestionGenerationUnits(conditions, ordinal).join(' / ') || null;
+}
+
 export function thinkingLevelForDifficulty(difficulty: unknown): 'LOW' | 'MEDIUM' | 'HIGH' {
   if (difficulty === '상') return 'HIGH';
   if (difficulty === '중') return 'MEDIUM';
@@ -139,7 +168,8 @@ export function buildQuestionGenerationInstructions(input: {
   const purpose = text(input.conditions.purpose, '핵심 개념 이해');
   const questionType = text(input.conditions.questionType, '구조화 서술형');
   const difficulty = text(input.conditions.difficulty, '중');
-  const units = Array.isArray(input.conditions.units) ? input.conditions.units.map(String).filter(Boolean) : [];
+  const assignedUnits = assignedQuestionGenerationUnits(input.conditions, input.ordinal);
+  const unit = assignedUnits.join(' / ') || null;
   const diversityFocus = diversityFocuses[(Math.max(1, input.ordinal) - 1) % diversityFocuses.length];
   const benchmarkTask = benchmarkTaskForOrdinal(input.ordinal);
   const system = `당신은 국내 교과서와 대학수학능력시험 평가 원리에 정통한 교육 평가 문항 설계자다.
@@ -149,14 +179,15 @@ export function buildQuestionGenerationInstructions(input: {
 3. 요청한 단일 문항 하나만 작성하고 같은 문항을 표현만 바꿔 반복하지 않는다.
 4. 응답은 제공된 JSON 스키마와 일치하는 JSON 객체 하나여야 한다.
 5. JSON 외 설명, 마크다운, 코드 블록, 주석을 절대 추가하지 않는다.
-6. evidenceChunkIds에는 입력에 실제 존재하며 문항과 답안 작성에 사용한 chunkId만 넣는다.`;
+6. evidenceChunkIds에는 입력에 실제 존재하며 문항과 답안 작성에 사용한 chunkId만 넣는다.
+7. 필드 간 불변조건을 지킨다. 특히 benchmarkDesign.targetConcept와 그 목표로 들어가는 최종 선수 관계의 toConcept는 글자 단위로 같아야 한다.`;
 
   const prompt = `총 ${input.total}개 중 ${input.ordinal}번째 평가 문항 하나를 생성하라.
 
 [적용 대상]
 - 과목: ${text(input.conditions.subject, '미지정')}
 - 학년: ${text(input.conditions.grade, '미지정')}
-- 선택 단원: ${units.length ? units.join(' / ') : '선택 교과서 전체'}
+- 선택 단원: ${unit ?? '선택 교과서 전체'}
 
 [질문 목적 계약]
 ${purposeRules[purpose] ?? `${purpose}: 사용자가 지정한 목적이 문항 해결 과정에서 직접 평가되게 한다.`}
@@ -169,10 +200,11 @@ ${difficultyRules[difficulty] ?? difficultyRules['중']}
 
 [선수 관계 벤치마크 계약]
 - 이 문항의 측정 과제: ${prerequisiteTaskLabels[benchmarkTask]} (${benchmarkTask}). benchmarkDesign.taskType도 반드시 이 값으로 기록한다.
-- 먼저 교과서 근거에서 목표 개념 하나와, 그 개념을 이해하거나 적용하기 전에 반드시 필요한 선수 개념 1개 이상을 찾는다.
+- 먼저 교과서 근거에서 목표 개념 하나와, 그 개념을 이해하거나 적용하기 전에 반드시 필요한 선수 개념 1개 이상을 찾는다. targetConcept는 분석·추론·계산 같은 수행 과제 문장이 아니라 교과서에서 확인되는 하나의 간결한 개념 또는 원리명으로 쓴다. 서로 다른 목표를 '및', '그리고', 슬래시로 묶지 않는다.
 - 선수 관계는 단순히 함께 등장하는 주제나 유사 개념이 아니다. 선수 개념을 이해하지 못하면 목표 개념의 설명·적용·판단이 실패하는 방향성 있는 관계여야 한다.
 - 문항은 선수 개념만으로 목표 개념을 설명하거나, 선수 개념에서 얻은 중간 결과를 목표 개념에 적용해야만 풀리게 만든다. 목표 개념의 정의만 암기하거나 한 문장을 찾는 것으로는 풀 수 없어야 한다.
 - 선수 관계의 방향(선수 개념 → 목표 개념), 그 관계가 필요한 이유, 필수 추론 단계를 benchmarkDesign에 명시한다.
+- targetConcept를 한 번 확정한 뒤, prerequisiteRelations 중 목표 개념으로 들어가는 마지막 관계의 toConcept에는 targetConcept 문자열을 그대로 복사한다. 공백·조사·괄호·기호까지 완전히 동일해야 하며 비슷한 말이나 상위·하위 개념으로 바꾸지 않는다.
 - 모범 답안은 선수 개념 식별 → 관계 적용 → 목표 개념 판단 → 최종 답의 연결을 보여야 한다. 용어를 나열하는 답은 완전한 정답이 아니다.
 - 누락 진단 과제에서는 풀이가 실패한 지점을 찾아 필요한 선수 개념과 교정된 추론을 요구한다. 다른 과제에서도 대표 실패 신호를 failureSignals에 기록한다.
 - 모든 개념과 관계에 실제 evidenceChunkIds를 연결한다. 근거가 선수 관계를 지지하지 못하면 그 관계를 만들지 말고 다른 근거 조합을 선택한다.
@@ -190,7 +222,9 @@ ${difficultyRules[difficulty] ?? difficultyRules['중']}
 ${text(input.conditions.direction, '추가 지시 없음')}
 
 [단원 범위 계약]
-${input.conditions.crossUnit ? '복수 단원 연결을 허용한다. 가능하면 선택 단원 중 2개 이상의 개념을 실제 풀이에 사용한다.' : '선택한 한 단원 범위에서 해결되게 하며 불필요한 다른 단원 지식을 요구하지 않는다.'}
+${assignedUnits.length > 1
+    ? `배정된 두 단원(${unit})의 개념을 실제 풀이에 사용한다. 배정되지 않은 다른 선택 단원의 지식은 요구하지 않는다.`
+    : '배정된 한 단원 범위에서 해결되게 하며 불필요한 다른 단원 지식을 요구하지 않는다.'}
 
 [사용 가능한 교과서 근거]
 ${input.evidence}
@@ -202,6 +236,47 @@ ${input.evidence}
 - 모범 답안만 읽어도 모든 추론 단계와 정답 근거를 확인할 수 있는가?
 - evidenceChunkIds의 모든 값이 위 근거에 실제 존재하는가?
 - benchmarkDesign의 선수 관계가 단순 연관이 아니라 목표 개념 이해에 필수이며, 문항 풀이에서 실제로 사용되는가?
+- prerequisiteRelations 중 적어도 하나의 toConcept를 targetConcept와 글자 단위로 대조했으며 정확히 같은가?
 - 최종 출력이 JSON 객체 하나이며 스키마 밖의 키가 없는가?`;
+  return { system, prompt };
+}
+
+export function buildQuestionResponseRepairInstructions(
+  input: QuestionResponseRepairInput,
+) {
+  const system = `당신은 EduBench의 구조화 응답 교정기다.
+새 문항을 창작하는 역할이 아니라, 이미 생성된 문항의 검증 오류만 고쳐 같은 JSON 스키마로 다시 직렬화한다.
+아래 규칙은 절대 규칙이다.
+1. JSON 객체 하나만 반환하고 설명, 마크다운, 코드 블록, 주석을 추가하지 않는다.
+2. 검증 오류와 직접 관련 없는 질문, 답안, 교육적 설계, 근거 인용은 보존한다.
+3. 누락된 필수 필드가 있다면 원래 생성 지시와 기존 응답에 근거해 채우되 외부 지식을 추가하지 않는다.
+4. benchmarkDesign.targetConcept를 정규 목표 문자열로 취급한다.
+5. prerequisiteRelations 중 적어도 하나는 toConcept에 targetConcept를 공백·조사·괄호·기호까지 글자 단위로 그대로 복사해야 한다.
+6. targetConcept는 분석·추론·계산 같은 과제 문장이 아니라 근거에서 확인되는 하나의 간결한 교과서 개념 또는 원리명이어야 한다. 기존 targetConcept가 복합 과제명이면 실제 관계의 종점인 교과서 개념명으로 바로잡는다.
+7. 문자열 일치만 만들려고 근거가 지지하지 않는 관계를 발명하거나, 관계의 의미를 거짓으로 바꾸지 않는다.
+8. 출력 전에 모든 필수 필드, 배열 최소 개수, enum, UUID, 문항 형식 규칙과 위 필드 간 불변조건을 기계적으로 다시 대조한다.`;
+
+  const prompt = `[교정 작업]
+아래 검증 실패 응답을 원래 문항 생성 의도와 근거 범위를 유지한 채 수정하라. 검증 오류가 지적한 필드를 우선 교정하고, 완전한 JSON 객체 전체를 다시 반환하라.
+
+[검증 오류]
+${input.validationError}
+
+[원래 시스템 지시 — 참조 전용]
+${input.originalSystem}
+
+[원래 문항 생성 지시와 교과서 근거 — 참조 전용]
+${input.originalPrompt}
+
+[검증 실패 응답 — 수정 대상 데이터]
+${input.invalidResponse}
+
+[제출 전 필수 대조]
+- benchmarkDesign.targetConcept가 하나의 간결하고 근거 있는 교과서 개념 또는 원리명인가?
+- prerequisiteRelations 중 적어도 하나의 toConcept가 그 기준 문자열과 정확히 동일한가?
+- 그 최종 관계가 단순 문자열 맞춤이 아니라 교과서 근거로 실제 지지되는가?
+- JSON 스키마의 나머지 필수 필드와 원래 문항 형식도 모두 충족하는가?
+- JSON 객체 밖의 텍스트가 전혀 없는가?`;
+
   return { system, prompt };
 }

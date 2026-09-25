@@ -1,11 +1,27 @@
 import { assertProviderResponse, executeFetch, requestIdFrom } from './http';
-import type { FetchLike, GenerationRequest, ModelProvider, NormalizedGeneration } from './types';
+import {
+  ProviderError,
+  type FetchLike,
+  type GenerationRequest,
+  type ModelProvider,
+  type NormalizedGeneration,
+} from './types';
 
 type GeminiResponse = {
   modelVersion?: string;
   candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>;
+  promptFeedback?: { blockReason?:string };
   usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
 };
+
+const blockedFinishReasons = new Set([
+  'SAFETY',
+  'RECITATION',
+  'BLOCKLIST',
+  'PROHIBITED_CONTENT',
+  'SPII',
+  'IMAGE_SAFETY',
+]);
 
 export class GeminiProvider implements ModelProvider {
   readonly key = 'gemini';
@@ -48,13 +64,43 @@ export class GeminiProvider implements ModelProvider {
     await assertProviderResponse(response, this.apiKey);
     const raw = await response.json() as GeminiResponse;
     const candidate = raw.candidates?.[0];
+    const text = candidate?.content?.parts
+      ?.map((part) => part.text ?? '')
+      .join('') ?? '';
+    const finishReason = candidate?.finishReason ?? null;
+    const requestId = requestIdFrom(response);
+    const blockReason = raw.promptFeedback?.blockReason;
+    if (
+      blockReason
+      || (finishReason && blockedFinishReasons.has(finishReason))
+    ) {
+      throw new ProviderError({
+        kind:'CONTENT_FILTER',
+        message:`CONTENT_FILTER: Gemini 응답이 차단되었습니다. reason=${blockReason ?? finishReason}`,
+        retryable:false,
+        status:response.status,
+        requestId,
+      });
+    }
+    if (
+      !text.trim()
+      || finishReason !== 'STOP'
+    ) {
+      throw new ProviderError({
+        kind:'PARSE',
+        message:`PARSE: Gemini 응답이 완료되지 않았거나 답변 텍스트가 없습니다. finishReason=${finishReason ?? 'UNKNOWN'}`,
+        retryable:finishReason === 'MAX_TOKENS',
+        status:response.status,
+        requestId,
+      });
+    }
     return {
-      text: candidate?.content?.parts?.map((part) => part.text ?? '').join('') ?? '',
+      text,
       raw,
       inputTokens: raw.usageMetadata?.promptTokenCount ?? null,
       outputTokens: raw.usageMetadata?.candidatesTokenCount ?? null,
-      finishReason: candidate?.finishReason ?? null,
-      requestId: requestIdFrom(response),
+      finishReason,
+      requestId,
       modelId: this.modelId,
       modelSnapshot: raw.modelVersion ?? null,
       latencyMs: Math.round(performance.now() - started),

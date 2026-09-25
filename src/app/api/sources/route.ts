@@ -119,7 +119,7 @@ export async function POST(request: Request) {
     );
     const previous = predecessor.rows[0] ?? null;
     const id = randomUUID();
-    const storagePath = await storeSourceFile(id, bytes);
+    const storagePath = await storeSourceFile(sha256, bytes);
     await client.query(
       `insert into source_files(
          id,sha256,original_name,storage_path,mime_type,byte_size,

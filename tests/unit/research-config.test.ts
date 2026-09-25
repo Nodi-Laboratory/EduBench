@@ -46,22 +46,30 @@ describe('research configuration definitions', () => {
     });
     expect(defaultResearchConfigDefinitions[2]).toMatchObject({
       kind:'question_generation',
+      version:'question-generation-gemini-3.5-flash-v3',
       settings:{
-        model:'gemini-3.6-flash',
-        directionMaxOutputTokens:2048,
+        model:'gemini-3.5-flash',
+        directionMaxOutputTokens:8192,
         questionMaxOutputTokens:16384,
       },
     });
     expect(defaultResearchConfigDefinitions[3]).toMatchObject({
       kind:'benchmark_models',
+      version:'benchmark-models-core-v6',
       settings:{
         models:[
-          { providerKey:'gemini', modelId:'gemini-3.6-flash' },
+          { providerKey:'gemini', modelId:'gemini-3.5-flash' },
           { providerKey:'upstage', modelId:'solar-pro3' },
           {
             providerKey:'exaone',
             modelId:'LGAI-EXAONE/K-EXAONE-236B-A23B',
             generation:{ temperature:1, topP:0.95, presencePenalty:0, enableThinking:true, maxOutputTokens:16384 },
+          },
+          {
+            providerKey:'openai',
+            displayName:'OpenAI GPT-5.5',
+            modelId:'gpt-5.5',
+            protocol:'openai-responses',
           },
         ],
       },

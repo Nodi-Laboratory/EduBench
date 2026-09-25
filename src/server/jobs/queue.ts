@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import { withTransaction } from '@/server/db/transaction';
 import { DomainError } from '@/domain/errors';
+import type { BenchmarkProviderCooldown } from '@/server/runs/provider-cooldown';
 
 export type JobState = 'PENDING' | 'LEASED' | 'RETRY_WAIT' | 'SUCCEEDED' | 'TERMINAL_FAILED' | 'CANCELLED';
 
@@ -368,6 +369,70 @@ export async function releaseJobForShutdown(lease: JobLease): Promise<void> {
       interruptedAttempt:lease.attempt,
       preservedAttempts:released.rows[0].attempts,
       extendedMaxAttempts:released.rows[0].max_attempts,
+    });
+  });
+}
+
+export async function deferJobForProviderCooldown(
+  lease:JobLease,
+  cooldown:BenchmarkProviderCooldown,
+):Promise<void> {
+  await withTransaction(async (client) => {
+    const deferred = await client.query<{ attempts:number }>(
+      `update jobs
+          set state='RETRY_WAIT',
+              attempts=greatest(attempts-1,0),
+              available_at=greatest($4::timestamptz,now()),
+              lease_owner=null,
+              lease_expires_at=null,
+              completed_at=null,
+              last_error_code='PROVIDER_COOLDOWN',
+              last_error_message=$5,
+              updated_at=now()
+        where id=$1
+          and state='LEASED'
+          and lease_owner=$2
+          and attempts=$3
+          and lease_expires_at>now()
+        returning attempts`,
+      [
+        lease.jobId,
+        lease.workerId,
+        lease.attempt,
+        cooldown.blockedUntil,
+        `${cooldown.providerKey} provider cooldown until ${cooldown.blockedUntil.toISOString()}`,
+      ],
+    );
+    if (!deferred.rows[0]) {
+      throw new DomainError('JOB_LEASE_MISMATCH', '작업 lease 소유자가 일치하지 않습니다.', lease);
+    }
+    const restoredItems = await client.query<{ ordinal:number; attempts:number }>(
+      `update generation_items
+          set state='PENDING',
+              retryable=true,
+              claimed_job_id=null,
+              claimed_job_attempt=null,
+              error_code=null,
+              error_message=null,
+              started_at=null,
+              completed_at=null,
+              updated_at=now()
+        where state='RUNNING'
+          and claimed_job_id=$1
+          and claimed_job_attempt=$2
+        returning ordinal,attempts`,
+      [lease.jobId, lease.attempt],
+    );
+    await appendEvent(client, lease.jobId, 'JOB_PROVIDER_COOLDOWN_DEFERRED', {
+      workerId:lease.workerId,
+      interruptedAttempt:lease.attempt,
+      preservedAttempts:deferred.rows[0].attempts,
+      providerKey:cooldown.providerKey,
+      blockedUntil:cooldown.blockedUntil.toISOString(),
+      deferredGenerationItems:restoredItems.rows.map((item) => ({
+        ordinal:item.ordinal,
+        auditAttempt:item.attempts,
+      })),
     });
   });
 }

@@ -4,6 +4,7 @@ import { migrate } from '@/server/db/migrate';
 import {
   claimJobs,
   completeJob,
+  deferJobForProviderCooldown,
   enqueueJob,
   failJob,
   releaseJobForShutdown,
@@ -11,6 +12,88 @@ import {
   renewJobLease,
   withJobLeaseHeartbeat,
 } from '@/server/jobs/queue';
+
+test('defers a rate-limited job until the provider cooldown expires without consuming its attempt', async () => {
+  const job = await enqueueJob({
+    kind:'question.generate',
+    payload:{ batchId:'00000000-0000-4000-8000-000000000042' },
+    idempotencyKey:'generation:provider-cooldown',
+    maxAttempts:1,
+  });
+  const [claimed] = await claimJobs('worker-cooldown', 1, 60_000, ['question.generate']);
+  const blockedUntil = new Date(Date.now() + 60_000);
+
+  await deferJobForProviderCooldown({
+    jobId:claimed!.id,
+    workerId:'worker-cooldown',
+    attempt:claimed!.attempts,
+  }, {
+    providerKey:'gemini',
+    blockedUntil,
+    rateLimitDimension:'RPM',
+    rateLimitScope:null,
+    retryAfterMs:60_000,
+    sourceRunId:null,
+    sourceRunItemId:null,
+    sourcePhase:'QUESTION_GENERATION',
+    sourceModelId:null,
+    requestId:null,
+    lastErrorMessage:'rate limited',
+    hitCount:1,
+    activatedAt:new Date(),
+    resumedAt:null,
+    updatedAt:new Date(),
+  });
+
+  const deferred = await db.query<{ state:string; attempts:number; available_at:Date }>(
+    'select state,attempts,available_at from jobs where id=$1',
+    [job.id],
+  );
+  expect(deferred.rows[0]).toMatchObject({ state:'RETRY_WAIT', attempts:0 });
+  expect(deferred.rows[0]!.available_at.getTime()).toBeGreaterThanOrEqual(blockedUntil.getTime() - 1_000);
+  await expect(claimJobs('replacement-worker', 1, 60_000, ['question.generate'])).resolves.toEqual([]);
+});
+
+test('releases generation-item ownership without rewinding its audit attempt when deferring its leased job', async () => {
+  const batchId = '00000000-0000-4000-8000-000000000043';
+  await db.query('delete from generation_items where generation_batch_id=$1', [batchId]);
+  await db.query('delete from generation_batches where id=$1', [batchId]);
+  await db.query(
+    `insert into generation_batches(
+       id,state,requested_count,conditions,source_scope,generation_model,prompt_version
+     ) values($1,'RUNNING',1,'{}'::jsonb,'{}'::jsonb,'test','test')`,
+    [batchId],
+  );
+  const job = await enqueueJob({
+    kind:'question.generate', payload:{ batchId }, idempotencyKey:'generation:provider-cooldown-item',
+  });
+  const [claimed] = await claimJobs('worker-cooldown-item', 1, 60_000, ['question.generate']);
+  await db.query(
+    `insert into generation_items(
+       generation_batch_id,ordinal,state,attempts,claimed_job_id,claimed_job_attempt,started_at
+     ) values($1,1,'RUNNING',3,$2,$3,now())`,
+    [batchId, job.id, claimed!.attempts],
+  );
+
+  await deferJobForProviderCooldown({
+    jobId:job.id, workerId:'worker-cooldown-item', attempt:claimed!.attempts,
+  }, {
+    providerKey:'gemini', blockedUntil:new Date(Date.now() + 60_000),
+    rateLimitDimension:'RPM', rateLimitScope:null, retryAfterMs:60_000,
+    sourceRunId:null, sourceRunItemId:null, sourcePhase:'QUESTION_GENERATION',
+    sourceModelId:null, requestId:null, lastErrorMessage:'rate limited', hitCount:1,
+    activatedAt:new Date(), resumedAt:null, updatedAt:new Date(),
+  });
+
+  const item = await db.query<{
+    state:string; attempts:number; claimed_job_id:string | null; claimed_job_attempt:number | null;
+  }>('select state,attempts,claimed_job_id,claimed_job_attempt from generation_items where generation_batch_id=$1', [batchId]);
+  expect(item.rows[0]).toEqual({
+    state:'PENDING', attempts:3, claimed_job_id:null, claimed_job_attempt:null,
+  });
+  await db.query('delete from generation_items where generation_batch_id=$1', [batchId]);
+  await db.query('delete from generation_batches where id=$1', [batchId]);
+});
 
 beforeAll(async () => {
   await migrate();
