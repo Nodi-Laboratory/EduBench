@@ -1,3 +1,4 @@
+import { rememberProviderKeys } from '@/server/providers/credentials';
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, expect, test, vi } from 'vitest';
@@ -516,7 +517,7 @@ test('uses verified production embeddings and cosine order for simple VECTOR ret
   const previousMock = process.env.MOCK_PROVIDERS;
   const previousKey = process.env.GOOGLE_API_KEY;
   process.env.MOCK_PROVIDERS = 'false';
-  process.env.GOOGLE_API_KEY = 'integration-test-key';
+  rememberProviderKeys(`run:${run.id}`, { gemini:'integration-test-key' });
   let fetchCalls = 0;
   let signalEmbeddingStarted!:() => void;
   const embeddingStarted = new Promise<void>((resolve) => {
@@ -962,7 +963,7 @@ test('lets a healthy waiter take over when only the retrieval owner is aborted',
   const previousMock = process.env.MOCK_PROVIDERS;
   const previousKey = process.env.GOOGLE_API_KEY;
   process.env.MOCK_PROVIDERS = 'false';
-  process.env.GOOGLE_API_KEY = 'integration-test-key';
+  rememberProviderKeys(`run:${run.id}`, { gemini:'integration-test-key' });
   const ownerController = new AbortController();
   let signalOwnerStarted!:() => void;
   const ownerStarted = new Promise<void>((resolve) => {

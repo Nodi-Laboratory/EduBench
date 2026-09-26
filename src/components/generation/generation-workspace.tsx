@@ -13,6 +13,9 @@ import { JsonBlock } from '@/components/ui/json-block';
 import { buildQuestionGenerationInstructions } from '@/domain/question-prompt';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
+import { ProviderKeyNotice } from '@/components/ui/provider-key-notice';
+import { useMockProviders } from '@/hooks/use-mock-providers';
+import { providerKeyHeaders, useProviderKeys } from '@/hooks/use-provider-keys';
 
 type TocEntry = {
   id: string;
@@ -409,6 +412,9 @@ function mergeBatchSnapshot(
 }
 
 export function GenerationWorkspace({ sources, batches }: { sources: GenerationSource[]; batches: GenerationBatch[] }) {
+  const mockMode = useMockProviders();
+  const { hasKey } = useProviderKeys();
+  const missingKeys = mockMode || hasKey('gemini') ? [] : ['gemini'];
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
   const [selectedTocIds, setSelectedTocIds] = useState<string[]>([]);
@@ -658,7 +664,7 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
     if (!selectedSourceIds.length) { setNotice('질문 생성에 사용할 교과서를 하나 이상 선택하세요.'); return; }
     const form = new FormData(event.currentTarget);
     const response = await fetch('/api/generation', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', ...providerKeyHeaders() },
       body: JSON.stringify({
         subject: form.get('subject'), grade: form.get('grade'),
         sourceFileIds: selectedSourceIds, tocEntryIds: selectedTocIds,
@@ -677,7 +683,7 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
   }
   async function resumeGeneration() {
     if (!selectedBatchId) return;
-    const response = await fetch(`/api/generation/${selectedBatchId}/resume`, { method: 'POST' });
+    const response = await fetch(`/api/generation/${selectedBatchId}/resume`, { method: 'POST', headers: providerKeyHeaders() });
     const body = await response.json();
     if (!response.ok) {
       setNotice(body.message ?? '생성 작업을 재개하지 못했습니다.');
@@ -730,7 +736,8 @@ export function GenerationWorkspace({ sources, batches }: { sources: GenerationS
           <details><summary>시스템 프롬프트</summary><pre>{promptPreview.system}</pre></details>
           <details open><summary>설정 적용 프롬프트</summary><pre>{promptPreview.prompt}</pre></details>
         </section>
-        <button className="button primary" type="submit" disabled={sources.length === 0 || selectedSourceIds.length === 0}><Sparkles size={15} /> 문항 생성 시작</button>
+        <ProviderKeyNotice missing={missingKeys} feature="문항 생성" />
+        <button className="button primary" type="submit" disabled={missingKeys.length > 0 || sources.length === 0 || selectedSourceIds.length === 0}><Sparkles size={15} /> 문항 생성 시작</button>
         {sources.length === 0 && <p className="form-warning">준비 완료된 교과서가 필요합니다.</p>}{notice && <p className="inline-notice" role="status">{notice}</p>}
       </form></section>
       <div className="generation-side">

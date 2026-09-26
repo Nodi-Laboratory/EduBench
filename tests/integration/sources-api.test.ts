@@ -1,3 +1,4 @@
+import { rememberProviderKeys } from '@/server/providers/credentials';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -314,11 +315,14 @@ test('validates every required real provider before reading or rasterizing the s
   delete process.env.GOOGLE_API_KEY;
   try {
     await expect(processDocument(id)).rejects.toThrow(
-      'UPSTAGE_NOT_CONFIGURED: UPSTAGE_API_KEY가 필요합니다.',
+      'UPSTAGE_NOT_CONFIGURED: Upstage API 키가 필요합니다.',
     );
-    process.env.UPSTAGE_API_KEY = 'test-upstage-key';
+    // Keys come from the browser request that enqueued the job, never env.
+    process.env.UPSTAGE_API_KEY = 'ignored-server-env-key';
+    await expect(processDocument(id)).rejects.toThrow('UPSTAGE_NOT_CONFIGURED');
+    rememberProviderKeys(`source:${id}`, { upstage:'test-upstage-key' });
     await expect(processDocument(id)).rejects.toThrow(
-      'EMBEDDING_NOT_CONFIGURED: GOOGLE_API_KEY가 필요합니다.',
+      'EMBEDDING_NOT_CONFIGURED: Gemini API 키가 필요합니다.',
     );
   } finally {
     if (previousMock == null) delete process.env.MOCK_PROVIDERS;

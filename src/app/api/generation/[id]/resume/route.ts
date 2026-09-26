@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withTransaction } from '@/server/db/transaction';
 import { enqueueJobWithClient } from '@/server/jobs/queue';
+import { withRequestProviderKeys } from '@/server/providers/credentials';
 
 type ResumeResult =
   | { kind: 'not-found' }
@@ -15,7 +16,7 @@ type ResumeResult =
     terminalFailures: number;
   };
 
-export async function POST(
+async function handlePost(
   _request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
@@ -285,4 +286,8 @@ export async function POST(
     completedQuestions: result.completedQuestions,
     terminalFailures: result.terminalFailures,
   }, { status: 202 });
+}
+
+export function POST(...args: Parameters<typeof handlePost>) {
+  return withRequestProviderKeys(args[0], () => handlePost(...args));
 }

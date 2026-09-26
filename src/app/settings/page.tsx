@@ -6,12 +6,6 @@ import { listResearchConfigProfiles } from '@/server/settings/research-profiles'
 export const metadata: Metadata = { title: '시스템 설정' };
 export const dynamic = 'force-dynamic';
 
-const envMap: Record<string, string[]> = {
-  gemini: ['GOOGLE_API_KEY'], claude: ['ANTHROPIC_API_KEY','ANTHROPIC_MODEL'],
-  openai: ['OPENAI_API_KEY','OPENAI_MODEL'], upstage: ['UPSTAGE_API_KEY'],
-  exaone: ['EXAONE_API_KEY','EXAONE_BASE_URL'], midm: ['MIDM_API_KEY','MIDM_BASE_URL','MIDM_MODEL'],
-};
-
 export default async function SettingsPage() {
   const [providers, scores, prices, researchProfiles] = await Promise.all([
     db.query<{ provider_key: string; display_name: string; protocol: string }>('select provider_key, display_name, protocol from provider_configs order by display_name'),
@@ -25,5 +19,5 @@ export default async function SettingsPage() {
     listResearchConfigProfiles(),
   ]);
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
-  return <SettingsWorkspace providers={providers.rows.map((provider) => ({ ...provider, configured: mock || envMap[provider.provider_key]!.every((key) => Boolean(process.env[key])), envNames: envMap[provider.provider_key]! }))} scores={scores.rows} prices={prices.rows} mockMode={mock} researchProfiles={researchProfiles} />;
+  return <SettingsWorkspace providers={providers.rows} scores={scores.rows} prices={prices.rows} mockMode={mock} researchProfiles={researchProfiles} />;
 }

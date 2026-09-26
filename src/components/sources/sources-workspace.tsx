@@ -12,6 +12,9 @@ import { Ban, ChevronRight, CircleStop, FileText, LoaderCircle, RotateCcw, Trash
 import { JsonBlock } from '@/components/ui/json-block';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
+import { ProviderKeyNotice } from '@/components/ui/provider-key-notice';
+import { useMockProviders } from '@/hooks/use-mock-providers';
+import { providerKeyHeaders, useProviderKeys } from '@/hooks/use-provider-keys';
 
 export type SourceListItem = {
   id: string;
@@ -1049,6 +1052,9 @@ function SourceArtifactView({
 }
 
 export function SourcesWorkspace({ initialSources }: { initialSources: SourceListItem[] }) {
+  const mockMode = useMockProviders();
+  const { hasKey } = useProviderKeys();
+  const missingKeys = mockMode ? [] : ['upstage', 'gemini'].filter((provider) => !hasKey(provider));
   const [sources, setSources] = useState(initialSources);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activity, setActivity] = useState<Activity | null>(null);
@@ -1192,7 +1198,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     event.preventDefault();
     setSubmitting(true);
     const form = event.currentTarget;
-    const response = await fetch('/api/sources', { method: 'POST', body: new FormData(form) });
+    const response = await fetch('/api/sources', { method: 'POST', headers: providerKeyHeaders(), body: new FormData(form) });
     const body = await response.json();
     if (!response.ok) setNotice(body.message ?? '파일을 등록하지 못했습니다.');
     else {
@@ -1206,7 +1212,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     setSubmitting(false);
   }
   async function retry(sourceId: string) {
-    const response = await fetch(`/api/sources/${sourceId}/retry`, { method: 'POST' });
+    const response = await fetch(`/api/sources/${sourceId}/retry`, { method: 'POST', headers: providerKeyHeaders() });
     const body = await response.json();
     setNotice(response.ok ? '문서 처리 작업을 다시 예약했습니다.' : (body.message ?? '재실행하지 못했습니다.'));
     await Promise.all([refreshSources(), fetchActivity(sourceId, false).then((snapshot) => {
@@ -1219,6 +1225,7 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
     setReprocessingId(source.id);
     const response = await fetch(`/api/sources/${source.id}/reprocess`, {
       method:'POST',
+      headers:providerKeyHeaders(),
     });
     const body = await response.json();
     if (!response.ok) {
@@ -1476,8 +1483,9 @@ export function SourcesWorkspace({ initialSources }: { initialSources: SourceLis
           <div className="upload-copy"><span className="upload-icon"><Upload size={20} /></span><div><strong>교과서 PDF 등록</strong><p>최대 100MB. 업로드 직후 처리 로그가 열립니다.</p></div></div>
           <label className="file-control">교과서 PDF<input aria-label="교과서 PDF" name="file" type="file" accept="application/pdf" required /></label>
           <label>과목<input name="subject" placeholder="예: 과학" /></label><label>학년<input name="grade" placeholder="예: 중학교 2학년" /></label>
-          <button className="button primary" disabled={submitting}>{submitting ? '저장 중…' : '업로드 및 분석 시작'}</button>
+          <button className="button primary" disabled={submitting || missingKeys.length > 0}>{submitting ? '저장 중…' : '업로드 및 분석 시작'}</button>
         </form>
+        <ProviderKeyNotice missing={missingKeys} feature="교과서 PDF 파싱과 임베딩" />
         {notice && <p className="inline-notice" role="status">{notice}</p>}
       </section>
       <div className={`sources-layout ${selectedId ? 'has-activity' : ''}`}>

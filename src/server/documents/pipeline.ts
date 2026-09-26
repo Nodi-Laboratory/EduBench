@@ -33,6 +33,7 @@ import {
   DocumentPageParseExhaustedError,
 } from '@/server/documents/failure';
 import { ProviderError } from '@/server/providers/types';
+import { isMockProviders, providerEnvFor } from '@/server/providers/credentials';
 
 export {
   effectiveDocumentParseConcurrency,
@@ -325,15 +326,16 @@ export async function processDocument(
   const effectivePageConcurrency = effectiveDocumentParseConcurrency(
     requestedPageConcurrency,
   );
-  const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
-  if (!mock && !process.env.UPSTAGE_API_KEY) {
+  const mock = isMockProviders();
+  const providerEnv = providerEnvFor(`source:${sourceId}`);
+  if (!mock && !providerEnv.UPSTAGE_API_KEY) {
     throw new Error(
-      'UPSTAGE_NOT_CONFIGURED: UPSTAGE_API_KEY가 필요합니다.',
+      'UPSTAGE_NOT_CONFIGURED: Upstage API 키가 필요합니다. 설정 화면에서 키를 입력한 뒤 다시 시도하세요.',
     );
   }
-  if (!mock && !process.env.GOOGLE_API_KEY) {
+  if (!mock && !providerEnv.GOOGLE_API_KEY) {
     throw new Error(
-      'EMBEDDING_NOT_CONFIGURED: GOOGLE_API_KEY가 필요합니다.',
+      'EMBEDDING_NOT_CONFIGURED: Gemini API 키가 필요합니다. 설정 화면에서 키를 입력한 뒤 다시 시도하세요.',
     );
   }
   options.signal?.throwIfAborted();
@@ -389,7 +391,7 @@ export async function processDocument(
     }
     : await parseDocumentPages(bytes, source.original_name, {
       parser:new UpstageDocumentParser({
-        apiKey:process.env.UPSTAGE_API_KEY ?? '',
+        apiKey:providerEnv.UPSTAGE_API_KEY ?? '',
         model:parseSettings.model,
         baseUrl:process.env.UPSTAGE_BASE_URL,
         requestGate:upstageDocumentParseDistributedGate,
@@ -528,7 +530,7 @@ export async function processDocument(
   }
   else {
     const embedder = new GeminiEmbedder({
-      apiKey:process.env.GOOGLE_API_KEY!,
+      apiKey:providerEnv.GOOGLE_API_KEY!,
       modelId:embeddingModel,
       dimensions:embeddingSettings.dimensions,
       baseUrl:process.env.GEMINI_BASE_URL,

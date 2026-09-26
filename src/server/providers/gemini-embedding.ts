@@ -31,10 +31,10 @@ export class GeminiEmbedder {
     let response: Response;
     try {
       response = await executeFetch(() => (this.options.fetch ?? fetch)(
-        `${(this.options.baseUrl ?? 'https://generativelanguage.googleapis.com').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(this.modelId)}:batchEmbedContents?key=${encodeURIComponent(this.options.apiKey)}`,
+        `${(this.options.baseUrl ?? 'https://generativelanguage.googleapis.com').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(this.modelId)}:batchEmbedContents`,
         {
           method:'POST',
-          headers:{ 'content-type':'application/json' },
+          headers:{ 'content-type':'application/json', 'x-goog-api-key':this.options.apiKey },
           signal:requestSignal,
           body:JSON.stringify({
             requests:texts.map((text) => ({

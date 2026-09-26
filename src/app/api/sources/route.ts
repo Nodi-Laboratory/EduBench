@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
+import { withRequestProviderKeys } from '@/server/providers/credentials';
 import { db } from '@/server/db/pool';
 import { enqueueJobWithClient } from '@/server/jobs/queue';
 import { storeSourceFile } from '@/server/files/storage';
@@ -67,7 +68,7 @@ export async function GET() {
   return NextResponse.json({ items: result.rows });
 }
 
-export async function POST(request: Request) {
+async function handlePost(request: Request) {
   const form = await request.formData();
   const file = form.get('file');
   if (!(file instanceof File)) {
@@ -162,4 +163,8 @@ export async function POST(request: Request) {
     reprocessedFrom:result.reprocessedFrom,
   };
   return NextResponse.json(body, { status:result.created ? 201 : 200 });
+}
+
+export function POST(...args: Parameters<typeof handlePost>) {
+  return withRequestProviderKeys(args[0], () => handlePost(...args));
 }

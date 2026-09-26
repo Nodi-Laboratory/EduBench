@@ -29,6 +29,7 @@ import {
 import { transitionRun, type RunCommand, type RunState } from '@/domain/status';
 import { withTransaction } from '@/server/db/transaction';
 import { createProviderForModel, isSupportedProviderKey } from '@/server/providers/registry';
+import { isMockProviders, providerEnvFromKeys, type ProviderEnv } from '@/server/providers/credentials';
 import { generationParametersSchema } from '@/server/providers/types';
 import {
   type BenchmarkProviderCooldown,
@@ -57,6 +58,8 @@ export type CreateRunInput = {
   retrievalModes?: BenchmarkRetrievalMode[];
   questionLimit?: number;
   questionIds?: string[];
+  /** Provider keys supplied with the request; only used to validate them. */
+  providerEnv?: ProviderEnv;
 };
 
 export type RunSummary = {
@@ -188,8 +191,10 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
         model,
       ]),
     );
-    const mockProviders =
-      process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
+    const mockProviders = isMockProviders();
+    // Without request keys, keep the non-secret settings (base URLs,
+    // MOCK_PROVIDERS) and treat every key as missing.
+    const providerEnv = input.providerEnv ?? providerEnvFromKeys({});
     const resolveExecutionModels = () => input.models.map((requested): RunModelInput => {
       const configured = profileModelByProvider.get(
         requested.providerKey as BenchmarkResearchModel['providerKey'],
@@ -226,11 +231,12 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
         !createProviderForModel(
           configured.providerKey,
           configured.modelId,
+          providerEnv,
         )
       ) {
         throw new DomainError(
           'RUN_MODEL_NOT_CONFIGURED',
-          `${configured.providerKey} / ${configured.modelId} API 환경변수가 필요합니다.`,
+          `${configured.providerKey} / ${configured.modelId} 실행에 API 키가 필요합니다. 설정 화면에서 키를 입력하세요.`,
         );
       }
       return {
@@ -351,12 +357,12 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
     const needsPike = retrievalModes.includes('PIKE');
     if (
       needsVector
-      && process.env.MOCK_PROVIDERS?.toLowerCase() !== 'true'
-      && !process.env.GOOGLE_API_KEY
+      && !isMockProviders()
+      && !input.providerEnv?.GOOGLE_API_KEY
     ) {
       throw new DomainError(
         'BENCHMARK_EMBEDDING_PROVIDER_NOT_CONFIGURED',
-        'RAG 조건의 질의 임베딩에 GOOGLE_API_KEY가 필요합니다.',
+        'RAG 조건의 질의 임베딩에 Gemini API 키가 필요합니다. 설정 화면에서 키를 입력하세요.',
       );
     }
     if (needsVector || needsPike) {
@@ -411,11 +417,11 @@ export async function createRun(input: CreateRunInput): Promise<RunSummary> {
     if (
       profile.judge_provider
       && profile.judge_model
-      && !createProviderForModel(profile.judge_provider, profile.judge_model)
+      && !createProviderForModel(profile.judge_provider, profile.judge_model, input.providerEnv ?? providerEnvFromKeys({}))
     ) {
       throw new DomainError(
         'SCORING_JUDGE_NOT_CONFIGURED',
-        `${profile.judge_provider} / ${profile.judge_model} Judge를 구성할 환경변수가 필요합니다. 새 실행을 만들기 전에 API 키와 Base URL을 설정하십시오.`,
+        `${profile.judge_provider} / ${profile.judge_model} Judge를 호출할 API 키가 필요합니다. 새 실행을 만들기 전에 설정 화면에서 키를 입력하십시오.`,
       );
     }
     const executionModels = resolveExecutionModels();

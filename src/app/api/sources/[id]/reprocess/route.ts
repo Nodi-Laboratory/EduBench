@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
+import { withRequestProviderKeys } from '@/server/providers/credentials';
 import { reprocessSourceWithCurrentProfiles } from '@/server/sources/reprocessing';
 
-export async function POST(
+async function handlePost(
   _request:Request,
   context:{ params:Promise<{ id:string }> },
 ) {
@@ -17,4 +18,8 @@ export async function POST(
     );
   }
   return NextResponse.json(result);
+}
+
+export function POST(...args: Parameters<typeof handlePost>) {
+  return withRequestProviderKeys(args[0], () => handlePost(...args));
 }

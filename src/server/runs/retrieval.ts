@@ -12,6 +12,7 @@ import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 import { withProviderRetry } from '@/server/providers/retry';
+import { isMockProviders, providerEnvFor } from '@/server/providers/credentials';
 import {
   ProviderError,
   type ProviderErrorKind,
@@ -356,21 +357,22 @@ async function vectorRetrieval(
     questionText:item.question_text,
     answerOptions:item.answer_options,
   });
-  const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
+  const mock = isMockProviders();
+  const providerEnv = providerEnvFor(`run:${item.benchmark_run_id}`);
   let queryVector: string | null = null;
   let vectorAudit: Record<string, unknown> | null = null;
   if (!mock) {
-    if (!process.env.GOOGLE_API_KEY) {
+    if (!providerEnv.GOOGLE_API_KEY) {
       throw new DomainError(
         'BENCHMARK_EMBEDDING_PROVIDER_NOT_CONFIGURED',
-        '단순 RAG 질의 임베딩에 GOOGLE_API_KEY가 필요합니다.',
+        '단순 RAG 질의 임베딩에 Gemini API 키가 필요합니다. 설정 화면에서 키를 입력한 뒤 재개하세요.',
       );
     }
     const embedder = new GeminiEmbedder({
-      apiKey:process.env.GOOGLE_API_KEY,
+      apiKey:providerEnv.GOOGLE_API_KEY,
       modelId:settings.model,
       dimensions:settings.dimensions,
-      baseUrl:process.env.GEMINI_BASE_URL,
+      baseUrl:providerEnv.GEMINI_BASE_URL,
       timeoutMs:settings.requestTimeoutMs,
     });
     const queryInput = settings.prefixStrategy === 'text_prefix'

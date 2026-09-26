@@ -12,6 +12,9 @@ import {
   LoaderCircle,
   ScrollText,
 } from 'lucide-react';
+import { ProviderKeyNotice } from '@/components/ui/provider-key-notice';
+import { useMockProviders } from '@/hooks/use-mock-providers';
+import { providerKeyHeaders, useProviderKeys } from '@/hooks/use-provider-keys';
 
 type LabPage = {
   pageNumber: number;
@@ -112,6 +115,9 @@ function moveTab<T extends string>(
 }
 
 export function DocumentLabWorkspace() {
+  const mockMode = useMockProviders();
+  const { hasKey } = useProviderKeys();
+  const missingKeys = mockMode || hasKey('upstage') ? [] : ['upstage'];
   const [file, setFile] = useState<File | null>(null);
   const [result, setResult] = useState<LabResponse | null>(null);
   const [selectedPage, setSelectedPage] = useState(0);
@@ -142,7 +148,7 @@ export function DocumentLabWorkspace() {
     const form = new FormData();
     form.set('file', file);
     try {
-      const response = await fetch('/api/document-lab/parse', { method: 'POST', body: form });
+      const response = await fetch('/api/document-lab/parse', { method: 'POST', headers: providerKeyHeaders(), body: form });
       const body = await response.json() as LabResponse & {
         message?: string;
         code?: string;
@@ -204,7 +210,7 @@ export function DocumentLabWorkspace() {
               onChange={(event) => selectFile(event.target.files?.[0] ?? null)}
             />
           </label>
-          <button className="button primary" disabled={!file || loading}>
+          <button className="button primary" disabled={!file || loading || missingKeys.length > 0}>
             {loading ? <><LoaderCircle className="lab-spinner" size={15} /> 파싱 중…</> : '문서 파싱'}
           </button>
         </form>

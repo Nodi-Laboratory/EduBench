@@ -301,7 +301,7 @@ test('uses normalized provider base URL overrides from environment configuration
     vi.unstubAllGlobals();
   }
   expect(requestedUrls).toEqual([
-    'https://gemini.test/v1beta/models/gemini-model:generateContent?key=g',
+    'https://gemini.test/v1beta/models/gemini-model:generateContent',
     'https://anthropic.test/v1/messages',
     'https://openai.test/v1/responses',
     'https://upstage.test/v1/chat/completions',

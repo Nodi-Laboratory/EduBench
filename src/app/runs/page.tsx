@@ -7,11 +7,10 @@ import { listResearchConfigProfiles } from '@/server/settings/research-profiles'
 export const metadata: Metadata = { title: '벤치마크 실행' };
 export const dynamic = 'force-dynamic';
 
+// Non-secret server settings a provider needs besides the user's API key.
 const providerEnv: Record<string, string[]> = {
-  exaone:['EXAONE_API_KEY', 'EXAONE_BASE_URL'],
-  gemini:['GOOGLE_API_KEY'],
-  openai:['OPENAI_API_KEY', 'OPENAI_MODEL'],
-  upstage:['UPSTAGE_API_KEY'],
+  exaone:['EXAONE_BASE_URL'],
+  midm:['MIDM_BASE_URL'],
 };
 
 export default async function RunsPage() {
@@ -32,8 +31,8 @@ export default async function RunsPage() {
        where status = 'PUBLISHED'
        order by published_at desc`,
     ),
-    db.query<{ id:string; version:string; title:string; provenance_unresolved:boolean; retired_metric:boolean }>(
-      `select id,version,title,
+    db.query<{ id:string; version:string; title:string; provenance_unresolved:boolean; retired_metric:boolean; judge_provider:string | null }>(
+      `select id,version,title,judge_provider,
          not score_profile_definition_usable(metrics,judge_provider,judge_model)
            provenance_unresolved,
          metrics @> '["exact_match"]'::jsonb retired_metric
@@ -67,7 +66,7 @@ export default async function RunsPage() {
       display_name:model.displayName,
       protocol:model.protocol,
       modelId:model.modelId,
-      configured:mockMode || (providerEnv[model.providerKey] ?? []).every(
+      configured:(providerEnv[model.providerKey] ?? []).every(
         (key) => Boolean(process.env[key]),
       ),
       envNames:providerEnv[model.providerKey] ?? [],
@@ -77,5 +76,6 @@ export default async function RunsPage() {
       requestTimeoutMs:model.requestTimeoutMs,
     }))}
     initialRuns={runs.rows}
+    mockMode={mockMode}
   />;
 }

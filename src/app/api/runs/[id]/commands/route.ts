@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { DomainError } from '@/domain/errors';
 import { commandRun, retryFailedRunItems, retryScoringRun } from '@/server/runs/service';
+import { providerKeysFromRequest, rememberProviderKeys } from '@/server/providers/credentials';
 
 // Completion and drain transitions are worker-owned. Exposing them here would
 // let a client bypass item/Judge completion checks and manufacture a terminal
@@ -23,6 +24,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   try {
     const { id } = await context.params;
     const { command } = schema.parse(await request.json());
+    // Re-sent on every command so a run can continue after a server restart
+    // dropped the in-memory keys.
+    rememberProviderKeys(`run:${id}`, providerKeysFromRequest(request));
     if (command === 'RETRY_FAILED') return NextResponse.json({ retried: await retryFailedRunItems(id) });
     if (command === 'RETRY_SCORING') return NextResponse.json(await retryScoringRun(id));
     return NextResponse.json(await commandRun(id, command));

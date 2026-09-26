@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ChevronRight, CircleDot } from 'lucide-react';
 import { usePathname } from 'next/navigation';
 import { NAV_ITEMS } from './navigation';
@@ -22,7 +22,7 @@ function seoulClock(now: Date) {
   }).format(now);
 }
 
-export function Topbar() {
+export function Topbar({ userMenu }: { userMenu?: ReactNode }) {
   const pathname = usePathname();
   const [clock, setClock] = useState({
     iso: '',
@@ -67,6 +67,7 @@ export function Topbar() {
         )}
         <span className="topbar-timezone">Asia/Seoul</span>
         <time dateTime={clock.iso || undefined}>{clock.label}</time>
+        {userMenu}
       </div>
     </header>
   );

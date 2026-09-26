@@ -1,14 +1,15 @@
 'use client';
 
 import { useState } from 'react';
-import { BadgeDollarSign, FileSliders, ServerCog } from 'lucide-react';
+import { BadgeDollarSign, FileSliders } from 'lucide-react';
+import { ProviderKeyPanel } from '@/components/settings/provider-key-panel';
 import { ScoreProfileAudit, type ScoreProfileAuditData } from '@/components/settings/score-profile-audit';
 import {
   ResearchSettingsWorkspace,
   type ResearchConfigProfilesData,
 } from '@/components/settings/research-settings-workspace';
 
-type Provider = { provider_key: string; display_name: string; protocol: string; configured: boolean; envNames: string[] };
+type Provider = { provider_key: string; display_name: string; protocol: string };
 type Price = { version: string; provider_key: string; model_pattern: string; currency: string; input_per_million: string; output_per_million: string };
 
 export function SettingsWorkspace({ providers, scores, prices, mockMode, researchProfiles }: { providers: Provider[]; scores: ScoreProfileAuditData[]; prices: Price[]; mockMode: boolean; researchProfiles?: ResearchConfigProfilesData }) {
@@ -27,12 +28,9 @@ export function SettingsWorkspace({ providers, scores, prices, mockMode, researc
   }
 
   return <div className="workflow-page">
-    <header className="page-heading"><div><span className="eyebrow">SYSTEM / CONFIGURATION</span><h1>시스템 설정</h1><p>비밀값은 화면에 저장하지 않고 .env에서만 읽으며, 실행 재현용 버전 프로필만 관리합니다.</p></div></header>
+    <header className="page-heading"><div><span className="eyebrow">SYSTEM / CONFIGURATION</span><h1>시스템 설정</h1><p>API 키는 이 브라우저에만 저장하고, 서버에서는 실행 재현용 버전 프로필만 관리합니다.</p></div></header>
     {notice && <p className="inline-notice">{notice}</p>}
-    <section className="panel settings-section">
-      <div className="panel-heading"><div><ServerCog size={16}/><h2>모델 제공자 환경</h2></div><span className="count-label">연결 확인 기능 없음</span></div>
-      <div className="provider-status-grid">{providers.map((provider) => <div key={provider.provider_key}><span className={`status-dot ${provider.configured ? '' : 'idle'}`}/><div><strong>{provider.display_name}</strong><small className="mono">{provider.protocol}</small></div><b>{mockMode ? 'MOCK 명시됨' : provider.configured ? '환경변수 설정됨' : provider.envNames.join(' · ')}</b></div>)}</div>
-    </section>
+    <ProviderKeyPanel mockMode={mockMode}/>
     <ResearchSettingsWorkspace initialProfiles={researchProfiles}/>
     <div className="settings-grid">
       <section className="panel">
@@ -49,7 +47,7 @@ export function SettingsWorkspace({ providers, scores, prices, mockMode, researc
           <div className="form-row"><label>버전<input name="version" placeholder="score-v2" required/></label><label>제목<input name="title" placeholder="교육 적합성 프로필" required/></label></div>
           <label>지표 키 (쉼표 구분)<input name="metrics" defaultValue="accuracy,faithfulness,completeness,curriculum_alignment,student_fit,misconception,hallucination" required/></label>
           <label>지표 가중치 (JSON 객체)<input className="mono" name="weights" defaultValue={'{"response_present":0}'}/><small>생략한 지표는 1, 응답 존재 지표는 기본 0입니다. 0은 종합점수에서 제외합니다.</small></label>
-          <div className="form-row"><label>심사 제공자<select name="judgeProvider" value={scoreJudgeProvider} onChange={(event) => setScoreJudgeProvider(event.target.value)}><option value="">결정론적 지표만</option>{providers.map((provider) => <option key={provider.provider_key} value={provider.provider_key}>{provider.display_name}</option>)}</select></label><label>정확한 심사 모델<input name="judgeModel" placeholder="예: gemini-2.5-pro" required={Boolean(scoreJudgeProvider)}/><small>.env 기본값이 아닌 이 모델 ID가 실행에 고정됩니다.</small></label></div>
+          <div className="form-row"><label>심사 제공자<select name="judgeProvider" value={scoreJudgeProvider} onChange={(event) => setScoreJudgeProvider(event.target.value)}><option value="">결정론적 지표만</option>{providers.map((provider) => <option key={provider.provider_key} value={provider.provider_key}>{provider.display_name}</option>)}</select></label><label>정확한 심사 모델<input name="judgeModel" placeholder="예: gemini-2.5-pro" required={Boolean(scoreJudgeProvider)}/><small>이 모델 ID가 실행에 고정됩니다.</small></label></div>
           <label>루브릭 프롬프트<textarea name="rubricPrompt" placeholder="블라인드 절대평가 기준"/></label>
           <button className="button primary">채점 프로필 추가</button>
         </form>

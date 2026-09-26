@@ -1,0 +1,8 @@
+import { NextResponse } from 'next/server';
+import { getCurrentUser } from '@/server/auth/current-user';
+
+export async function GET() {
+  const user = await getCurrentUser();
+  if (!user) return NextResponse.json({ code: 'UNAUTHENTICATED' }, { status: 401 });
+  return NextResponse.json({ user });
+}

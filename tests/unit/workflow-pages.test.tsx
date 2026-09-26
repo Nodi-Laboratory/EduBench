@@ -2,7 +2,8 @@
 
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { postWithProviderKeys, saveTestProviderKeys } from './helpers/provider-keys';
 import { GenerationWorkspace } from '@/components/generation/generation-workspace';
 import { ReviewWorkspace } from '@/components/review/review-workspace';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
@@ -14,7 +15,12 @@ import { RunWorkspace } from '@/components/runs/run-workspace';
 import { ResultAnalyticsDashboard } from '@/components/results/result-analytics-dashboard';
 import { buildResultAnalytics } from '@/server/results/analytics';
 
+beforeEach(() => {
+  saveTestProviderKeys();
+});
+
 afterEach(() => {
+  localStorage.clear();
   cleanup();
   vi.unstubAllGlobals();
 });
@@ -980,7 +986,7 @@ test('question generation exposes durable item errors and resumes only unfinishe
   fireEvent.click(screen.getByRole('button', { name: '미완료 문항 생성 재개' }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
     `/api/generation/${batchId}/resume`,
-    { method: 'POST' },
+    postWithProviderKeys,
   ));
   expect(await screen.findByText(/재개 순번 2/)).toBeInTheDocument();
 });

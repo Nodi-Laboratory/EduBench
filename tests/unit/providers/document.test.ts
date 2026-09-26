@@ -64,8 +64,10 @@ test('sends an explicitly pinned parser profile and preserves Markdown output', 
 });
 
 test('normalizes Gemini batch embeddings and uses its normalized base URL override', async () => {
-  const embedder = new GeminiEmbedder({ apiKey: 'secret', modelId: 'gemini-embedding-test', dimensions: 3, baseUrl: 'https://gemini.test/', fetch: async (url) => {
-    expect(url).toBe('https://gemini.test/v1beta/models/gemini-embedding-test:batchEmbedContents?key=secret');
+  const embedder = new GeminiEmbedder({ apiKey: 'secret', modelId: 'gemini-embedding-test', dimensions: 3, baseUrl: 'https://gemini.test/', fetch: async (url, init) => {
+    // The key travels in a header so it never appears in a logged URL.
+    expect(url).toBe('https://gemini.test/v1beta/models/gemini-embedding-test:batchEmbedContents');
+    expect((init?.headers as Record<string, string>)['x-goog-api-key']).toBe('secret');
     return new Response(JSON.stringify({ embeddings: [{ values: [0.1, 0.2, 0.3] }, { values: [0.4, 0.5, 0.6] }] }));
   } });
   await expect(embedder.embed(['원자', '분자'])).resolves.toEqual([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]);

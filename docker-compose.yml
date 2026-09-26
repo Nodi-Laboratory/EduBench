@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: edubench
       POSTGRES_PASSWORD: edubench
     ports:
-      - "54329:5432"
+      - "${DB_PORT:-54329}:5432"
     volumes:
       - edubench_db:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +24,10 @@ services:
     environment:
       DATABASE_URL: postgresql://edubench:edubench@db:5432/edubench
       STORAGE_ROOT: /data/storage
-    command: ["sh", "-c", "npm run db:migrate && npm run db:seed && npm start"]
+    # Migrations and seeds are idempotent. The background worker runs inside
+    # the web process (src/instrumentation.ts) so it can use the API keys the
+    # browser sends with each request; keys are never stored.
+    command: ["sh", "-c", "npm run db:migrate && npm run db:seed && npm run db:seed-demo && npm start"]
     ports:
       - "${WEB_PORT:-63000}:3000"
     volumes:
@@ -33,33 +36,11 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/dashboard').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 5s
       timeout: 4s
       retries: 30
-  worker:
-    build: .
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://edubench:edubench@db:5432/edubench
-      STORAGE_ROOT: /data/storage
-    command: ["npm", "run", "worker"]
-    restart: unless-stopped
-    volumes:
-      - edubench_storage:/data/storage
-    depends_on:
-      web:
-        condition: service_healthy
-    # Informational liveness/DB-connectivity check; it intentionally does not
-    # treat a long-running scoring job as unhealthy.
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"const { Client } = require('pg'); const client = new Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 3000, statement_timeout: 3000 }); client.connect().then(() => client.query('SELECT 1')).then(() => client.end()).catch(async () => { await client.end().catch(() => undefined); process.exitCode = 1; });\""]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+      start_period: 60s
 
 volumes:
   edubench_db:

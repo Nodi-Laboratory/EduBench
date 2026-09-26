@@ -6,10 +6,23 @@ import {
 import { DomainError } from '@/domain/errors';
 import {
   DOCUMENT_LAB_LIMITS,
-  parseDocumentLabFile,
+  parseDocumentLabFile as parseDocumentLabFileWithKey,
   type DocumentLabProfileConfig,
 } from '@/server/documents/lab';
+import { PROVIDER_KEYS_HEADER } from '@/server/providers/credentials';
 import { ProviderError } from '@/server/providers/types';
+
+// The Upstage key now arrives with the browser request. These tests keep
+// setting UPSTAGE_API_KEY and pass it along as that request-supplied key.
+const parseDocumentLabFile: typeof parseDocumentLabFileWithKey = (file, dependencies = {}) =>
+  parseDocumentLabFileWithKey(file, {
+    ...dependencies,
+    upstageApiKey:dependencies.upstageApiKey ?? process.env.UPSTAGE_API_KEY,
+  });
+
+function providerKeysHeader(keys: Record<string, string>) {
+  return { [PROVIDER_KEYS_HEADER]: Buffer.from(JSON.stringify(keys)).toString('base64url') };
+}
 
 const originalMockProviders = process.env.MOCK_PROVIDERS;
 const originalUpstageApiKey = process.env.UPSTAGE_API_KEY;
@@ -256,7 +269,7 @@ test('returns a typed configured error without exposing credentials', async () =
   expect(response.status).toBe(409);
   await expect(response.json()).resolves.toEqual({
     code: 'UPSTAGE_NOT_CONFIGURED',
-    message: 'UPSTAGE_API_KEY is required to parse documents.',
+    message: 'Upstage API 키가 필요합니다. 설정 화면에서 키를 입력하세요.',
   });
 });
 
@@ -310,7 +323,7 @@ test('rejects an oversized serialized Lab response with a typed 4xx error', asyn
 
 test('returns safe page and request provenance while redacting provider bodies and credentials', async () => {
   delete process.env.MOCK_PROVIDERS;
-  process.env.UPSTAGE_API_KEY = 'super-secret-key';
+  delete process.env.UPSTAGE_API_KEY;
   vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(
     JSON.stringify({ error: 'Authorization Bearer super-secret-key', image: 'data:image/png;base64,AAAA' }),
     { status: 503, headers: { 'x-request-id': 'provider-request-7' } },
@@ -330,7 +343,11 @@ test('returns safe page and request provenance while redacting provider bodies a
         sleep:async () => undefined,
       },
     }),
-  })(new Request('http://localhost/api/document-lab/parse', { method: 'POST', body: form }));
+  })(new Request('http://localhost/api/document-lab/parse', {
+    method: 'POST',
+    headers: providerKeysHeader({ upstage:'super-secret-key' }),
+    body: form,
+  }));
   const body = await response.json();
 
   expect(response.status).toBe(502);

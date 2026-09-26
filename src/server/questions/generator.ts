@@ -20,6 +20,7 @@ import {
 } from '@/server/jobs/queue';
 import { GeminiEmbedder } from '@/server/providers/gemini-embedding';
 import { createProviderForModel } from '@/server/providers/registry';
+import { isMockProviders, providerEnvFor } from '@/server/providers/credentials';
 import type {
   GenerationRequest,
   ModelProvider,
@@ -904,17 +905,18 @@ export async function generateQuestions(
   const generationSettings =
     executionPins.questionGeneration.definition.settings;
   const embeddingSettings = executionPins.embeddingRag.definition.settings;
-  const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
+  const mock = isMockProviders();
+  const providerEnv = providerEnvFor(`generation:${batchId}`);
   if (!mock && batch.generation_model !== generationSettings.model) {
     throw new DomainError(
       'GENERATION_CONFIG_PIN_INTEGRITY_ERROR',
       '생성 배치의 모델 ID가 고정된 연구 설정과 일치하지 않습니다.',
     );
   }
-  if (!mock && !process.env.GOOGLE_API_KEY) {
+  if (!mock && !providerEnv.GOOGLE_API_KEY) {
     throw new DomainError(
       'GENERATION_EMBEDDING_NOT_CONFIGURED',
-      '검색 질의 임베딩과 Gemini 문항 생성에 GOOGLE_API_KEY가 필요합니다.',
+      '검색 질의 임베딩과 Gemini 문항 생성에 Gemini API 키가 필요합니다. 설정 화면에서 키를 입력한 뒤 재개하세요.',
     );
   }
   if (!mock) {
@@ -1084,18 +1086,18 @@ export async function generateQuestions(
   const embeddingModel = mock
     ? 'mock-embedding-3072'
     : embeddingSettings.model;
-  const provider = createProviderForModel('gemini', generationSettings.model);
+  const provider = createProviderForModel('gemini', generationSettings.model, providerEnv);
   if (!provider) {
     throw new DomainError(
       'GENERATION_PROVIDER_NOT_CONFIGURED',
-      `Gemini ${generationSettings.model} 생성에 GOOGLE_API_KEY가 필요합니다.`,
+      `Gemini ${generationSettings.model} 생성에 Gemini API 키가 필요합니다.`,
     );
   }
   const embedder = !mock ? new GeminiEmbedder({
-    apiKey: process.env.GOOGLE_API_KEY!,
+    apiKey: providerEnv.GOOGLE_API_KEY!,
     modelId:embeddingSettings.model,
     dimensions:embeddingSettings.dimensions,
-    baseUrl: process.env.GEMINI_BASE_URL,
+    baseUrl: providerEnv.GEMINI_BASE_URL,
     timeoutMs:embeddingSettings.requestTimeoutMs,
   }) : null;
 

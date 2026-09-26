@@ -40,9 +40,9 @@ export class GeminiProvider implements ModelProvider {
   async generate(request: GenerationRequest, signal?: AbortSignal): Promise<NormalizedGeneration> {
     const started = performance.now();
     const response = await executeFetch(() => this.fetcher(
-      `${this.baseUrl}/v1beta/models/${encodeURIComponent(this.modelId)}:generateContent?key=${encodeURIComponent(this.apiKey)}`,
+      `${this.baseUrl}/v1beta/models/${encodeURIComponent(this.modelId)}:generateContent`,
       {
-        method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': this.apiKey }, signal,
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: request.system }] },
           contents: [{ role: 'user', parts: [{ text: request.prompt }] }],

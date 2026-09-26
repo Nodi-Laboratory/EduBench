@@ -9,7 +9,6 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "worker": "tsx src/worker.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "tsx scripts/prepare-test-db.ts && vitest run --config vitest.integration.config.ts",
@@ -18,10 +17,13 @@
     "lint": "eslint .",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",
-    "storage:deduplicate": "tsx scripts/deduplicate-source-storage.ts"
+    "db:seed-demo": "tsx scripts/seed-demo.ts",
+    "storage:deduplicate": "tsx scripts/deduplicate-source-storage.ts",
+    "screenshots": "tsx scripts/capture-screenshots/capture.ts"
   },
   "dependencies": {
     "@react-pdf/renderer": "^4.3.1",
+    "bcryptjs": "3.0.3",
     "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
     "lucide-react": "1.25.0",

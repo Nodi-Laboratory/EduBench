@@ -4,6 +4,11 @@ import { DomainError } from '@/domain/errors';
 import { db } from '@/server/db/pool';
 import { generationParametersSchema } from '@/server/providers/types';
 import { createRun } from '@/server/runs/service';
+import {
+  providerEnvFromKeys,
+  providerKeysFromRequest,
+  rememberProviderKeys,
+} from '@/server/providers/credentials';
 
 const modelSchema = z.object({
   providerKey: z.string().min(1), displayName: z.string().min(1), modelId: z.string().min(1),
@@ -44,7 +49,10 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const input = runSchema.parse(await request.json());
-    return NextResponse.json(await createRun(input), { status: 201 });
+    const keys = providerKeysFromRequest(request);
+    const run = await createRun({ ...input, providerEnv:providerEnvFromKeys(keys) });
+    rememberProviderKeys(`run:${run.id}`, keys);
+    return NextResponse.json(run, { status: 201 });
   } catch (error) {
     if (error instanceof z.ZodError) return NextResponse.json({ code: 'INVALID_RUN_INPUT', issues: error.issues }, { status: 400 });
     if (error instanceof DomainError) return NextResponse.json({ code: error.code, message: error.message }, { status: 409 });

@@ -17,6 +17,7 @@ import {
 } from '@/domain/benchmark-retrieval';
 import { useCoalescedRefresh } from '@/hooks/use-coalesced-refresh';
 import { useCursorEventStream } from '@/hooks/use-cursor-event-stream';
+import { providerKeyHeaders } from '@/hooks/use-provider-keys';
 
 type Run = { id: string; public_id: string; title: string; state: string; total_items: number; completed_items: number; failed_items: number; dataset_version: string; score_version: string; price_profile_version: string; created_at: string; retrieval_modes?:StoredBenchmarkRetrievalMode[]; last_scoring_error?: { code?: string; message?: string; attempts?: number; retryAt?:string | null; retryDelayMs?:number | null } | null };
 type Model = { id: string; provider_key?: string; display_name: string; blind_id: string; model_id: string; protocol: string; concurrency: number };
@@ -566,7 +567,7 @@ export function RunController({
 
   async function command(value: string) {
     setBusy(true); setNotice('');
-    const response = await fetch(`/api/runs/${run.id}/commands`, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ command:value }) });
+    const response = await fetch(`/api/runs/${run.id}/commands`, { method:'POST', headers:{ 'content-type':'application/json', ...providerKeyHeaders() }, body:JSON.stringify({ command:value }) });
     const body = await response.json();
     if (!response.ok) setNotice(body.message ?? body.code ?? '명령을 처리하지 못했습니다.');
     else {

@@ -2,6 +2,11 @@ import type { PoolClient } from 'pg';
 import { withTransaction } from '@/server/db/transaction';
 import { DomainError } from '@/domain/errors';
 import type { BenchmarkProviderCooldown } from '@/server/runs/provider-cooldown';
+import {
+  credentialScopeForJob,
+  currentRequestProviderKeys,
+  rememberProviderKeys,
+} from '@/server/providers/credentials';
 
 export type JobState = 'PENDING' | 'LEASED' | 'RETRY_WAIT' | 'SUCCEEDED' | 'TERMINAL_FAILED' | 'CANCELLED';
 
@@ -197,6 +202,8 @@ export async function cancelJobWithClient(client: PoolClient, jobId: string): Pr
 }
 
 export async function enqueueJobWithClient(client: PoolClient, input: EnqueueInput): Promise<{ id: string; existing: boolean }> {
+  const scope = credentialScopeForJob(input.kind, input.payload);
+  if (scope) rememberProviderKeys(scope, currentRequestProviderKeys());
   const inserted = await client.query<{ id: string }>(
       `insert into jobs(kind, payload, idempotency_key, priority, max_attempts, available_at)
        values ($1, $2::jsonb, $3, $4, $5, coalesce($6::timestamptz, now()))

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { db } from '@/server/db/pool';
 import { withTransaction } from '@/server/db/transaction';
 import { enqueueJobWithClient } from '@/server/jobs/queue';
+import { withRequestProviderKeys } from '@/server/providers/credentials';
 import { GENERATION_STAGES } from '@/domain/generation';
 import {
   hashResearchConfigDefinition,
@@ -44,7 +45,7 @@ export async function GET() {
   return NextResponse.json({ items: result.rows });
 }
 
-export async function POST(request: Request) {
+async function handlePost(request: Request) {
   const parsed = generationSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json({ code: 'INVALID_GENERATION_INPUT', issues: parsed.error.issues }, { status: 400 });
@@ -266,4 +267,8 @@ export async function POST(request: Request) {
     }
     throw error;
   }
+}
+
+export function POST(...args: Parameters<typeof handlePost>) {
+  return withRequestProviderKeys(args[0], () => handlePost(...args));
 }

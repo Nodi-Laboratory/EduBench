@@ -7,6 +7,7 @@ import {
   type DocumentLabProfileConfig,
 } from '@/server/documents/lab';
 import { listResearchConfigProfiles } from '@/server/settings/research-profiles';
+import { providerKeysFromRequest } from '@/server/providers/credentials';
 
 type ListResearchConfigProfiles = typeof listResearchConfigProfiles;
 
@@ -62,7 +63,11 @@ export function createDocumentLabPostHandler(
       )();
       return NextResponse.json(await (
         dependencies.parseFile ?? parseDocumentLabFile
-      )(file, { profile, signal:request.signal }));
+      )(file, {
+        profile,
+        signal:request.signal,
+        upstageApiKey:providerKeysFromRequest(request).upstage,
+      }));
     } catch (error) {
       if (error instanceof DocumentLabError) {
         return NextResponse.json({ code: error.code, message: error.message }, { status: error.status });

@@ -2,13 +2,19 @@
 
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { postWithProviderKeys, saveTestProviderKeys } from './helpers/provider-keys';
 import { ReviewWorkspace } from '@/components/review/review-workspace';
 import { DatasetWorkspace } from '@/components/datasets/dataset-workspace';
 import { RunWorkspace } from '@/components/runs/run-workspace';
 import type { AuditQuestion } from '@/server/datasets/audit';
 
+beforeEach(() => {
+  saveTestProviderKeys();
+});
+
 afterEach(() => {
+  localStorage.clear();
   cleanup();
   vi.unstubAllGlobals();
 });

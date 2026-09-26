@@ -2,7 +2,8 @@
 
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { postWithProviderKeys, saveTestProviderKeys } from './helpers/provider-keys';
 import { GenerationWorkspace } from '@/components/generation/generation-workspace';
 import { RunController } from '@/components/runs/run-controller';
 import { SourcesWorkspace } from '@/components/sources/sources-workspace';
@@ -53,7 +54,12 @@ class EventSourceStub {
   }
 }
 
+beforeEach(() => {
+  saveTestProviderKeys();
+});
+
 afterEach(() => {
+  localStorage.clear();
   cleanup();
   sessionStorage.clear();
   EventSourceStub.instances = [];
@@ -125,7 +131,7 @@ test('a READY source outside the active research profiles exposes one-click repr
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
     '/api/sources/source-legacy/reprocess',
-    { method:'POST' },
+    postWithProviderKeys,
   ));
   expect(await screen.findByText(
     '현재 연구 설정으로 새 처리 계보를 시작했습니다.',

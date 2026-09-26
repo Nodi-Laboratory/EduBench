@@ -1,3 +1,4 @@
+import { PROVIDER_KEYS_HEADER } from '@/server/providers/credentials';
 import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -269,7 +270,13 @@ test('creates a real benchmark run from the active OpenAI model profile', async 
       'http://localhost/api/runs',
       {
         method:'POST',
-        headers:{ 'content-type':'application/json' },
+        headers:{
+          'content-type':'application/json',
+          [PROVIDER_KEYS_HEADER]:Buffer.from(JSON.stringify({
+            openai:'integration-openai-key',
+            gemini:'integration-judge-key',
+          })).toString('base64url'),
+        },
         body:JSON.stringify({
           title:`OpenAI 프로필 실행 ${randomUUID().slice(0, 8)}`,
           datasetVersionId,

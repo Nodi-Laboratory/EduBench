@@ -14,6 +14,7 @@ import { judgeMetricBatches, normalizeJudgeEvidence, normalizeJudgeScoreValue, n
 import { db } from "@/server/db/pool";
 import { withTransaction } from "@/server/db/transaction";
 import { createProviderForModel } from "@/server/providers/registry";
+import { providerEnvFor } from "@/server/providers/credentials";
 import type {
   GenerationRequest,
   ModelProvider,
@@ -782,10 +783,14 @@ async function scoreClaimedRun(
         throw new Error(
           `SCORING_JUDGE_NOT_CONFIGURED: ${judgeMetrics.join(",")} 지표에는 judge_provider와 judge_model이 모두 필요합니다.`,
         );
-      const judge = createProviderForModel(row.judge_provider, row.judge_model);
+      const judge = createProviderForModel(
+        row.judge_provider,
+        row.judge_model,
+        providerEnvFor(`run:${runId}`),
+      );
       if (!judge)
         throw new Error(
-          `SCORING_JUDGE_NOT_CONFIGURED: ${row.judge_provider} 환경변수가 필요합니다.`,
+          `SCORING_JUDGE_NOT_CONFIGURED: ${row.judge_provider} API 키가 필요합니다. 설정 화면에서 키를 입력한 뒤 채점을 재개하세요.`,
         );
       try {
         const priorParents = await persistedFallbackParents({

@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { migrate } from '@/server/db/migrate';
 import { db } from '@/server/db/pool';
 import { createRunProviderResolver } from '@/server/providers/registry';
+import { providerEnvFor } from '@/server/providers/credentials';
+import { missingRunProviderKeys, pauseRunForMissingProviderKeys } from '@/server/runs/provider-keys';
 import { processDocument, markDocumentFailed } from '@/server/documents/pipeline';
 import { classifyDocumentFailure } from '@/server/documents/failure';
 import {
@@ -35,7 +37,7 @@ import {
 
 const workerId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const resolveRunProvider = createRunProviderResolver();
+const runProviderResolvers = new Map<string, ReturnType<typeof createRunProviderResolver>>();
 const persistentTaskPool = new TaskSlotPool(
   {
     'document.parse':2,
@@ -60,6 +62,19 @@ async function processBenchmarkRuns() {
   const runs = await db.query<{ id: string }>("select id from benchmark_runs where state = 'RUNNING' order by created_at limit 20");
   let processed = 0;
   for (const run of runs.rows) {
+    const providerEnv = providerEnvFor(`run:${run.id}`);
+    const missing = await missingRunProviderKeys(run.id, providerEnv, 'execution');
+    if (missing.length) {
+      await pauseRunForMissingProviderKeys(run.id, missing);
+      continue;
+    }
+    // Rebuilt per run and per key set so a key the user re-sent is picked up.
+    const resolverKey = `${run.id}:${Object.keys(providerEnv).filter((name) => name.endsWith('_API_KEY')).sort().join(',')}`;
+    let resolveRunProvider = runProviderResolvers.get(resolverKey);
+    if (!resolveRunProvider) {
+      resolveRunProvider = createRunProviderResolver(providerEnv);
+      runProviderResolvers.set(resolverKey, resolveRunProvider);
+    }
     const items = await claimRunItems(run.id, workerId, Number(process.env.WORKER_BATCH_SIZE ?? 8), 150_000);
     await Promise.all(items.map(async (item) => {
       const model = await db.query<{ provider_key: string; model_id:string }>(
@@ -74,7 +89,7 @@ async function processBenchmarkRuns() {
           item.id,
           workerId,
           'PROVIDER_NOT_CONFIGURED',
-          `${providerKey} / ${modelId} 모델을 위한 환경변수가 완전하지 않습니다.`,
+          `${providerKey} / ${modelId} 모델을 호출할 API 키가 없습니다. 설정 화면에서 키를 입력한 뒤 재시도하세요.`,
         );
         return;
       }
@@ -224,6 +239,11 @@ async function processScoringRuns() {
   );
   for (const run of runs.rows) {
     try {
+      const missing = await missingRunProviderKeys(run.id, providerEnvFor(`run:${run.id}`), 'scoring');
+      if (missing.length) {
+        await pauseRunForMissingProviderKeys(run.id, missing);
+        continue;
+      }
       const result = await scoreRun(run.id, workerShutdown.signal);
       if (!result.claimed) continue;
     }
@@ -287,13 +307,17 @@ async function benchmarkLoop() {
   }
 }
 
-export async function main() {
-  await migrate();
+export async function runWorkerLoops() {
   console.info(`[EduBench worker] started ${workerId}`);
   await Promise.all([persistentJobLoop(), benchmarkLoop()]);
   await persistentTaskPool.drain();
-  await db.end();
   console.info('[EduBench worker] stopped');
+}
+
+export async function main() {
+  await migrate();
+  await runWorkerLoops();
+  await db.end();
 }
 
 if (import.meta.url === new URL(`file://${process.argv[1]!.replace(/\\/g, '/')}`).href) {

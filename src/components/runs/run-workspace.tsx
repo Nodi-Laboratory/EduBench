@@ -4,6 +4,8 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { Activity, ArrowRight, PlayCircle, ServerCog } from 'lucide-react';
 import { JsonBlock } from '@/components/ui/json-block';
+import { ProviderKeyNotice } from '@/components/ui/provider-key-notice';
+import { providerKeyHeaders, useProviderKeys } from '@/hooks/use-provider-keys';
 import {
   benchmarkRetrievalModeMetadata,
   benchmarkRetrievalModes,
@@ -26,6 +28,7 @@ type Profile = {
   title: string;
   provenance_unresolved?: boolean;
   retired_metric?: boolean;
+  judge_provider?: string | null;
 };
 type Provider = {
   provider_key:string;
@@ -53,16 +56,27 @@ function retrievalModeLabel(mode:StoredBenchmarkRetrievalMode):string {
     : benchmarkRetrievalModeMetadata[mode].shortLabel;
 }
 
-export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile = null, initialRuns }: {
+export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile = null, initialRuns, mockMode = false }: {
   datasets: Dataset[];
   scoreProfiles: Profile[];
   providers: Provider[];
   modelProfile?:ModelProfile | null;
   initialRuns: Run[];
+  mockMode?: boolean;
 }) {
-  const [selected, setSelected] = useState(() => providers
+  const { hasKey } = useProviderKeys();
+  // `configured` covers server-side requirements such as a base URL; the API
+  // key itself comes from this browser.
+  const providerReady = (provider: Provider) => mockMode
+    || ((provider.configured ?? Boolean(provider.modelId)) && hasKey(provider.provider_key));
+  const [selectedKeys, setSelected] = useState(() => providers
     .filter((provider) => provider.configured ?? Boolean(provider.modelId))
     .map((provider) => provider.provider_key));
+  const selected = selectedKeys.filter((key) => {
+    const provider = providers.find((candidate) => candidate.provider_key === key);
+    return provider ? providerReady(provider) : false;
+  });
+  const [selectedScoreProfileId, setSelectedScoreProfileId] = useState('');
   const [selectedRetrievalModes, setSelectedRetrievalModes] = useState<
     BenchmarkRetrievalMode[]
   >(() => [...benchmarkRetrievalModes]);
@@ -81,12 +95,23 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
     (profile) => profile.retired_metric,
   ).length;
   const selectedDataset = datasets.find((dataset) => dataset.id === selectedDatasetId) ?? null;
+  const selectedScoreProfile = selectableScoreProfiles.find((profile) => profile.id === selectedScoreProfileId)
+    ?? selectableScoreProfiles[0];
+  const missingKeys = mockMode ? [] : [...new Set([
+    ...providers.filter((provider) => !hasKey(provider.provider_key)).map((provider) => provider.provider_key),
+    ...(selectedScoreProfile?.judge_provider && !hasKey(selectedScoreProfile.judge_provider)
+      ? [selectedScoreProfile.judge_provider] : []),
+    ...(selectedRetrievalModes.includes('VECTOR') && !hasKey('gemini') ? ['gemini'] : []),
+  ])];
+  const blockingKeys = missingKeys.filter((provider) => selected.length === 0
+    || provider === selectedScoreProfile?.judge_provider
+    || (provider === 'gemini' && selectedRetrievalModes.includes('VECTOR')));
 
   async function submit(formData: FormData) {
     setSubmitting(true); setNotice('');
     const selectedProviders = providers.filter((provider) => selected.includes(provider.provider_key));
     try {
-      const response = await fetch('/api/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      const response = await fetch('/api/runs', { method: 'POST', headers: { 'content-type': 'application/json', ...providerKeyHeaders() }, body: JSON.stringify({
         title: formData.get('title'), datasetVersionId: formData.get('datasetVersionId'), scoreProfileId: formData.get('scoreProfileId'),
         priceProfileVersion: String(formData.get('priceProfileVersion')), systemPrompt: formData.get('systemPrompt'),
         questionLimit: Number(formData.get('questionLimit')),
@@ -116,7 +141,7 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
 
   const seoulDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   return <div className="workflow-page">
-    <header className="page-heading"><div><span className="eyebrow">BENCHMARK / EXECUTION</span><h1>벤치마크 실행</h1><p>불변 데이터셋과 환경변수의 실제 모델을 결합해 재현 가능한 실행을 생성합니다.</p></div></header>
+    <header className="page-heading"><div><span className="eyebrow">BENCHMARK / EXECUTION</span><h1>벤치마크 실행</h1><p>불변 데이터셋과 연구 프로필의 실제 모델을 결합해 재현 가능한 실행을 생성합니다.</p></div></header>
     <div className="run-setup-grid">
       <section className="panel"><div className="panel-heading"><div><span className="section-index mono">01</span><h2>실행 명세</h2></div></div>
         <form className="dense-form" action={submit}>
@@ -129,7 +154,7 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
             const nextDataset = datasets.find((dataset) => dataset.id === nextId);
             setSelectedDatasetId(nextId);
             setQuestionLimit(nextDataset?.question_count ?? 1);
-          }}>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.title} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required disabled={selectableScoreProfiles.length === 0}>{selectableScoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
+          }}>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.version} · {dataset.title} · {dataset.question_count}문항</option>)}</select></label><label>채점 프로필<select name="scoreProfileId" required disabled={selectableScoreProfiles.length === 0} value={selectedScoreProfile?.id ?? ''} onChange={(event) => setSelectedScoreProfileId(event.target.value)}>{selectableScoreProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.version} · {profile.title}</option>)}</select></label></div>
           {selectedDataset && <div className="run-dataset-manifest" aria-live="polite">
             <div><span className="eyebrow">SELECTED DATASET</span><strong className="mono">{selectedDataset.version}</strong><b>{selectedDataset.title}</b></div>
             <p>{selectedDataset.description || '설명 없음'}</p>
@@ -164,15 +189,16 @@ export function RunWorkspace({ datasets, scoreProfiles, providers, modelProfile 
           </fieldset>
           <label>시스템 프롬프트<textarea name="systemPrompt" defaultValue="주어진 질문에 정확하고 완결되게 답하며, 제공된 근거가 있는 조건에서는 그 근거에 충실하게 답한다." required /></label>
           {!modelProfile && <p className="result-warning">활성 벤치마크 모델 연구 설정이 없습니다. 시스템 설정에서 프로필을 활성화하십시오.</p>}
-          <button className="button primary" disabled={submitting || datasets.length === 0 || !selectedDatasetId || selected.length === 0 || selectedRetrievalModes.length === 0 || selectableScoreProfiles.length === 0 || !modelProfile}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
+          <ProviderKeyNotice missing={blockingKeys.length ? missingKeys : []} feature="벤치마크 실행" />
+          <button className="button primary" disabled={submitting || blockingKeys.length > 0 || datasets.length === 0 || !selectedDatasetId || selected.length === 0 || selectedRetrievalModes.length === 0 || selectableScoreProfiles.length === 0 || !modelProfile}><PlayCircle size={15} /> {submitting ? '실행 명세 생성 중…' : '실행 초안 생성'}</button>
           {notice && <p className="inline-notice">{notice}</p>}
         </form>
       </section>
       <section className="panel"><div className="panel-heading"><div><span className="section-index mono">02</span><h2>모델 선택</h2></div><span className="count-label mono">{selected.length} SELECTED</span></div>
         {modelProfile && <div className="dataset-note"><ServerCog size={17}/><p>활성 모델 프로필 <strong>{modelProfile.version}</strong><br/><span className="mono">{modelProfile.contentHash}</span></p></div>}
-        <div className="provider-selector">{providers.map((provider, index) => { const configured=provider.configured ?? Boolean(provider.modelId); return <label key={provider.provider_key} className={!configured ? 'disabled-provider' : ''}><input type="checkbox" checked={selected.includes(provider.provider_key)} disabled={!configured} onChange={(event) => setSelected((current) => event.target.checked ? [...current, provider.provider_key] : current.filter((key) => key !== provider.provider_key))} /><span className={`model-key model-${index + 1}`} /><span><strong>{provider.display_name}</strong><small className="mono">{provider.modelId}</small><small>{configured ? `동시 ${provider.concurrency ?? 1} · timeout ${provider.requestTimeoutMs ?? 90_000}ms` : `${(provider.envNames ?? [provider.envName ?? 'API key']).join(' · ')} 미설정`}</small></span><b>{provider.protocol}</b></label>; })}</div>
+        <div className="provider-selector">{providers.map((provider, index) => { const configured=providerReady(provider); return <label key={provider.provider_key} className={!configured ? 'disabled-provider' : ''}><input type="checkbox" checked={selected.includes(provider.provider_key)} disabled={!configured} onChange={(event) => setSelected((current) => event.target.checked ? [...current, provider.provider_key] : current.filter((key) => key !== provider.provider_key))} /><span className={`model-key model-${index + 1}`} /><span><strong>{provider.display_name}</strong><small className="mono">{provider.modelId}</small><small>{configured ? `동시 ${provider.concurrency ?? 1} · timeout ${provider.requestTimeoutMs ?? 90_000}ms` : (provider.configured ?? true) ? 'API 키 미입력 · 설정 화면에서 입력' : `${(provider.envNames ?? [provider.envName ?? 'API key']).join(' · ')} 미설정`}</small></span><b>{provider.protocol}</b></label>; })}</div>
         <div className="compact-list">{providers.map((provider) => <details key={`${provider.provider_key}-parameters`}><summary><strong>{provider.display_name}</strong> 실제 생성 파라미터</summary><JsonBlock value={provider.parameters ?? {}}/></details>)}</div>
-        <div className="dataset-note"><ServerCog size={17} /><p>API 키와 Base URL만 <strong>.env</strong>에서 읽습니다. 모델 ID와 생성값은 위 불변 연구 프로필에서 고정됩니다.</p></div>
+        <div className="dataset-note"><ServerCog size={17} /><p>API 키는 이 브라우저에 저장된 값을 요청마다 전달하고, Base URL만 서버 <strong>.env</strong>에서 읽습니다. 모델 ID와 생성값은 위 불변 연구 프로필에서 고정됩니다.</p></div>
       </section>
     </div>
     <section className="panel recent-panel"><div className="panel-heading"><div><span className="section-index mono">03</span><h2>실행 기록</h2></div><span className="count-label mono">{runs.length} RUNS</span></div>

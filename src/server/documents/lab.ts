@@ -73,6 +73,8 @@ export type DocumentLabDependencies = {
   createParser?: (options: UpstageDocumentParserOptions) => PageParser;
   limits?: DocumentLabLimits;
   signal?: AbortSignal;
+  /** Upstage key supplied by the browser for this request only. */
+  upstageApiKey?: string;
   providerRetry?: Pick<
     ProviderRetryOptions,
     'maxAttempts' | 'baseDelayMs' | 'maxDelayMs' | 'sleep' | 'random'
@@ -320,8 +322,8 @@ export async function parseDocumentLabFile(file: File, dependencies: DocumentLab
   const mock = process.env.MOCK_PROVIDERS?.toLowerCase() === 'true';
   const settings = dependencies.profile?.settings ?? defaultDocumentParseSettings;
   const requestConfig = requestConfigFor(dependencies.profile, settings);
-  const apiKey = process.env.UPSTAGE_API_KEY;
-  if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'UPSTAGE_API_KEY is required to parse documents.');
+  const apiKey = dependencies.upstageApiKey;
+  if (!mock && !apiKey) throw new DocumentLabError('UPSTAGE_NOT_CONFIGURED', 409, 'Upstage API 키가 필요합니다. 설정 화면에서 키를 입력하세요.');
 
   const limits = dependencies.limits ?? DOCUMENT_LAB_LIMITS;
   const renderOptions = {
