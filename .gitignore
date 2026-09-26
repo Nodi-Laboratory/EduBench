@@ -11,3 +11,11 @@ dist/
 *.tsbuildinfo
 storage/
 exports/
+
+# Local tool artifacts
+.playwright-mcp/
+.superdesign/
+docs/superpowers/
+docs/local/
+graphify-out/
+/document-lab-*.png
