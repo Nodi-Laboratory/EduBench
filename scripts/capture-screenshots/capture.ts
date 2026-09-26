@@ -17,7 +17,7 @@ const baseUrl = (process.env.BASE_URL ?? 'http://localhost:63000').replace(/\/+$
 const outputDir = path.resolve(process.cwd(), 'image');
 
 async function settle(page: Page) {
-  await page.waitForLoadState('networkidle').catch(() => undefined);
+  await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => undefined);
   // Let charts finish their entry animation and live clocks render.
   await page.waitForTimeout(1_200);
 }
@@ -30,7 +30,7 @@ async function shoot(page: Page, name: string) {
 
 async function main() {
   await mkdir(outputDir, { recursive: true });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, args: ['--lang=ko-KR'] });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     locale: 'ko-KR',
@@ -44,6 +44,8 @@ async function main() {
   await page.getByLabel('비밀번호').fill('demo1234');
   await page.getByRole('button', { name: '로그인' }).click();
   await page.waitForURL(`${baseUrl}/dashboard`);
+  // The control room streams events, so wait for its first snapshot instead of network idle.
+  await page.getByText('실제 운영 데이터를 불러오는 중입니다.').waitFor({ state: 'detached', timeout: 30_000 }).catch(() => undefined);
   await shoot(page, 'dashboard');
 
   await page.goto(`${baseUrl}/sources`);

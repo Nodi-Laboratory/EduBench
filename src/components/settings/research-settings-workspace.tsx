@@ -411,7 +411,7 @@ export function ResearchSettingsWorkspace({
       </div>
       <div className="research-settings-intro">
         <p>
-          현재 활성 버전이 새 작업의 기본값입니다. 기존 결과는 바뀌지 않으며 비밀키와 Base URL은 계속 .env에서만 관리합니다.
+          현재 활성 버전이 새 작업의 기본값입니다. 기존 결과는 바뀌지 않으며 API 키는 위 입력란(브라우저), Base URL은 .env에서 관리합니다.
         </p>
         <span>설정을 바꾸기 전 적용 범위와 재처리 영향을 확인하십시오.</span>
       </div>

@@ -39,7 +39,15 @@ export default async function GenerationPage() {
         order by entry.source_file_id, entry.ordinal`,
       [sources.rows.map((source) => source.id)],
     ),
-    db.query<{ id: string; state: string; requested_count: number; created_at: string }>(`select id, state, requested_count, created_at::text from generation_batches order by created_at desc limit 10`),
+    db.query<{ id: string; state: string; requested_count: number; created_at: string; progress: { completedQuestions?: number; failedQuestions?: number; error?: string } }>(
+      `select id, state, requested_count, created_at::text,
+         jsonb_build_object(
+           'completedQuestions',progress->'completedQuestions',
+           'failedQuestions',progress->'failedQuestions',
+           'error',progress->'error'
+         ) progress
+       from generation_batches order by created_at desc limit 10`,
+    ),
   ]);
   const hydrated = sources.rows.map((source) => ({ ...source, tocEntries: toc.rows.filter((entry) => entry.source_file_id === source.id) }));
   return <GenerationWorkspace sources={hydrated} batches={batches.rows} />;
