@@ -78,9 +78,6 @@ async function main() {
     await shoot(page, 'result-analytics');
   }
 
-  await page.goto(`${baseUrl}/results`);
-  await shoot(page, 'results');
-
   await page.goto(`${baseUrl}/settings`);
   await shoot(page, 'settings-api-keys');
 
