@@ -214,6 +214,7 @@ export function DocumentLabWorkspace() {
             {loading ? <><LoaderCircle className="lab-spinner" size={15} /> 파싱 중…</> : '문서 파싱'}
           </button>
         </form>
+        <ProviderKeyNotice missing={missingKeys} feature="문서 파싱" />
         <div className="lab-config-values" aria-label={result ? '실제 요청 설정' : '적용 요청 설정'}>
           {result ? <>
             <div><span>MODE</span><code>{`mode=${configValue(requestConfig.mode)}`}</code></div>
